@@ -91,6 +91,13 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
     else None
   )
 
+  # None when gear_load is disabled.
+  gear_term = (
+    env.unwrapped.observation_manager.get_term_cfg("gear_load", "gear_load").func
+    if "gear_load" in env.unwrapped.observation_manager.active_terms
+    else None
+  )
+
   done_envs = torch.zeros(cfg.num_envs, dtype=torch.bool, device=device)
   max_temp = torch.zeros(cfg.num_envs, device=device)
   sum_temp = torch.zeros(cfg.num_envs, device=device)
@@ -100,6 +107,10 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
   final_soc = torch.ones(cfg.num_envs, device=device)
   dead_joints = torch.zeros(cfg.num_envs, device=device)
   first_death_s = torch.full((cfg.num_envs,), float("nan"), device=device)
+  max_gear_ratio = torch.zeros(cfg.num_envs, device=device)
+  worst_gear_joint = torch.zeros(cfg.num_envs, dtype=torch.long, device=device)
+  sum_step_gear_ratio = torch.zeros(cfg.num_envs, device=device)
+  gear_overlimit_steps = torch.zeros(cfg.num_envs, device=device)
 
   obs = env.get_observations()
   print(f"[INFO] Running {cfg.num_envs} evaluation episodes...")
@@ -143,6 +154,17 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
         active, torch.maximum(dead_joints, dead_now), dead_joints
       )
 
+    if gear_term is not None:
+      # Worst joint's peak gear load / effort limit over this control step.
+      step_ratio, step_joint = gear_term.last_peak_gear_load_ratio.max(dim=-1)
+      new_max = active & (step_ratio > max_gear_ratio)
+      max_gear_ratio = torch.where(new_max, step_ratio, max_gear_ratio)
+      worst_gear_joint = torch.where(new_max, step_joint, worst_gear_joint)
+      sum_step_gear_ratio += torch.where(active, step_ratio, 0.0)
+      # Steps where an impact pushed more through some gearbox than the
+      # motor alone can apply.
+      gear_overlimit_steps += (active & (step_ratio > 1.0)).float()
+
     newly_done = dones.bool() & ~done_envs
     done_envs = done_envs | newly_done
     if newly_done.any():
@@ -169,6 +191,21 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
         "first_death_s": first_death_s[env_id].item(),
       }
     )
+    if gear_term is not None:
+      records[-1].update(
+        {
+          "max_gear_load_ratio": max_gear_ratio[env_id].item(),
+          "worst_gear_joint": gear_term.joint_names[
+            int(worst_gear_joint[env_id].item())
+          ],
+          "mean_peak_gear_load_ratio": (
+            sum_step_gear_ratio[env_id] / safe_steps[env_id]
+          ).item(),
+          "gear_overlimit_frac": (
+            gear_overlimit_steps[env_id] / safe_steps[env_id]
+          ).item(),
+        }
+      )
 
   output_path = Path(cfg.output_file)
   output_path.parent.mkdir(parents=True, exist_ok=True)

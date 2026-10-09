@@ -61,13 +61,18 @@ Go2 MJCF later without touching the physics engines.
   threshold, not Go2's 80–85°C software shutdown. Toggle the whole event
   with `actuator_health.enabled` in the yaml. See `PLAN.md` for the phases
   that build on it.
+- **`envs_mjlab/gear_load.py`** — `GearLoadObservation`, a read-only
+  `"gear_load"` observation group: per-joint peak gearbox load over each
+  control step, as a ratio to the joint's spec effort limit. See "Gearbox
+  load" below. Toggle with `gear_load.enabled` in the yaml.
 - **`scripts/run_eval.py`** — headless batch evaluation of a checkpoint,
   dumping per-episode results to CSV/JSON (including `dead_joints` and
-  `first_death_s` when a death threshold is set).
+  `first_death_s` when a death threshold is set, and the gear-load columns
+  below).
 - **`scripts/play.py`** + **`viewer/`** — an interactive Viser-based viewer
-  with a live "Robot Health" tab: per-node thermal, current, and torque
-  charts (all nodes on shared axes, not just aggregates) plus a battery
-  panel, for eyeballing what failure conditions actually look like before
+  with a live "Robot Health" tab: per-node thermal, current, torque, and
+  gear-load charts (all nodes on shared axes, not just aggregates) plus a
+  battery panel, for eyeballing what failure conditions actually look like before
   building any automatic detection.
 
 ## Why physics-substep heat averaging
@@ -83,6 +88,46 @@ heat and mechanical power every physics substep (by wrapping
 `Simulation.step`, since mjlab has no official per-substep hook for
 observation terms) and averages over the control step before updating
 either engine.
+
+## Gearbox load
+
+The motor's torque (`qfrc_actuator`) is clamped at the effort limit, but
+the gears carry more than that at impacts. The rotor sits on the gearbox's
+input side, and mjlab's Go1 models its reflected inertia as `armature`
+(`ROTOR_INERTIA × N²`, `go1_constants.py`). When a footfall stops a joint
+within a few milliseconds, the gear teeth must also stop the rotor, so the
+load through them is
+
+    tau_gear = qfrc_actuator − armature × qacc
+
+— the impact-transmission effect of high reflected inertia
+[[9]](#references). `GearLoadObservation` computes it every physics
+substep (impacts are too short for the 50 Hz control step) and keeps the
+per-joint peak. A position-output policy can lower it by touching down
+slowly and yielding at contact rather than holding the joint stiff;
+commanding less torque alone only trims the share below the effort limit.
+
+Outputs (ratio = peak |tau_gear| ÷ spec effort limit, 23.7 / 35.55 N·m;
+above 1 means an impact pushed more through the gears than the motor alone
+can apply):
+
+- Metrics: `gear_load_max_ratio` (episode worst) and
+  `gear_load_mean_peak_ratio` (typical per-step peak).
+- `run_eval.py` columns: `max_gear_load_ratio`, `worst_gear_joint`,
+  `mean_peak_gear_load_ratio`, `gear_overlimit_frac` (fraction of control
+  steps where some joint's ratio exceeded 1).
+- Viewer: a "Gear load" chart and bar panel in the Robot Health tab.
+
+For scale, the rough-terrain Go1 reference policy (256 episodes) gives a
+per-episode worst-joint ratio of median 1.06, p90 1.76, max 2.83, almost
+always on a knee; impulse pushes reach 3–4.
+
+It is purely observational: it isn't fed to the thermal model (motor
+current follows the motor's torque, not the rotor-braking share the gears
+carry) and doesn't change actuation. Absolute peaks depend on MuJoCo's
+contact softness and physics step, and the simulated gears are rigid (no
+backlash or compliance), so compare policies within the sim rather than
+reading the numbers as hardware loads.
 
 ## Related work
 
@@ -147,6 +192,13 @@ Unitree's official Go2 spec, [[6]](#references).
    — data source: reversible temperature coefficient of induction
    α(Br) = −0.12 %/°C, measured 20–80°C. Go2's actual magnet grade is
    unknown; N42 is a representative standard grade.
+9. Wensing, Wang, Seok, Otten, Lang, Kim, *"Proprioceptive Actuator
+   Design in the MIT Cheetah: Impact Mitigation and High-Bandwidth
+   Physical Interaction for Dynamic Legged Robots,"* IEEE Transactions on
+   Robotics 33(3), 509–522, 2017,
+   [10.1109/TRO.2016.2640183](https://doi.org/10.1109/TRO.2016.2640183) —
+   reflected rotor inertia (∝ N²) sets how much of an impact the
+   transmission carries; basis of `tau_gear` in `envs_mjlab/gear_load.py`.
 
 ## Known placeholders
 

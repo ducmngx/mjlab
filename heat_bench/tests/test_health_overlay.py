@@ -50,6 +50,22 @@ def test_setup_tab_creates_all_widgets():
   )  # SoC %, cumulative energy, capacity loss
 
 
+def test_gear_panel_shown_only_with_gear_term():
+  server = MagicMock()
+  gear = SimpleNamespace(last_peak_gear_load_ratio=torch.zeros(2, 12))
+  overlay = RobotHealthOverlay(server, _fake_term(), gear)
+  overlay.setup_tab()
+  assert server.gui.add_uplot.call_count == 5  # + gear load
+  assert server.gui.add_html.call_count == 4  # + gear load bars
+
+  gear.last_peak_gear_load_ratio[0, 2] = 2.1
+  overlay.update(paused=False, env_idx=0)
+  assert overlay._gear_chart.history[2][-1] == pytest.approx(2.1)
+
+  overlay.clear_histories()
+  assert len(overlay._gear_chart.history[2]) == 0
+
+
 def test_update_grows_history_and_pushes_values():
   server = MagicMock()
   term = _fake_term()

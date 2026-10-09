@@ -146,6 +146,17 @@ impulse_disturbance:
   cooldown_s: [1.0, 3.0]         # seconds of silence between impulses
   body_names: ["trunk"]
 
+# Gearbox load (heat_bench/envs_mjlab/gear_load.py): per-joint peak torque
+# through the transmission each control step, tau_gear = qfrc_actuator -
+# armature*qacc -- the motor's torque plus the torque spent braking the
+# rotor's reflected inertia at impacts (Wensing et al. 2017, README
+# References [9]). Passive: not used for heat or actuation. Reported as a
+# ratio to each joint's spec effort limit; >1 means an impact pushed more
+# through the gears than the motor alone can apply. No constants needed --
+# the Go1 MJCF's armature already models the rotor.
+gear_load:
+  enabled: true
+
 # Active actuator-health event (heat_bench/envs_mjlab/actuator_health.py):
 # owns per-joint derate/failure state and writes actuator_forcerange every
 # control step: Kt(T) thermal derate, battery voltage limit, scripted faults,

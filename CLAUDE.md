@@ -64,7 +64,8 @@ Some style guidelines to follow:
 `heat_bench/` (passive thermal/battery/torque benchmark for trained
 policies) bases several design decisions on published research rather than
 guesswork — the 14-node thermal topology, the 50Hz/200Hz update split,
-both battery models, and the Rd(T)/Kt(T) motor coefficients. Full context
+both battery models, the Rd(T)/Kt(T) motor coefficients, and the gearbox
+load signal. Full context
 and citations live in `heat_bench/README.md`'s "References" section; the
 papers themselves:
 
@@ -88,6 +89,10 @@ papers themselves:
    — annealed-copper resistance temperature coefficient (data source).
 8. Arnold Magnetic Technologies, *N42 NdFeB* datasheet — reversible
    α(Br) of NdFeB magnets (data source).
+9. Wensing, Wang, Seok, Otten, Lang, Kim, *"Proprioceptive Actuator Design
+   in the MIT Cheetah: Impact Mitigation and High-Bandwidth Physical
+   Interaction for Dynamic Legged Robots,"* IEEE T-RO 33(3), 509–522,
+   2017, 10.1109/TRO.2016.2640183 — reflected rotor inertia → gearbox load.
 
 When adding a new heat_bench design decision backed by research, cite it
 in both places: inline in the relevant module/config comment, and in

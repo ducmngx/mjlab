@@ -28,7 +28,13 @@ class HealthMonitoringViewer(ViserPlayViewer):
     term = self.env.unwrapped.observation_manager.get_term_cfg(
       "thermal", "thermal_energy"
     ).func
-    self._health_overlay = RobotHealthOverlay(self._server, term)
+    obs_manager = self.env.unwrapped.observation_manager
+    gear_term = (
+      obs_manager.get_term_cfg("gear_load", "gear_load").func
+      if "gear_load" in obs_manager.active_terms
+      else None
+    )
+    self._health_overlay = RobotHealthOverlay(self._server, term, gear_term)
 
     health_tabs = self._server.gui.add_tab_group()
     with health_tabs.add_tab("Robot Health", icon=viser.Icon.ACTIVITY_HEARTBEAT):

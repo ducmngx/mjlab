@@ -161,13 +161,12 @@ thermal/mechanical stress needed to exercise any of the above.
   - Ties into the *deterministic-thresholds-not-injected-hazard*
     principle: rough terrain doesn't need to "inject" impacts — it
     naturally produces the torque spikes that feed both the current
-    thermal model and any future impact-triggered mechanical failure
-    (Phase 3), for free, without any new mechanism.
+    thermal model and the Phase 3 gearbox-load metric, for free, without
+    any new mechanism.
 - **Disturbance**: already implemented — `push_by_setting_velocity`
   (instantaneous qvel kick) and `apply_body_impulse` (real force+torque
-  wrench, respects mass/inertia, debug-vis arrow). Impulse disturbance is
-  the natural trigger source for Phase 3's mechanical failure states
-  (sufficiently large impact → `free`/`locked` on the affected joint).
+  wrench, respects mass/inertia, debug-vis arrow). Impulse disturbance
+  drives the largest gearbox loads (3–4× the effort limit; see Phase 3).
 - **Payload**: already implemented via `dr.pseudo_inertia` (mass/inertia/
   COM jointly randomized). Increases baseline torque demand across all
   joints, indirectly raising baseline current/heat — a difficulty axis
@@ -219,7 +218,8 @@ Implemented in `heat_bench/envs_mjlab/actuator_health.py`, gated by
   events, so it copies the live per-env `forcerange` and each step writes
   `baseline × derate`. This resolves the DR write-ordering risk under
   "Event design" for `effort_limits`. `pd_gains` vs. gain writes for
-  `free`/`locked` still needs the same treatment in Phase 3.
+  `free`/`locked` would need the same treatment if those states are ever
+  built (shelved in Phase 3).
 - The thermal obs term is resolved lazily on first call (the
   EventManager is built before the ObservationManager).
 
@@ -301,13 +301,22 @@ Original scope:
 - Not included: irreversible NdFeB demagnetization (accumulating Kt loss
   above the magnet grade's max temperature), a separate later item.
 
-### Phase 3 — Mechanical failure states from disturbance
-- Extend impulse disturbance (or add a new event) so a sufficiently
-  large impact can trigger `free` or `locked` on the affected joint(s),
-  reusing the same state buffer/write path (gain-zeroing for `free`,
-  gain-maxing + frozen target for `locked`).
-- Open question, not blocking Phases 0-2: are mechanical states
-  reversible or also terminal? Decide when this phase starts.
+### Phase 3 — Gearbox load metric — DONE (failure models shelved)
+- Shipped instead of mechanical failure states: `envs_mjlab/gear_load.py`,
+  a passive per-substep `tau_gear = qfrc_actuator − armature·qacc` (the
+  rotor's reflected inertia, already in the Go1 MJCF, braked through the
+  gears at impacts; Wensing et al. 2017, README References [9]). Exposed as
+  the `"gear_load"` obs group, episode metrics, `run_eval.py` columns, and
+  a Robot Health viewer panel. Not fed to heat, doesn't touch actuation.
+- Explored and shelved as too heavy for the benchmark: impact-triggered
+  `free`/`locked` states with Weibull-scattered gear strength (β ≈ 11.7
+  fitted to AGMA/Shigley Table 14-10), a gearbox longevity metric
+  (rainflow + Basquin + Miner after Wu et al., arXiv:2507.17275, with the
+  ISO 6336-3 bending slope), and RL-style random fault injection.
+- If a mechanical failure threshold is ever revisited: normal rough-terrain
+  walking already loads the knee gearbox to ~2× the effort limit at
+  footfalls (pushes 3–4×), so any threshold must sit above that, and its
+  value is sim-dependent (contact softness, physics step, rigid gears).
 
 ### Phase 4 — Difficulty presets
 - Named tiers bundling terrain config + payload + push/impulse
@@ -342,7 +351,6 @@ Original scope:
 
 ## Open questions to resolve when each phase starts
 
-- Mechanical failure states (Phase 3): reversible or terminal?
 - Unitree 80°C shutdown condition (user-owned): trip/re-enable hysteresis
   and where it writes (`derate`/`state`), plus a cited source.
 - Resolved: failure-decision granularity is the control step (Phase 0);

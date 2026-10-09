@@ -83,14 +83,19 @@ class _MultiSeriesChart:
 class RobotHealthOverlay:
   """Owns the Robot Health tab's widgets and per-frame updates."""
 
-  def __init__(self, server: viser.ViserServer, term: Any) -> None:
+  def __init__(
+    self, server: viser.ViserServer, term: Any, gear_term: Any | None = None
+  ) -> None:
     """Args:
     server: The Viser server instance.
     term: The live ``ThermalEnergyObservation`` instance (resolved via
       ``env.unwrapped.observation_manager.get_term_cfg(...).func``).
+    gear_term: The live ``GearLoadObservation``, or None when the
+      ``gear_load`` group is disabled (no gear panel is shown).
     """
     self._server = server
     self._term = term
+    self._gear_term = gear_term
 
     # `term.joint_names` are the actual resolved joint names (e.g.
     # "FR_hip_joint"), in the same order as last_current/last_torque and
@@ -101,10 +106,12 @@ class RobotHealthOverlay:
     self._thermal_chart = _MultiSeriesChart(self.thermal_node_names)
     self._current_chart = _MultiSeriesChart(self.joint_names)
     self._torque_chart = _MultiSeriesChart(self.joint_names)
+    self._gear_chart = _MultiSeriesChart(self.joint_names)
 
     self._thermal_bars: NodeBarPanel | None = None
     self._current_bars: NodeBarPanel | None = None
     self._torque_bars: NodeBarPanel | None = None
+    self._gear_bars: NodeBarPanel | None = None
     self._soc_bar = None
     self._soc_readout: viser.GuiNumberHandle | None = None
     self._bus_voltage_chart = _MultiSeriesChart(["bus_voltage_v"])
@@ -130,6 +137,16 @@ class RobotHealthOverlay:
     self._torque_bars = NodeBarPanel(
       self._server, self.joint_names, low=0.0, high=35.0, unit="Nm"
     )
+
+    if self._gear_term is not None:
+      self._server.gui.add_markdown("### Gear load (12 joints)")
+      self._gear_chart.create(
+        self._server, "Peak gearbox load / effort limit (>1: impact)"
+      )
+      # 2.5x: rough-terrain policies reach ~2x at footfalls, more under pushes.
+      self._gear_bars = NodeBarPanel(
+        self._server, self.joint_names, low=0.0, high=2.5, unit="x"
+      )
 
     self._server.gui.add_markdown("### Battery")
     # Initialize from the live SoC (whatever `initial_soc` the config sets)
@@ -169,6 +186,12 @@ class RobotHealthOverlay:
     if self._torque_bars is not None:
       self._torque_bars.update(torque)
 
+    if self._gear_term is not None:
+      gear = self._gear_term.last_peak_gear_load_ratio[env_idx].detach().cpu()
+      self._gear_chart.push(gear.numpy())
+      if self._gear_bars is not None:
+        self._gear_bars.update(gear.numpy())
+
     soc_pct = float(term.battery.soc[env_idx].item()) * 100.0
     if self._soc_bar is not None:
       self._soc_bar.value = soc_pct
@@ -191,6 +214,7 @@ class RobotHealthOverlay:
     self._thermal_chart.clear()
     self._current_chart.clear()
     self._torque_chart.clear()
+    self._gear_chart.clear()
     self._bus_voltage_chart.clear()
     if self._thermal_bars is not None:
       self._thermal_bars.clear()
@@ -198,15 +222,22 @@ class RobotHealthOverlay:
       self._current_bars.clear()
     if self._torque_bars is not None:
       self._torque_bars.clear()
+    if self._gear_bars is not None:
+      self._gear_bars.clear()
 
   def cleanup(self) -> None:
     self._thermal_chart.cleanup()
     self._current_chart.cleanup()
     self._torque_chart.cleanup()
+    self._gear_chart.cleanup()
     self._bus_voltage_chart.cleanup()
     if self._thermal_bars is not None:
       self._thermal_bars.cleanup()
     if self._current_bars is not None:
       self._current_bars.cleanup()
+    if self._torque_bars is not None:
+      self._torque_bars.cleanup()
+    if self._gear_bars is not None:
+      self._gear_bars.cleanup()
     if self._torque_bars is not None:
       self._torque_bars.cleanup()

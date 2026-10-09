@@ -55,6 +55,26 @@ if TYPE_CHECKING:
   from mjlab.managers.event_manager import EventTermCfg
 
 
+def ctrl_ids_for_joints(
+  asset, joint_ids: list[int], joint_names: list[str]
+) -> torch.Tensor:
+  """Global ctrl index of the actuator driving each joint, in ``joint_ids``
+  order. Actuator ctrl order need not match joint order, so model fields
+  indexed by actuator (e.g. ``actuator_forcerange``) must go through this."""
+  ctrl_for_joint: dict[int, int] = {}
+  for actuator in asset.actuators:
+    for joint_id, ctrl_id in zip(
+      actuator.target_ids.tolist(), actuator.global_ctrl_ids.tolist(), strict=True
+    ):
+      ctrl_for_joint[joint_id] = ctrl_id
+  missing = [
+    n for j, n in zip(joint_ids, joint_names, strict=True) if j not in ctrl_for_joint
+  ]
+  if missing:
+    raise ValueError(f"No actuator drives joints {missing}.")
+  return torch.tensor([ctrl_for_joint[j] for j in joint_ids], dtype=torch.long)
+
+
 class ActuatorState(IntEnum):
   """Discrete per-joint consequence state (see PLAN.md, "Causes vs.
   consequence states"). Thermal Kt fade alone never changes it; only fault
@@ -89,24 +109,8 @@ class apply_actuator_health:
     self._asset = asset
     joint_ids, self.joint_names = asset.find_joints(asset_cfg.joint_names)
     self._joint_ids = torch.tensor(joint_ids, device=env.device, dtype=torch.long)
-
-    # Actuator ctrl order need not match joint order, so map each resolved
-    # joint to the ctrl index of the actuator driving it.
-    ctrl_for_joint: dict[int, int] = {}
-    for actuator in asset.actuators:
-      for joint_id, ctrl_id in zip(
-        actuator.target_ids.tolist(), actuator.global_ctrl_ids.tolist(), strict=True
-      ):
-        ctrl_for_joint[joint_id] = ctrl_id
-    missing = [
-      n
-      for j, n in zip(joint_ids, self.joint_names, strict=True)
-      if j not in ctrl_for_joint
-    ]
-    if missing:
-      raise ValueError(f"No actuator drives joints {missing}.")
-    self.ctrl_ids = torch.tensor(
-      [ctrl_for_joint[j] for j in joint_ids], device=env.device, dtype=torch.long
+    self.ctrl_ids = ctrl_ids_for_joints(asset, joint_ids, self.joint_names).to(
+      env.device
     )
 
     num_joints = len(joint_ids)

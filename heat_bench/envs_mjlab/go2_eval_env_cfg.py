@@ -27,6 +27,7 @@ from heat_bench.envs_mjlab.eval_observations import (
   thermal_max_joint_temp,
   thermal_mean_joint_temp,
 )
+from heat_bench.envs_mjlab.gear_load import GearLoadObservation, gear_load_peak_ratio
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
@@ -139,6 +140,27 @@ def go2_eval_env_cfg(
     reduce="last",
     params={"obs_group": "thermal", "obs_term": "thermal_energy"},
   )
+
+  if hb_cfg.get("gear_load", {}).get("enabled", False):
+    # Separate group so the thermal observation vector stays unchanged.
+    # Registered after "thermal", so its sim.step wrap chains onto the
+    # thermal term's.
+    cfg.observations["gear_load"] = ObservationGroupCfg(
+      terms={
+        "gear_load": ObservationTermCfg(
+          func=GearLoadObservation, params={"asset_cfg": robot_asset_cfg}
+        ),
+      },
+      concatenate_terms=True,
+      enable_corruption=False,
+    )
+    gear_params = {"obs_group": "gear_load", "obs_term": "gear_load"}
+    cfg.metrics["gear_load_max_ratio"] = MetricsTermCfg(
+      func=gear_load_peak_ratio, reduce="max", params=gear_params
+    )
+    cfg.metrics["gear_load_mean_peak_ratio"] = MetricsTermCfg(
+      func=gear_load_peak_ratio, reduce="mean", params=gear_params
+    )
 
   if hb_cfg.get("actuator_health", {}).get("enabled", False):
     cfg.events["actuator_health"] = EventTermCfg(
