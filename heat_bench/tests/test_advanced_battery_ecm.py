@@ -111,9 +111,11 @@ def test_capacity_loss_higher_at_higher_temperature():
   cool_temp = torch.full((1,), 25.0, device=cool_battery.device)
   hot_temp = torch.full((1,), 60.0, device=hot_battery.device)
 
-  for _ in range(20):
-    _, _, _, cool_loss = cool_battery.step(current, mech_power, heat, cool_temp, DT)
-    _, _, _, hot_loss = hot_battery.step(current, mech_power, heat, hot_temp, DT)
+  for _ in range(19):
+    cool_battery.step(current, mech_power, heat, cool_temp, DT)
+    hot_battery.step(current, mech_power, heat, hot_temp, DT)
+  _, _, _, cool_loss = cool_battery.step(current, mech_power, heat, cool_temp, DT)
+  _, _, _, hot_loss = hot_battery.step(current, mech_power, heat, hot_temp, DT)
 
   assert hot_loss.item() > cool_loss.item()
 

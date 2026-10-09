@@ -266,15 +266,17 @@ class scripted_joint_fault:
     dead_at_s: float,
   ) -> None:
     del env_ids, joint_names, health_term
-    if self._health is None:
-      self._health = env.event_manager.get_term_cfg(self._health_term_name).func
-      unknown = [n for n in self._joint_names if n not in self._health.joint_names]
+    health = self._health
+    if health is None:
+      health = env.event_manager.get_term_cfg(self._health_term_name).func
+      self._health = health
+      unknown = [n for n in self._joint_names if n not in health.joint_names]
       if unknown:
         raise ValueError(
-          f"Unknown joints {unknown}; expected any of {self._health.joint_names}."
+          f"Unknown joints {unknown}; expected any of {health.joint_names}."
         )
       self._joint_idx = torch.tensor(
-        [self._health.joint_names.index(n) for n in self._joint_names],
+        [health.joint_names.index(n) for n in self._joint_names],
         device=env.device,
       )
 
@@ -289,9 +291,9 @@ class scripted_joint_fault:
     )
     # Same schedule for every selected joint: broadcast [N] -> [N, K].
     num_joints = len(self._joint_idx)
-    self._health.derate[:, self._joint_idx] = (
+    health.derate[:, self._joint_idx] = (
       torch.where(dead, 0.0, derate).unsqueeze(-1).expand(-1, num_joints)
     )
-    self._health.state[:, self._joint_idx] = (
+    health.state[:, self._joint_idx] = (
       state.to(torch.int8).unsqueeze(-1).expand(-1, num_joints)
     )

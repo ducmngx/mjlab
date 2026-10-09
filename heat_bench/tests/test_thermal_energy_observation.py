@@ -206,8 +206,9 @@ def test_battery_model_switch_via_config():
 
   sim.data.qfrc_actuator[:] = 20.0
   sim.data.qvel[:] = 5.0
-  for _ in range(30):
-    obs = term(env, asset_cfg)
+  for _ in range(29):
+    term(env, asset_cfg)
+  obs = term(env, asset_cfg)
 
   assert obs.shape == (num_envs, 14)
   assert (term.last_capacity_loss_pct >= 0).all()
@@ -316,8 +317,9 @@ def test_cumulative_distance_traveled_accumulates_and_resets():
   dummy_cfg = MetricsTermCfg(func=CumulativeDistanceTraveled)
   metric = CumulativeDistanceTraveled(cfg=dummy_cfg, env=env)
 
-  for _ in range(10):
-    total = metric(env, asset_cfg)
+  for _ in range(9):
+    metric(env, asset_cfg)
+  total = metric(env, asset_cfg)
 
   expected = torch.tensor([5.0 * env.step_dt * 10, 0.0], device=device)
   assert torch.allclose(total, expected, atol=1e-5)

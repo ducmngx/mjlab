@@ -38,10 +38,11 @@ def test_zero_current_leaves_soc_and_energy_unchanged():
   heat = torch.zeros(1, 12, device=battery.device)
   chassis_temp = _chassis_temp(1, battery.device)
 
-  for _ in range(10):
-    energy, bus_v, soc, capacity_loss = battery.step(
-      current, mech_power, heat, chassis_temp, DT
-    )
+  for _ in range(9):
+    battery.step(current, mech_power, heat, chassis_temp, DT)
+  energy, bus_v, soc, capacity_loss = battery.step(
+    current, mech_power, heat, chassis_temp, DT
+  )
 
   assert torch.allclose(soc, torch.ones_like(soc))
   assert torch.allclose(energy, torch.zeros_like(energy))
