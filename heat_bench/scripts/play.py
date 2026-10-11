@@ -72,6 +72,10 @@ class PlayConfig:
   healthy -> derated (torque limit ramps to 30% over 3-6s) -> dead (zero
   torque at 10s), timed per episode. All other joints stay healthy. Demo of the actuator_health
   write path; not yet a temperature-driven failure."""
+  gear_break: bool = False
+  """Turn on the gearbox overload break (actuator_health.gear_break): each
+  joint draws a Weibull gearbox strength per episode and goes limp (FREE,
+  zero torque) once an impact's gear load reaches it."""
   port: int = 8080
   """Viser server port. Use a different port per instance to run more than
   one viewer (e.g. two battery models) side by side."""
@@ -81,7 +85,9 @@ def run_play(cfg: PlayConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-  env_cfg = go2_eval_env_cfg(play=True, battery_model=cfg.battery_model)
+  env_cfg = go2_eval_env_cfg(
+    play=True, battery_model=cfg.battery_model, gear_break=cfg.gear_break
+  )
   if cfg.push_disturbance:
     add_push_disturbance(env_cfg)
   if cfg.impulse_disturbance:
@@ -111,6 +117,12 @@ def run_play(cfg: PlayConfig) -> None:
     print(
       "[INFO] Impulse disturbance enabled: force-based push/kick -- watch "
       "for the magenta arrow (debug visualization is on by default)."
+    )
+
+  if cfg.gear_break:
+    print(
+      "[INFO] Gearbox break enabled: a joint goes limp once an impact's gear "
+      "load reaches its sampled strength."
     )
 
   if cfg.joint_fault:

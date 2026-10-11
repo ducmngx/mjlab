@@ -170,3 +170,25 @@ actuator_health:
   # winding hot spot. Not Go2's 80-85C software shutdown, which is a
   # reversible protective cutoff. null = joints never die.
   dead_temp_c: 85.0               # USER-SET
+  # Gearbox overload break (stress-strength interference): at each reset
+  # every joint's gearbox draws a strength S ~ Weibull(shape, scale), in
+  # units of its spec effort limit. A joint breaks -- latches FREE, zero
+  # torque, until reset -- once a control step's peak gear load (gear_load
+  # above) reaches S. Randomness lives only in the part's strength, so
+  # failure odds still rise with how hard the policy loads its gears.
+  # Requires gear_load.enabled. Off by default; turn on with --gear-break
+  # on play.py / run_eval.py (or enabled: true here).
+  gear_break:
+    enabled: false
+    # Least-squares fit of a Weibull to AGMA's gear reliability factors K_R
+    # (Shigley's Mechanical Engineering Design, Table 14-10; README
+    # References [10]): K_R scatter is fatigue-strength scatter, used here
+    # as the part-to-part strength spread. Pairwise fits span 9.7-14.5.
+    weibull_shape: 11.68
+    # USER-SET calibration, not hardware: tau_gear's scale is sim-dependent.
+    # Chosen so the reference rough-terrain Go1 policy (model_9999.pt,
+    # 2026-09-22_22-12-37) breaks a gearbox in ~1% of run_eval episodes
+    # (default push_robot on; ~0.4% without pushes, ~2% with
+    # impulse_disturbance), measured over 512 episodes. Its knee peaks per
+    # episode: p50 0.94x, p99 1.95x, max 2.85x the effort limit.
+    weibull_scale: 2.75

@@ -48,6 +48,9 @@ class RunEvalConfig:
   """Where to dump per-episode results. '.csv' or '.json' by suffix."""
   log_root: str = "logs/rsl_rl"
   """Root directory under which experiment logs are written."""
+  gear_break: bool = False
+  """Turn on the gearbox overload break (actuator_health.gear_break); its
+  breaks are reported in the broken_joints / first_break_s columns."""
 
 
 def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
@@ -57,7 +60,7 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
   # play=False: finite episode_length_s and terrain-bounds termination stay
   # enabled, so episodes actually end. play=True is for the interactive
   # viewer (infinite episode length) and would hang this headless loop.
-  env_cfg = go2_eval_env_cfg(play=False)
+  env_cfg = go2_eval_env_cfg(play=False, gear_break=cfg.gear_break)
   agent_cfg = load_rl_cfg(REFERENCE_TASK_ID)
   env_cfg.scene.num_envs = cfg.num_envs
 
@@ -107,6 +110,8 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
   final_soc = torch.ones(cfg.num_envs, device=device)
   dead_joints = torch.zeros(cfg.num_envs, device=device)
   first_death_s = torch.full((cfg.num_envs,), float("nan"), device=device)
+  broken_joints = torch.zeros(cfg.num_envs, device=device)
+  first_break_s = torch.full((cfg.num_envs,), float("nan"), device=device)
   max_gear_ratio = torch.zeros(cfg.num_envs, device=device)
   worst_gear_joint = torch.zeros(cfg.num_envs, dtype=torch.long, device=device)
   sum_step_gear_ratio = torch.zeros(cfg.num_envs, device=device)
@@ -153,6 +158,16 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
       dead_joints = torch.where(
         active, torch.maximum(dead_joints, dead_now), dead_joints
       )
+      # Same for the gearbox break latch (all False when gear_break is off).
+      broken_now = health_term.broken.sum(dim=-1).float()
+      first_break_s = torch.where(
+        active & (broken_now > 0) & first_break_s.isnan(),
+        step_count * env.unwrapped.step_dt,
+        first_break_s,
+      )
+      broken_joints = torch.where(
+        active, torch.maximum(broken_joints, broken_now), broken_joints
+      )
 
     if gear_term is not None:
       # Worst joint's peak gear load / effort limit over this control step.
@@ -189,6 +204,8 @@ def run_eval(cfg: RunEvalConfig) -> list[dict[str, float]]:
         "final_soc": final_soc[env_id].item(),
         "dead_joints": int(dead_joints[env_id].item()),
         "first_death_s": first_death_s[env_id].item(),
+        "broken_joints": int(broken_joints[env_id].item()),
+        "first_break_s": first_break_s[env_id].item(),
       }
     )
     if gear_term is not None:

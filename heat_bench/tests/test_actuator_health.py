@@ -54,6 +54,7 @@ def _make_term(
   hb_cfg = load_heat_bench_config()
   hb_cfg["battery"].update(battery)
   hb_cfg["actuator_health"]["dead_temp_c"] = dead_temp_c
+  hb_cfg["actuator_health"]["gear_break"] = None
   params = {
     "asset_cfg": SceneEntityCfg(name="robot", joint_names=(".*",)),
     "obs_group": "thermal",
@@ -415,3 +416,94 @@ def test_knee_voltage_limit_uses_its_extra_reduction():
   for j, n in ((thigh, thermal["gear_ratio_N"]), (knee, thermal["gear_ratio_N"] * 1.5)):
     expected = n * kt * (24.0 - kt * n * 6.0) / rd
     assert term.voltage_hi[0, j].item() == pytest.approx(expected, rel=1e-4)
+
+
+def _make_gear_break_term(device: str, num_envs: int, shape=11.68, scale=2.75):
+  term, env, entity, params = _make_term(device, num_envs=num_envs)
+  params["config"]["actuator_health"]["gear_break"] = {
+    "enabled": True,
+    "weibull_shape": shape,
+    "weibull_scale": scale,
+  }
+  params["gear_obs_group"] = "gear_load"
+  params["gear_obs_term"] = "gear_load"
+  env.gear_ratio = torch.zeros(num_envs, 12, device=device)
+  env.gear_stub = SimpleNamespace(step_peak_ratio=lambda: env.gear_ratio)
+  env.observation_manager.get_term_cfg.side_effect = lambda group, _: Mock(
+    func=env.gear_stub if group == "gear_load" else env.thermal_stub
+  )
+  term_cfg = EventTermCfg(func=apply_actuator_health, mode="step", params=params)
+  return apply_actuator_health(term_cfg, env), env, entity, params
+
+
+def test_gear_strength_samples_follow_weibull():
+  device = get_test_device()
+  term, *_ = _make_gear_break_term(device, num_envs=4096, shape=11.68, scale=2.75)
+  median = term.gear_strength.flatten().median().item()
+  assert median == pytest.approx(
+    2.75 * torch.log(torch.tensor(2.0)) ** (1 / 11.68), rel=0.01
+  )
+  old = term.gear_strength.clone()
+  term.reset(torch.tensor([0], device=device))
+  assert not torch.equal(term.gear_strength[0], old[0])
+  torch.testing.assert_close(term.gear_strength[1:], old[1:])
+
+
+def test_overloaded_gear_breaks_free_and_stays_broken_until_reset():
+  device = get_test_device()
+  term, env, _, params = _make_gear_break_term(device, num_envs=2)
+  forcerange = env.sim.model.actuator_forcerange
+  full = forcerange[:, term.ctrl_ids].clone()
+  term.gear_strength[:] = 3.0
+
+  env.gear_ratio[0, 2] = 2.9
+  term(env, None, **params)
+  assert (term.state == ActuatorState.HEALTHY).all()
+
+  env.gear_ratio[0, 2] = 3.0
+  term(env, None, **params)
+  assert term.state[0, 2] == ActuatorState.FREE
+  assert (forcerange[0, term.ctrl_ids[2]] == 0.0).all()
+  others = [j for j in range(12) if j != 2]
+  assert (term.state[0, others] == ActuatorState.HEALTHY).all()
+  torch.testing.assert_close(forcerange[1, term.ctrl_ids], full[1])
+
+  # A limp joint carries no load, but it stays broken.
+  env.gear_ratio[:] = 0.0
+  term(env, None, **params)
+  assert term.state[0, 2] == ActuatorState.FREE
+
+  term.reset(torch.tensor([0], device=device))
+  term(env, None, **params)
+  assert (term.state[0] == ActuatorState.HEALTHY).all()
+  torch.testing.assert_close(forcerange[0, term.ctrl_ids], full[0])
+
+
+def test_thermal_death_overrides_broken_gear_state():
+  device = get_test_device()
+  term, env, _, params = _make_gear_break_term(device, num_envs=1)
+  term._dead_temp_c = 120.0
+  term.gear_strength[:] = 3.0
+  env.gear_ratio[0, 2] = 5.0
+  env.thermal_stub.last_joint_temps[0, 2] = 130.0
+  term(env, None, **params)
+  assert term.broken[0, 2] and term.dead[0, 2]
+  assert term.state[0, 2] == ActuatorState.DEAD
+
+
+def test_gear_break_requires_gear_load(monkeypatch):
+  module = importlib.import_module("heat_bench.envs_mjlab.go2_eval_env_cfg")
+  hb_cfg = load_heat_bench_config()
+  hb_cfg["gear_load"] = {"enabled": False}
+  monkeypatch.setattr(module, "load_heat_bench_config", lambda: hb_cfg)
+  with pytest.raises(ValueError, match="gear_load"):
+    go2_eval_env_cfg(play=True, gear_break=True)
+
+
+def test_gear_break_off_by_default_and_wired_by_flag():
+  assert "gear_obs_group" not in go2_eval_env_cfg().events["actuator_health"].params
+  cfg = go2_eval_env_cfg(play=True, gear_break=True)
+  params = cfg.events["actuator_health"].params
+  assert params["gear_obs_group"] == "gear_load"
+  assert params["gear_obs_term"] == "gear_load"
+  assert params["config"]["actuator_health"]["gear_break"]["enabled"]

@@ -67,8 +67,8 @@ Go2 MJCF later without touching the physics engines.
   load" below. Toggle with `gear_load.enabled` in the yaml.
 - **`scripts/run_eval.py`** — headless batch evaluation of a checkpoint,
   dumping per-episode results to CSV/JSON (including `dead_joints` and
-  `first_death_s` when a death threshold is set, and the gear-load columns
-  below).
+  `first_death_s` when a death threshold is set, `broken_joints` and
+  `first_break_s` with `--gear-break`, and the gear-load columns below).
 - **`scripts/play.py`** + **`viewer/`** — an interactive Viser-based viewer
   with a live "Robot Health" tab: per-node thermal, current, torque, and
   gear-load charts (all nodes on shared axes, not just aggregates) plus a
@@ -122,12 +122,25 @@ For scale, the rough-terrain Go1 reference policy (256 episodes) gives a
 per-episode worst-joint ratio of median 1.06, p90 1.76, max 2.83, almost
 always on a knee; impulse pushes reach 3–4.
 
-It is purely observational: it isn't fed to the thermal model (motor
-current follows the motor's torque, not the rotor-braking share the gears
-carry) and doesn't change actuation. Absolute peaks depend on MuJoCo's
-contact softness and physics step, and the simulated gears are rigid (no
-backlash or compliance), so compare policies within the sim rather than
-reading the numbers as hardware loads.
+The load itself isn't fed to the thermal model (motor current follows the
+motor's torque, not the rotor-braking share the gears carry). Absolute
+peaks depend on MuJoCo's contact softness and physics step, and the
+simulated gears are rigid (no backlash or compliance), so compare policies
+within the sim rather than reading the numbers as hardware loads.
+
+**Gearbox break** (`--gear-break` on `play.py` / `run_eval.py`, or
+`actuator_health.gear_break.enabled`; off by default). The one
+place gear load changes actuation is stress-strength interference. At each
+reset every joint's gearbox draws a strength S ~ Weibull(β, η), in units
+of its effort limit. Once a control step's peak ratio reaches S, the joint
+latches `FREE` (stripped teeth, zero torque) until reset. Only the part's
+strength is random, so a policy that loads its gears harder breaks more
+often, and avoidance stays measurable. β = 11.68 comes from AGMA's
+reliability factors [[10]](#references). η = 2.75 is a calibration, not a
+hardware rating: it is set so the reference policy breaks a gearbox in
+~1% of `run_eval.py` episodes (~0.4% without pushes, ~2% with
+`impulse_disturbance`). Failure is now a rate, so compare policies over
+many episodes with fixed seeds.
 
 ## Related work
 
@@ -199,6 +212,11 @@ Unitree's official Go2 spec, [[6]](#references).
    [10.1109/TRO.2016.2640183](https://doi.org/10.1109/TRO.2016.2640183) —
    reflected rotor inertia (∝ N²) sets how much of an impact the
    transmission carries; basis of `tau_gear` in `envs_mjlab/gear_load.py`.
+10. Budynas, Nisbett, *Shigley's Mechanical Engineering Design*, 10th ed.,
+    McGraw-Hill, 2015, Table 14-10 (reliability factors K_R, from AGMA
+    2001-D04) — gear strength scatter vs. reliability; a least-squares
+    Weibull fit to its five rows gives the gearbox-break shape β = 11.68
+    in `actuator_health.gear_break`.
 
 ## Known placeholders
 
@@ -260,6 +278,10 @@ noted otherwise.
   episode, via `scripted_joint_fault` writing the actuator-health event's
   buffers. A controlled demo of the torque-limit path, not a physical
   failure model — Phase 1+ derive failure from tracked temperature.
+- **Gearbox break** (`--gear-break` on `play.py` and `run_eval.py`) —
+  each joint draws a Weibull gearbox strength per episode and goes limp
+  (`FREE`, zero torque) once an impact's gear load reaches it. See
+  "Gearbox break" above.
 - **Battery-limited torque** (`battery.voltage_limited_torque`, on by
   default) — set `false` to compare against the current-limit-only
   behavior, e.g. alongside a low `battery.initial_soc` to see what a

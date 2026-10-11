@@ -46,7 +46,9 @@ has followed since day one exists specifically so this remains possible.
   rollouts, resets, and existing DR events, since it's a normal
   `EventTerm`, not a monkeypatch extension.
 - **Deterministic thresholds, not injected hazard** — failure state is a
-  function of tracked state, not a sampled random event. This is the
+  function of tracked state, not a sampled random event. Randomness may
+  live in component *strength*, sampled at reset (Phase 3b), never in
+  *when* a fault fires. This is the
   core philosophical point from the original terrain discussion: failure
   should be a *consequence* of stress, not a scripted/randomly-timed
   event, so the platform can be used to study *prediction and prevention*
@@ -317,6 +319,20 @@ Original scope:
   walking already loads the knee gearbox to ~2× the effort limit at
   footfalls (pushes 3–4×), so any threshold must sit above that, and its
   value is sim-dependent (contact softness, physics step, rigid gears).
+
+### Phase 3b — Gearbox overload break — DONE
+- Stress-strength interference in `apply_actuator_health`: each reset,
+  every joint draws a gearbox strength S ~ Weibull(β, η) in effort-limit
+  units; once a control step's peak `tau_gear` ratio reaches S, the joint
+  latches `FREE` (zero torque) until reset. Thermal `DEAD` overrides it.
+  Opt-in: `--gear-break` on `play.py` / `run_eval.py`.
+- β = 11.68: least-squares Weibull fit to AGMA reliability factors K_R
+  (Shigley Table 14-10, README References [10]). η = 2.75 is a declared
+  calibration: the reference policy breaks a gearbox in ~1% of `run_eval`
+  episodes (~0.4% without pushes, ~2% with impulses; 512 episodes).
+- Metrics: `run_eval.py` `broken_joints`, `first_break_s`.
+- Not included: `LOCKED` (jammed) gears, fatigue accumulation (the
+  shelved rainflow/Miner work), and thermal Arrhenius aging.
 
 ### Phase 4 — Difficulty presets
 - Named tiers bundling terrain config + payload + push/impulse

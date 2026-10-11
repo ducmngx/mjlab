@@ -16,6 +16,7 @@ import yaml
 
 from heat_bench.envs_mjlab.actuator_health import (
   apply_actuator_health,
+  enabled_gear_break,
   scripted_joint_fault,
 )
 from heat_bench.envs_mjlab.eval_observations import (
@@ -73,7 +74,7 @@ class CumulativeDistanceTraveled:
 
 
 def go2_eval_env_cfg(
-  play: bool = True, battery_model: str | None = None
+  play: bool = True, battery_model: str | None = None, gear_break: bool = False
 ) -> ManagerBasedRlEnvCfg:
   """Create the passive Go2-hardware-modeled thermal/battery eval config.
 
@@ -82,11 +83,15 @@ def go2_eval_env_cfg(
     battery_model: If given, overrides the yaml's `battery.model` ("rint"
       or "rint_soc_aging") -- lets scripts A/B compare battery models
       without editing configs/go2_eval_config.yaml.
+    gear_break: Turn on the yaml's `actuator_health.gear_break` gearbox
+      overload break (off by default). Requires gear_load.
   """
   cfg = unitree_go1_rough_env_cfg(play=play)
   hb_cfg = load_heat_bench_config()
   if battery_model is not None:
     hb_cfg["battery"]["model"] = battery_model
+  if gear_break:
+    hb_cfg["actuator_health"]["gear_break"]["enabled"] = True
   robot_asset_cfg = SceneEntityCfg("robot", joint_names=(".*",))
 
   cfg.observations["thermal"] = ObservationGroupCfg(
@@ -162,16 +167,21 @@ def go2_eval_env_cfg(
       func=gear_load_peak_ratio, reduce="mean", params=gear_params
     )
 
-  if hb_cfg.get("actuator_health", {}).get("enabled", False):
+  health_cfg = hb_cfg.get("actuator_health", {})
+  if health_cfg.get("enabled", False):
+    health_params = {
+      "asset_cfg": robot_asset_cfg,
+      "obs_group": "thermal",
+      "obs_term": "thermal_energy",
+      "config": hb_cfg,
+    }
+    if enabled_gear_break(hb_cfg) is not None:
+      if "gear_load" not in cfg.observations:
+        raise ValueError("actuator_health.gear_break requires gear_load.enabled.")
+      health_params["gear_obs_group"] = "gear_load"
+      health_params["gear_obs_term"] = "gear_load"
     cfg.events["actuator_health"] = EventTermCfg(
-      func=apply_actuator_health,
-      mode="step",
-      params={
-        "asset_cfg": robot_asset_cfg,
-        "obs_group": "thermal",
-        "obs_term": "thermal_energy",
-        "config": hb_cfg,
-      },
+      func=apply_actuator_health, mode="step", params=health_params
     )
 
   payload_cfg = hb_cfg.get("payload", {})

@@ -20,6 +20,14 @@ the observation term's cached joint temperatures and writes
   0) until the episode resets, even after it cools. The threshold is
   user-set and compared against the lumped joint node, which runs cooler
   than the winding hot spot. ``None`` disables it.
+- Gearbox overload break (Phase 3b): at each reset every joint draws a
+  gearbox strength from a Weibull (``actuator_health.gear_break``, in units
+  of the spec effort limit; off by default). Once a control step's peak gear load
+  (``GearLoadObservation.step_peak_ratio``) reaches it, the joint latches
+  ``FREE`` -- stripped teeth, zero torque -- until reset. Only the strength
+  is random, so the odds of breaking still follow how hard the policy
+  loads its gears (stress-strength interference). Thermal death takes
+  precedence in ``state`` when both happen.
 
 That product is the *current-limited* range. When
 ``battery.voltage_limited_torque`` is on, the range is further narrowed to
@@ -75,11 +83,19 @@ def ctrl_ids_for_joints(
   return torch.tensor([ctrl_for_joint[j] for j in joint_ids], dtype=torch.long)
 
 
+def enabled_gear_break(hb_cfg: dict) -> dict | None:
+  """The ``actuator_health.gear_break`` section if it's turned on, else None."""
+  gear_break = hb_cfg["actuator_health"].get("gear_break")
+  if gear_break is None or not gear_break.get("enabled", False):
+    return None
+  return gear_break
+
+
 class ActuatorState(IntEnum):
   """Discrete per-joint consequence state (see PLAN.md, "Causes vs.
   consequence states"). Thermal Kt fade alone never changes it; only fault
-  conditions (e.g. ``scripted_joint_fault``, the thermal death latch) set
-  non-HEALTHY states."""
+  conditions (e.g. ``scripted_joint_fault``, the thermal death latch, a
+  gearbox break) set non-HEALTHY states."""
 
   HEALTHY = 0
   DERATED = 1
@@ -144,6 +160,15 @@ class apply_actuator_health:
       env.num_envs, num_joints, device=env.device, dtype=torch.bool
     )
     """Thermal death latch per (env, joint); cleared only on reset."""
+    self._gear_break = enabled_gear_break(hb_cfg)
+    self.gear_strength = torch.full(
+      (env.num_envs, num_joints), torch.inf, device=env.device
+    )
+    """Gearbox strength per (env, joint), in units of the spec effort limit;
+    resampled at reset, +inf when ``gear_break`` is off."""
+    self._sample_gear_strength(slice(None))
+    self.broken = torch.zeros_like(self.dead)
+    """Gearbox break latch per (env, joint); cleared only on reset."""
     self.baseline_forcerange = env.sim.model.actuator_forcerange[
       :, self.ctrl_ids
     ].clone()
@@ -155,6 +180,17 @@ class apply_actuator_health:
 
     # Resolved lazily: the EventManager is built before the ObservationManager.
     self._thermal_term = None
+    self._gear_term = None
+
+  def _sample_gear_strength(self, env_ids: torch.Tensor | slice) -> None:
+    if self._gear_break is None:
+      return
+    # Inverse-CDF Weibull draw. rand is in [0, 1), so -log(u) > 0; u == 0
+    # gives an unbreakable +inf, never a zero-strength gear.
+    u = torch.rand_like(self.gear_strength[env_ids])
+    self.gear_strength[env_ids] = self._gear_break["weibull_scale"] * (
+      -torch.log(u)
+    ) ** (1.0 / self._gear_break["weibull_shape"])
 
   def reset(self, env_ids: torch.Tensor | slice | None) -> None:
     if env_ids is None:
@@ -165,6 +201,8 @@ class apply_actuator_health:
     self.voltage_hi[env_ids] = torch.inf
     self.state[env_ids] = ActuatorState.HEALTHY
     self.dead[env_ids] = False
+    self.broken[env_ids] = False
+    self._sample_gear_strength(env_ids)
     # The live field still holds this term's own (possibly derated) write
     # from the previous episode unless a DR event rewrote it since. Only take
     # values that differ from our last write as the new baseline; otherwise a
@@ -191,12 +229,28 @@ class apply_actuator_health:
     obs_group: str,
     obs_term: str,
     config: dict,
+    gear_obs_group: str | None = None,
+    gear_obs_term: str | None = None,
   ) -> None:
     del env_ids, asset_cfg, config  # Step mode covers all envs; config read in init.
     if self._thermal_term is None:
       self._thermal_term = env.observation_manager.get_term_cfg(
         obs_group, obs_term
       ).func
+    if self._gear_break is not None and self._gear_term is None:
+      if gear_obs_group is None or gear_obs_term is None:
+        raise ValueError("gear_break needs gear_obs_group and gear_obs_term.")
+      self._gear_term = env.observation_manager.get_term_cfg(
+        gear_obs_group, gear_obs_term
+      ).func
+
+    if self._gear_term is not None:
+      # Step events run after the decimation loop, so this is the peak over
+      # the control step that just ran -- including an episode's terminal
+      # step, judged against that episode's strength before reset resamples.
+      self.broken |= self._gear_term.step_peak_ratio() >= self.gear_strength
+      self.derate.masked_fill_(self.broken, 0.0)
+      self.state.masked_fill_(self.broken, ActuatorState.FREE)
 
     # Temps are from the end of the previous control step (see module
     # docstring). Colder-than-spec magnets don't raise the spec effort limit.
