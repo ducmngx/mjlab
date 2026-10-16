@@ -15,6 +15,12 @@ Added
   a read-only observation group and episode metrics on top of the existing
   Go1 rough-terrain task.
 
+- ``heat_bench`` fault impact dataset (``heat_bench/scripts/fault_impact.py``):
+  long-horizon scripted joint-fault trials that log the velocity error and
+  path drift against the command, timed per-body-part contact events, and
+  contact risk grids on a yaw-aligned elevation map, for learning to predict
+  a fault's impact.
+
 Changed
 ^^^^^^^
 
@@ -28,6 +34,8 @@ Changed
 Fixed
 ^^^^^
 
+- The Viser velocity-command joystick no longer crashes when a command
+  range's upper bound is below 0.1 (e.g. a command pinned to zero yaw).
 - Capped ``wandb`` below 0.29, which removed the ``start_method`` setting still passed
   by ``rsl-rl-lib`` and crashed training runs launched with ``--logger wandb``.
 - ``distribution="gaussian"`` domain randomization now draws an independent value per

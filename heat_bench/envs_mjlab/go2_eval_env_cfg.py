@@ -9,6 +9,7 @@ rough-terrain task; no reward or action terms are touched.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -28,7 +29,14 @@ from heat_bench.envs_mjlab.eval_observations import (
   thermal_max_joint_temp,
   thermal_mean_joint_temp,
 )
+from heat_bench.envs_mjlab.fault_impact import fault_elevation_sensor_cfg
 from heat_bench.envs_mjlab.gear_load import GearLoadObservation, gear_load_peak_ratio
+from heat_bench.envs_mjlab.joint_fault_injection import (
+  fault_contact_sensor_cfg,
+  inject_joint_fault,
+  parse_fault_modes,
+)
+from heat_bench.envs_mjlab.payload import DEFAULT_OFFSET_RANGE, attach_payload
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
@@ -37,6 +45,12 @@ from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.velocity.config.go1.env_cfgs import unitree_go1_rough_env_cfg
+from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+from mjlab.terrains.config import ROUGH_TERRAINS_CFG, STAIRS_TERRAINS_CFG
+
+FAULT_TERRAINS = {"rough": ROUGH_TERRAINS_CFG, "stairs": STAIRS_TERRAINS_CFG}
+"""Terrain presets for fault trials, generated in curriculum layout so each
+tile's row is its difficulty and its column its sub-terrain type."""
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "go2_eval_config.yaml"
 
@@ -287,3 +301,123 @@ def add_scripted_joint_fault(
     },
   )
   cfg.events["actuator_health"] = health_event
+
+
+def add_joint_fault_injection(
+  cfg: ManagerBasedRlEnvCfg,
+  joint_names: tuple[str, ...],
+  modes: tuple[str, ...] = ("limit", "lock", "free"),
+  fault_time_s: tuple[float, float] = (4.0, 4.0),
+  num_fault_joints: int = 1,
+  limit_half_width_rad: float = 0.15,
+  command_vel: tuple[float, float, float] | None = (1.0, 0.0, 0.0),
+  command_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+  | None = None,
+  terrain: str | None = None,
+  elevation_map: bool = False,
+) -> None:
+  """Fail joints mid-run without resetting, mutating ``cfg`` in place.
+
+  Adds ``inject_joint_fault`` (before ``actuator_health``, like
+  ``add_scripted_joint_fault``) and the whole-body ``fault_contacts``
+  sensor. Strips every termination and makes episodes effectively infinite,
+  so a fall -- e.g. a thigh touching the ground, normally
+  ``illegal_contact`` -- doesn't reset the env and the post-fault contacts
+  can be watched or recorded. ``command_vel`` pins the twist command to
+  (lin_vel_x, lin_vel_y, ang_vel_z) so runs compare; ``None`` keeps the
+  task's random commands. ``command_ranges`` instead samples one twist per
+  env at reset from ((vx lo, hi), (vy lo, hi), (wz lo, hi)) and holds it
+  for the whole run, so velocity errors are measured against a constant
+  command; the two are mutually exclusive. ``terrain`` picks a
+  ``FAULT_TERRAINS`` preset (``None`` keeps the task's random tiles).
+  ``elevation_map`` adds the ``fault_elevation_map`` raycast grid (see
+  ``fault_impact.py``). The gearbox break is turned off so only the
+  scripted fault fires.
+  """
+  if command_vel is not None and command_ranges is not None:
+    raise ValueError("Pass command_vel or command_ranges, not both.")
+  if terrain is not None and terrain not in FAULT_TERRAINS:
+    raise ValueError(f"Unknown terrain {terrain!r}; expected {list(FAULT_TERRAINS)}.")
+  if "actuator_health" not in cfg.events:
+    raise ValueError("add_joint_fault_injection requires actuator_health enabled.")
+  parse_fault_modes(modes)  # Fail fast on a typo.
+  health_event = cfg.events.pop("actuator_health")
+  health_cfg = health_event.params["config"]["actuator_health"]
+  if health_cfg.get("gear_break") is not None:
+    health_cfg["gear_break"]["enabled"] = False
+  health_event.params.pop("gear_obs_group", None)
+  health_event.params.pop("gear_obs_term", None)
+  cfg.events["joint_fault_injection"] = EventTermCfg(
+    func=inject_joint_fault,
+    mode="step",
+    params={
+      "joint_names": tuple(joint_names),
+      "modes": tuple(modes),
+      "fault_time_s": tuple(fault_time_s),
+      "health_term": "actuator_health",
+      "num_fault_joints": num_fault_joints,
+      "limit_half_width_rad": limit_half_width_rad,
+      "asset_cfg": SceneEntityCfg("robot"),
+    },
+  )
+  cfg.events["actuator_health"] = health_event
+
+  sensors = (fault_contact_sensor_cfg(),)
+  if elevation_map:
+    sensors += (fault_elevation_sensor_cfg(),)
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + sensors
+  cfg.terminations = {}
+  cfg.episode_length_s = int(1e9)
+  cfg.curriculum = {}
+
+  if terrain is not None:
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_generator = replace(
+      FAULT_TERRAINS[terrain], curriculum=True, border_width=10.0
+    )
+    # Trials never reset, so the initial spawn is the only draw: cover every
+    # difficulty row, not just the training curriculum's starting levels.
+    cfg.scene.terrain.max_init_terrain_level = None
+
+  if command_vel is not None:
+    vx, vy, wz = command_vel
+    command_ranges = ((vx, vx), (vy, vy), (wz, wz))
+  if command_ranges is not None:
+    twist = cfg.commands["twist"]
+    assert isinstance(twist, UniformVelocityCommandCfg)
+    rx, ry, rz = command_ranges
+    twist.heading_command = False
+    twist.rel_standing_envs = 0.0
+    twist.rel_heading_envs = 0.0
+    twist.rel_world_envs = 0.0
+    twist.rel_forward_envs = 0.0
+    twist.init_velocity_prob = 0.0
+    # Sampled at reset only; never resampled mid-run.
+    twist.resampling_time_range = (1e9, 1e9)
+    twist.ranges = UniformVelocityCommandCfg.Ranges(
+      lin_vel_x=rx, lin_vel_y=ry, ang_vel_z=rz
+    )
+
+
+def add_box_payload(
+  cfg: ManagerBasedRlEnvCfg,
+  mass_kg_range: tuple[float, float],
+  offset_range: tuple[tuple[float, float], ...] = DEFAULT_OFFSET_RANGE,
+) -> None:
+  """Strap a box payload of sampled mass onto the trunk, mutating ``cfg``.
+
+  New sample at every reset (see ``attach_payload``). The default mount sits
+  on top of the trunk with a few cm of fore-aft/lateral jitter, so the COM
+  rises and shifts like a real backpack's. Go1 weighs ~12.7 kg, so 5 kg is
+  ~40% extra. The reference policy was trained without a payload; pair with
+  fault mode ``none`` to see what the payload alone does.
+  """
+  cfg.events["box_payload"] = EventTermCfg(
+    func=attach_payload,
+    mode="reset",
+    params={
+      "asset_cfg": SceneEntityCfg("robot", body_names=("trunk",)),
+      "mass_kg_range": tuple(mass_kg_range),
+      "offset_range": tuple(tuple(r) for r in offset_range),
+    },
+  )

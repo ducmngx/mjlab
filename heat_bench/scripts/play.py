@@ -21,8 +21,11 @@ import torch
 import tyro
 import viser
 
+from heat_bench.envs_mjlab.fault_impact import fault_elevation_sensor_cfg
 from heat_bench.envs_mjlab.go2_eval_env_cfg import (
+  add_box_payload,
   add_impulse_disturbance,
+  add_joint_fault_injection,
   add_push_disturbance,
   add_scripted_joint_fault,
   go2_eval_env_cfg,
@@ -76,6 +79,28 @@ class PlayConfig:
   """Turn on the gearbox overload break (actuator_health.gear_break): each
   joint draws a Weibull gearbox strength per episode and goes limp (FREE,
   zero torque) once an impact's gear load reaches it."""
+  fault_joints: tuple[str, ...] = ()
+  """Joint names (e.g. 'FR_calf_joint') to fail mid-run without resetting:
+  the env keeps going after a fall so you can watch where the robot lands.
+  Contacts show as magenta spheres with force arrows, faulted joints as
+  spheres colored by mode (yellow limit, red lock, blue free). Strips all
+  terminations and pins the velocity command (see fault_command_vel)."""
+  fault_modes: tuple[str, ...] = ("lock",)
+  """Fault modes to draw from per env: limit (range narrowed around the
+  fault-time angle), lock (held at that angle), free (zero torque), none
+  (control: nothing fails)."""
+  fault_time_s: float = 4.0
+  """When the fault fires, in seconds after each reset."""
+  fault_command_vel: tuple[float, float, float] = (1.0, 0.0, 0.0)
+  """Fixed (lin_vel_x, lin_vel_y, ang_vel_z) command while fault_joints is set."""
+  payload_kg: tuple[float, float] | None = None
+  """Box payload strapped on top of the trunk, mass sampled per reset in
+  this range (kg), drawn as a grey sphere. E.g. '--payload-kg 5 5'."""
+  elevation_map: bool = False
+  """Draw the fault-impact elevation map (4x4 m, 0.1 m cells, cast from 2 m
+  above the trunk; see envs_mjlab/fault_impact.py) as height-coloured tiles
+  under the selected env: blue below the ground under the trunk, red
+  above. The policy's own 1.6x1.0 m height scan is the cyan-sphere patch."""
   port: int = 8080
   """Viser server port. Use a different port per instance to run more than
   one viewer (e.g. two battery models) side by side."""
@@ -94,6 +119,20 @@ def run_play(cfg: PlayConfig) -> None:
     add_impulse_disturbance(env_cfg)
   if cfg.joint_fault:
     add_scripted_joint_fault(env_cfg, cfg.joint_fault)
+  if cfg.payload_kg is not None:
+    add_box_payload(env_cfg, cfg.payload_kg)
+  if cfg.fault_joints:
+    add_joint_fault_injection(
+      env_cfg,
+      cfg.fault_joints,
+      modes=cfg.fault_modes,
+      fault_time_s=(cfg.fault_time_s, cfg.fault_time_s),
+      command_vel=cfg.fault_command_vel,
+    )
+  if cfg.elevation_map:
+    env_cfg.scene.sensors = (env_cfg.scene.sensors or ()) + (
+      fault_elevation_sensor_cfg(debug_vis=True),
+    )
   agent_cfg = load_rl_cfg(REFERENCE_TASK_ID)
   env_cfg.scene.num_envs = cfg.num_envs
 
@@ -129,6 +168,13 @@ def run_play(cfg: PlayConfig) -> None:
     print(
       f"[INFO] Scripted joint fault on {', '.join(cfg.joint_fault)}: healthy 0-3s, "
       "derated to 30% torque by 6s, dead (zero torque) at 10s."
+    )
+
+  if cfg.fault_joints:
+    print(
+      f"[INFO] Joint fault ({'/'.join(cfg.fault_modes)}) on "
+      f"{', '.join(cfg.fault_joints)} at {cfg.fault_time_s:g}s; no resets on "
+      "falls. Contacts are drawn as magenta spheres + force arrows."
     )
 
   runner_cls = load_runner_cls(REFERENCE_TASK_ID) or MjlabOnPolicyRunner

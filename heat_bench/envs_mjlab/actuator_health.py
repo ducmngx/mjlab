@@ -95,13 +95,15 @@ class ActuatorState(IntEnum):
   """Discrete per-joint consequence state (see PLAN.md, "Causes vs.
   consequence states"). Thermal Kt fade alone never changes it; only fault
   conditions (e.g. ``scripted_joint_fault``, the thermal death latch, a
-  gearbox break) set non-HEALTHY states."""
+  gearbox break, ``inject_joint_fault``) set non-HEALTHY states."""
 
   HEALTHY = 0
   DERATED = 1
   FREE = 2
   LOCKED = 3
   DEAD = 4
+  LIMITED = 5
+  """Joint range narrowed around its fault-time angle (``inject_joint_fault``)."""
 
 
 class apply_actuator_health:

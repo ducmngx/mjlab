@@ -334,6 +334,51 @@ Original scope:
 - Not included: `LOCKED` (jammed) gears, fatigue accumulation (the
   shelved rainflow/Miner work), and thermal Arrhenius aging.
 
+### Side demo — Joint-fault landing (scripted, not Phase 4/5)
+- `envs_mjlab/joint_fault_injection.py`: at a sampled time a joint goes
+  `LIMITED` (narrowed `jnt_range`), `LOCKED` (`jnt_range` collapsed to the
+  fault-time angle) or `FREE` (`derate` = 0), with all terminations
+  stripped so the fall isn't reset; a whole-body contact sensor logs where
+  and how hard the robot hits the ground (`scripts/fault_landing.py`,
+  `scripts/plot_fault_landing.py`, `play.py --fault-joints`).
+- First use of `LOCKED`. Done through `jnt_range` rather than gain writes,
+  so it doesn't touch the `pd_gains` DR ordering question. A soft MuJoCo
+  limit: the locked joint holds within ~1 mrad in testing.
+- Scripted timing on purpose -- it is a demo of post-failure dynamics, not
+  the parked monitor-guided injection design.
+- Explicit box payload (`envs_mjlab/payload.py`, `--payload-kg`): mass and
+  mount position in kg/m, trunk+box pseudo-inertias summed exactly. With
+  5 kg on top, LOCK falls (trunk contact) rose from 21% to 60%; the
+  payload alone (`none` mode) from 2% to 6%.
+- Next (agreed direction): learn to predict the impact zone -- a heatmap on
+  a forward-shifted height-scan grid, plus a sweep map for runs that
+  deviate without falling.
+
+### Side study — Fault impact dataset (scripted, not Phase 4/5)
+- Data for that predictor: `envs_mjlab/fault_impact.py`,
+  `scripts/fault_impact.py`, `scripts/plot_fault_impact.py`. Two effects
+  per fault:
+  - **Deviation:** `dv_b` = actual minus commanded body twist, plus the
+    path drift from the commanded path in the fault yaw frame;
+  - **Contact:** per-body-part events timed from the fault, and risk grids
+    on a yaw-aligned elevation map at fault time and at fall onset.
+- Long horizon (15 s) so survivors are covered. Fragility comes from
+  challenging terrain only, never pushes. This is not a robustness study.
+- Commands are sampled once per trial and never resampled, so `dv` is
+  against a constant target. Terrain uses the curriculum layout, with the
+  initial level cap lifted, because trials never reset.
+- First 256-env run on `rough` (fell within 15 s):
+
+  | Mode    | Fell | Median time to fall |
+  |---------|------|---------------------|
+  | `free`  | 73%  | 1.8 s               |
+  | `lock`  | 17%  |                     |
+  | `limit` | 7%   |                     |
+  | `none`  | 18%  |                     |
+
+  The `none` controls fall mostly on steep slopes, so the controls carry
+  the terrain's baseline hazard.
+
 ### Phase 4 — Difficulty presets
 - Named tiers bundling terrain config + payload + push/impulse
   disturbance parameters, building on existing config sections

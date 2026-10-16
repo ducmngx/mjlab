@@ -183,7 +183,8 @@ class UniformVelocityCommand(CommandTerm):
       for label, max_val in axes:
         max_input = server.gui.add_slider(
           f"Max {label}",
-          initial_value=max_val,
+          # A command range pinned at or near 0 must not crash the GUI.
+          initial_value=min(max(max_val, 0.1), 10.0),
           step=0.1,
           min=0.1,
           max=10.0,

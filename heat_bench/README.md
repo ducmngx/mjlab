@@ -282,6 +282,60 @@ noted otherwise.
   each joint draws a Weibull gearbox strength per episode and goes limp
   (`FREE`, zero torque) once an impact's gear load reaches it. See
   "Gearbox break" above.
+- **Joint-fault landing demo** (`--fault-joints JOINT [JOINT ...]`,
+  `--fault-modes limit|lock|free`, `--fault-time-s` on `play.py`; headless
+  in `scripts/fault_landing.py`) — the policy walks at a fixed command,
+  then at the fault time the joint fails, and the env is *not* reset:
+  every termination is stripped so a fall plays out. `limit` narrows
+  `jnt_range` to ±0.15 rad around the fault-time angle, `lock` collapses it
+  to that angle (a jammed gearbox the motor keeps pushing against), `free`
+  zeroes the motor torque. A whole-body `fault_contacts` sensor logs every
+  robot–terrain contact with the force on the robot; the viewer draws them
+  as magenta spheres + arrows, and the faulted joint as a sphere colored by
+  mode (yellow / red / blue). See `envs_mjlab/joint_fault_injection.py`.
+  A scripted scenario like `--joint-fault`, not a stress-driven failure.
+  Mode `none` is a control trial (fault time recorded, nothing fails).
+- **Fault impact dataset** (`scripts/fault_impact.py`,
+  `scripts/plot_fault_impact.py`) — the long-horizon, training-ready
+  version of the landing demo, meant for learning to predict a fault's
+  impact. Each trial walks one constant command sampled from
+  `--lin-vel-x/--lin-vel-y/--ang-vel-z` on curriculum-layout terrain
+  (`--terrain rough|stairs`; a tile's row is its difficulty, its column
+  its type, and every row is spawned). A joint fails, and the trial is
+  logged up to `--horizon-s` (15 s) after the fault, or `--post-fall-s`
+  after a fall. Survivors keep walking and drifting; there are no pushes,
+  so fragility comes only from the fault and the terrain. A fall is the
+  first post-fault step with trunk/head/hip/thigh terrain contact
+  (≥ `--min-contact-force-n`) or trunk tilt over `--tilt-fall-deg`. The
+  `.npz` holds:
+  - **Per-step logs:** the command; the body-velocity error `dv_b` (actual
+    minus commanded twist, the quantity a HIM-style internal model tracks);
+    the planar path vs the commanded one integrated from the fault pose;
+    joint state; per-body-part contact.
+  - **Contact events:** which part touched, when it started and ended (in
+    seconds after the fault), its order in the trial, peak force, impulse,
+    and where it was.
+  - **Per-trial labels:** `fell` / `time_to_fall_s` and first-contact time
+    per part and group.
+  - **Maps:** a 4×4 m, 0.1 m elevation map (`fault_elevation_map`, aligned
+    like `terrain_scan`), with contact risk grids on the same cells. Both
+    are given at fault time (`*_fy`) and at fall onset (`*_fl`).
+
+  See `envs_mjlab/fault_impact.py` for the frames. Robots that walk far
+  before falling land off the fault-time map (`risk_outside_fy`), which is
+  why the fall-onset frame exists. Robots also leave their spawn tile, so
+  the terrain is recorded at fault and at fall. On `rough`, the
+  reference policy's no-fault controls fall in ~18% of 15 s trials, mostly
+  on steep slopes at difficulty rows ≥ 4. Compare faulted trials against
+  them.
+- **Box payload** (`--payload-kg LO HI` on `play.py` and
+  `fault_landing.py`) — a solid box of sampled mass strapped on top of the
+  trunk (`envs_mjlab/payload.py`), combined exactly with the trunk's
+  inertials, so the COM rises like a real backpack's. Unlike the yaml
+  `payload` section's `alpha` (a uniformly denser trunk, COM unchanged).
+  Drawn as a grey sphere in the viewer. The reference policy never saw a
+  payload: with 5 kg, a locked knee put the trunk on the ground in 60% of
+  trials vs 21% without (256 envs per run).
 - **Battery-limited torque** (`battery.voltage_limited_torque`, on by
   default) — set `false` to compare against the current-limit-only
   behavior, e.g. alongside a low `battery.initial_soc` to see what a
@@ -309,6 +363,29 @@ uv run python -m heat_bench.scripts.play \
   --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
   --num-envs 4 --push-disturbance --impulse-disturbance \
   --battery-model rint_soc_aging
+
+# Joint-fault landing demo: watch a knee lock at 4s, no reset on the fall.
+uv run python -m heat_bench.scripts.play \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 4 --fault-joints FR_calf_joint --fault-modes lock
+
+# Same, headless: log post-fault contacts (trunk/world/fault-time frames)
+# for many trials to .npz, then plot 3D contact maps and landing heatmaps.
+uv run python -m heat_bench.scripts.fault_landing \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 192 --modes limit lock free none --payload-kg 5 5 \
+  --output-file landing.npz
+uv run python -m heat_bench.scripts.plot_fault_landing \
+  --input-file landing.npz --output-dir landing_plots
+
+# Fault impact dataset: 15 s after each fault, sampled commands, every
+# terrain difficulty; then survival / velocity-error / contact-timing /
+# risk-map figures (per mode, or --group-by joint_mode).
+uv run python -m heat_bench.scripts.fault_impact \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 256 --output-file impact.npz
+uv run python -m heat_bench.scripts.plot_fault_impact \
+  --input-file impact.npz --output-dir impact_plots
 ```
 
 ## Tests
