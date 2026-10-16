@@ -19,7 +19,9 @@ Added
   long-horizon scripted joint-fault trials that log the velocity error and
   path drift against the command, timed per-body-part contact events, and
   contact risk grids on a yaw-aligned elevation map, for learning to predict
-  a fault's impact.
+  a fault's impact. Includes a ``stairs_up`` stair-pit terrain, trunk-only
+  impact and body-sweep maps per second after the fault, and rendered trial
+  strips with the data drawn into the scene.
 
 Changed
 ^^^^^^^

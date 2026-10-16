@@ -3,26 +3,33 @@
 import math
 import os
 
+import mujoco
 import numpy as np
 import pytest
 import torch
 from heat_bench.envs_mjlab.fault_impact import (
   FAULT_ELEVATION_SENSOR,
   GridSpec,
+  SweepMap,
+  assemble_risk,
   body_part,
   extract_contact_events,
   fire_step,
+  geom_sample_points,
   integrate_command_path,
   path_deviation,
   rasterize_contacts,
   terrain_tile,
   tilt_angle,
   to_yaw_frame,
+  window_risk,
 )
 from heat_bench.envs_mjlab.go2_eval_env_cfg import (
   add_joint_fault_injection,
   go2_eval_env_cfg,
+  use_fault_terrain,
 )
+from heat_bench.scripts.render_fault_impact import pick_trials
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.sensor import RayCastSensor
@@ -178,3 +185,95 @@ def test_elevation_sensor_in_real_env():
     assert (sensor.data.distances > 0).all()
   finally:
     env.close()
+
+
+def test_sweep_marks_footprint_first_time_and_clearance():
+  grid = GridSpec(size=(1.0, 1.0), resolution=0.1)
+  sweep = SweepMap(1, grid, "cpu")
+  terrain = torch.zeros(1, grid.ny, grid.nx)
+  terrain[0, 5, 5] = 0.05  # A bump under the origin.
+  radius = torch.tensor([0.05])
+  rows = torch.tensor([0])
+  # A 5 cm sphere 12 cm up at the origin, then the same sphere 0.3 m ahead
+  # resting on the ground.
+  sweep.update(
+    rows, torch.tensor([[[0.0, 0.0, 0.12]]]), radius, terrain, torch.tensor([0.1])
+  )
+  sweep.update(
+    rows, torch.tensor([[[0.3, 0.0, 0.05]]]), radius, terrain, torch.tensor([0.4])
+  )
+  occupied, first, clear = sweep.result()[0]
+  # Reach is radius + half a cell = 0.1 m: a plus shape of 5 cells each.
+  assert occupied.sum() == 10
+  assert first[5, 5] == pytest.approx(0.1) and first[5, 8] == pytest.approx(0.4)
+  assert clear[5, 5] == pytest.approx(0.12 - 0.05 - 0.05)
+  assert clear[5, 8] == pytest.approx(0.0, abs=1e-6)
+  assert first[0, 0].isnan() and clear[0, 0].isnan()
+
+
+def test_geom_sample_points_cover_capsule_and_box():
+  types = np.array([mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_BOX])
+  sizes = np.array([[0.02, 0.1, 0.0], [0.13, 0.09, 0.05]])
+  idx, off, rad = geom_sample_points(types, sizes, np.array([0.12, 0.17]))
+  assert idx.tolist() == [0] * 5 + [1] * 9
+  torch.testing.assert_close(off[[0, 4], 2], torch.tensor([-0.1, 0.1]))
+  assert rad[0] == pytest.approx(0.02) and rad[5] == pytest.approx(0.05)
+  assert off[5:, 0].abs().max() == pytest.approx(0.13)
+
+
+def test_assemble_risk_channels():
+  contacts = torch.tensor(
+    [[[[0.0, 3.0]], [[float("nan"), 50.0]], [[float("nan"), 0.2]]]]
+  )
+  risk = assemble_risk(contacts, torch.tensor([[[0.0, 1.0]]]))
+  assert risk.shape == (1, 5, 1, 2)
+  assert risk[0, :, 0, 1].tolist() == pytest.approx([1.0, 50.0, 0.2, 1.0, 3.0])
+  assert risk[0, 0, 0, 0] == 0.0
+
+
+def test_stairs_up_preset_is_one_climbing_column():
+  cfg = go2_eval_env_cfg(play=True)
+  use_fault_terrain(cfg, "stairs_up")
+  assert cfg.scene.terrain is not None
+  gen = cfg.scene.terrain.terrain_generator
+  assert gen is not None and gen.curriculum and list(gen.sub_terrains) == ["stairs_up"]
+  with pytest.raises(ValueError, match="Unknown terrain"):
+    use_fault_terrain(cfg, "ramp")
+
+
+def test_window_risk_splits_by_time_since_fault():
+  grid = GridSpec(size=(1.0, 1.0), resolution=0.1)
+  pos = torch.tensor([[0.0, 0.0, 0.0], [0.3, 0.0, 0.0], [0.3, 0.0, 0.0]])
+  # Contacts at 0.5 s (origin) and 1.5 s, 1.7 s (0.3 m ahead).
+  contacts = (
+    torch.tensor([0, 0, 0]),
+    pos,
+    torch.tensor([10.0, 40.0, 20.0]),
+    torch.tensor([0.5, 1.5, 1.7]),
+  )
+  # One impact started at 1.5 s, ahead.
+  events = (torch.tensor([0]), pos[1:2], torch.tensor([40.0]), torch.tensor([1.5]))
+  risk = window_risk(contacts, events, torch.tensor([0.0, 1.0, 2.0]), 1, grid)
+  assert risk.shape == (1, 2, 5, grid.ny, grid.nx)
+  touched, peak, first, impacts, steps = risk[0, :, :, 5, 5].T
+  assert touched.tolist() == [1.0, 0.0]
+  w1 = risk[0, 1, :, 5, 8]
+  assert w1.tolist() == pytest.approx([1.0, 40.0, 1.5, 1.0, 2.0])
+  assert risk[0, 0, 3].sum() == 0  # No impact started in [0, 1).
+
+
+def test_pick_trials_prefers_falls_with_most_impact_cells_per_mode():
+  risk = np.zeros((5, 5, 2, 2))
+  risk[1, 0, 0, :] = 1.0  # Trial 1: 2 touched cells.
+  risk[2, 0, 0, 0] = 1.0  # Trial 2: 1 touched cell.
+  out = {
+    "env_kept": np.array([True, True, True, True, False]),
+    "fault_mode": np.array([1, 1, 1, 2, 1]),
+    "fell": np.array([False, True, True, False, True]),
+    "risk_fy": risk,
+    "risk_channels": np.array(
+      ["touched", "peak_force_n", "first_contact_dt_s", "impacts", "contact_steps"]
+    ),
+  }
+  # Mode 1: the fall with most cells, then a survivor; mode 2: its survivor.
+  assert pick_trials(out, per_mode=2) == [1, 0, 3]

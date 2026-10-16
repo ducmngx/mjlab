@@ -46,9 +46,41 @@ from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationT
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.velocity.config.go1.env_cfgs import unitree_go1_rough_env_cfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
-from mjlab.terrains.config import ROUGH_TERRAINS_CFG, STAIRS_TERRAINS_CFG
+from mjlab.terrains.config import (
+  ROUGH_TERRAINS_CFG,
+  STAIRS_TERRAINS_CFG,
+  pyramid_stairs_inv,
+)
+from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
 
-FAULT_TERRAINS = {"rough": ROUGH_TERRAINS_CFG, "stairs": STAIRS_TERRAINS_CFG}
+STAIRS_UP_TERRAINS_CFG = TerrainGeneratorCfg(
+  size=(8.0, 8.0),
+  border_width=10.0,
+  num_rows=10,
+  num_cols=1,
+  curriculum=True,
+  sub_terrains={
+    # A pit: the robot spawns on the low 3 m centre platform, so walking out
+    # in any direction climbs 5 steps of 0.3 m tread (1.5-3.0 m from the
+    # centre, Chebyshev distance). Riser height rises with the difficulty
+    # row; the reference policy trained on risers up to 0.10 m, so the top
+    # rows (to 0.14 m) are beyond what it has seen.
+    "stairs_up": pyramid_stairs_inv(
+      proportion=1.0,
+      step_height_range=(0.02, 0.14),
+      step_width=0.3,
+      platform_width=3.0,
+      border_width=1.0,
+    ),
+  },
+  add_lights=True,
+)
+
+FAULT_TERRAINS = {
+  "rough": ROUGH_TERRAINS_CFG,
+  "stairs": STAIRS_TERRAINS_CFG,
+  "stairs_up": STAIRS_UP_TERRAINS_CFG,
+}
 """Terrain presets for fault trials, generated in curriculum layout so each
 tile's row is its difficulty and its column its sub-terrain type."""
 
@@ -303,6 +335,19 @@ def add_scripted_joint_fault(
   cfg.events["actuator_health"] = health_event
 
 
+def use_fault_terrain(cfg: ManagerBasedRlEnvCfg, terrain: str) -> None:
+  """Swap in a ``FAULT_TERRAINS`` preset, mutating ``cfg`` in place."""
+  if terrain not in FAULT_TERRAINS:
+    raise ValueError(f"Unknown terrain {terrain!r}; expected {list(FAULT_TERRAINS)}.")
+  assert cfg.scene.terrain is not None
+  cfg.scene.terrain.terrain_generator = replace(
+    FAULT_TERRAINS[terrain], curriculum=True, border_width=10.0
+  )
+  # Fault trials never reset, so the initial spawn is the only draw: cover
+  # every difficulty row, not just the training curriculum's starting levels.
+  cfg.scene.terrain.max_init_terrain_level = None
+
+
 def add_joint_fault_injection(
   cfg: ManagerBasedRlEnvCfg,
   joint_names: tuple[str, ...],
@@ -371,13 +416,7 @@ def add_joint_fault_injection(
   cfg.curriculum = {}
 
   if terrain is not None:
-    assert cfg.scene.terrain is not None
-    cfg.scene.terrain.terrain_generator = replace(
-      FAULT_TERRAINS[terrain], curriculum=True, border_width=10.0
-    )
-    # Trials never reset, so the initial spawn is the only draw: cover every
-    # difficulty row, not just the training curriculum's starting levels.
-    cfg.scene.terrain.max_init_terrain_level = None
+    use_fault_terrain(cfg, terrain)
 
   if command_vel is not None:
     vx, vy, wz = command_vel

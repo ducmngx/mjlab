@@ -5,10 +5,15 @@ Runs a trained checkpoint on ``go2_eval_env_cfg`` with
 curriculum-layout terrain, one or more joints fail at a sampled time (see
 ``heat_bench/envs_mjlab/joint_fault_injection.py``), and nothing resets.
 Each trial is logged from ``pre_fault_s`` before the fault until
-``horizon_s`` after it, or until ``post_fall_s`` after a fall, whichever
-comes first. A robot that survives the fault keeps walking (and drifting)
-for the full horizon; one that falls is logged through its impact. No
+``horizon_s`` (5 s) after it -- through any fall, unless ``post_fall_s``
+cuts it short. A robot that survives the fault keeps walking (and
+drifting); one that falls is logged through its impact and after. No
 pushes: fragility comes from the fault and the terrain alone.
+
+Only the trunk body (its box and the head sphere, ``TRUNK_GROUPS``) counts
+as contact with the environment: a fall is the trunk touching the terrain,
+and contact rows, events, impact zones and the body sweep are trunk-only.
+Leg contact is still logged per step (``dense_part_active``) as context.
 
 Everything goes into one ``.npz`` (plot it with
 ``heat_bench/scripts/plot_fault_impact.py``):
@@ -18,9 +23,8 @@ Everything goes into one ``.npz`` (plot it with
   joint state, per-body-part contact, fall indicators. Step ``j`` is
   ``dt_s[b, j]`` seconds after env ``b``'s fault (negative = before);
   ``valid`` marks logged steps.
-- ``contact_*``: one row per robot-terrain contact (slot and step),
-  feet excluded unless ``log_foot_contacts``.
-- ``event_*``: per-body-part contact events (which part, onset/end time
+- ``contact_*``: one row per trunk-terrain contact (slot and step).
+- ``event_*``: trunk contact events (trunk box or head, onset/end time
   after the fault, order, peak force, impulse, where).
 - per-trial labels: fault, command, terrain tile, ``fell`` /
   ``time_to_fall_s``, first-contact times per part, peak force, final path
@@ -46,12 +50,17 @@ import tyro
 from heat_bench.envs_mjlab.fault_impact import (
   BODY_GROUPS,
   FAULT_ELEVATION_SENSOR,
-  SEVERE_GROUPS,
+  RISK_CHANNELS,
+  SWEEP_CHANNELS,
+  TRUNK_GROUPS,
   GridSpec,
+  SweepMap,
+  assemble_risk,
   body_group,
   body_part,
   extract_contact_events,
   fire_step,
+  geom_sample_points,
   heading,
   integrate_command_path,
   path_deviation,
@@ -60,6 +69,7 @@ from heat_bench.envs_mjlab.fault_impact import (
   terrain_tile,
   tilt_angle,
   to_yaw_frame,
+  window_risk,
 )
 from heat_bench.envs_mjlab.go2_eval_env_cfg import (
   add_box_payload,
@@ -72,6 +82,7 @@ from heat_bench.envs_mjlab.joint_fault_injection import (
   contacts_in_base_frame,
 )
 from heat_bench.scripts.policy_loading import load_policy
+from heat_bench.scripts.render_fault_impact import render_trials
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.sensor import GridPatternCfg, RayCastSensor
 from mjlab.utils.lab_api.math import quat_apply_inverse, wrap_to_pi
@@ -104,8 +115,10 @@ class FaultImpactConfig:
   """Candidate fault joints; each env draws num_fault_joints of them."""
   num_fault_joints: int = 1
   """Joints failing at once per env."""
-  modes: tuple[str, ...] = ("limit", "lock", "free", "none")
-  """Fault modes; each env draws one. 'none' trials are no-fault controls."""
+  modes: tuple[str, ...] = ("lock", "free", "none")
+  """Fault modes; each env draws one. The study's two failure modes are
+  lock (jammed joint) and free (limp joint); 'none' trials are the no-fault
+  baseline. 'limit' is also available."""
   fault_time_s: tuple[float, float] = (3.0, 5.0)
   """Fault time range after the start, sampled uniformly per env."""
   limit_half_width_rad: float = 0.15
@@ -116,29 +129,39 @@ class FaultImpactConfig:
   """Lateral command range (m/s)."""
   ang_vel_z: tuple[float, float] = (-0.5, 0.5)
   """Yaw-rate command range (rad/s)."""
-  terrain: Literal["rough", "stairs"] = "rough"
-  """Terrain preset (curriculum layout: tile row = difficulty, col = type)."""
+  terrain: Literal["rough", "stairs", "stairs_up"] = "rough"
+  """Terrain preset (curriculum layout: tile row = difficulty, col = type).
+  ``stairs_up`` spawns every robot at the bottom of a stair pit, so walking
+  out climbs; pair it with a straight command (``--lin-vel-y 0 0
+  --ang-vel-z 0 0``) and a fault time while on the steps (~2-5 s)."""
   pre_fault_s: float = 1.0
   """Also log this long before the fault, as a baseline."""
-  horizon_s: float = 15.0
-  """Log at most this long after the fault."""
-  post_fall_s: float = 2.0
-  """After a fall, keep logging this long to capture the impact, then stop."""
-  tilt_fall_deg: float = 60.0
-  """Trunk tilt from upright that counts as a fall."""
-  severe_groups: tuple[str, ...] = SEVERE_GROUPS
-  """Body groups whose terrain contact counts as a fall."""
+  horizon_s: float = 5.0
+  """Log this long after the fault."""
+  post_fall_s: float | None = None
+  """Stop logging this long after a fall. None logs the full horizon, so
+  every trial fills every window."""
+  window_s: float = 1.0
+  """Width of the per-window impact maps (``risk_window_fy``): [0, 1),
+  [1, 2), ... seconds after the fault, up to ``horizon_s``."""
+  tilt_fall_deg: float | None = None
+  """Also count a trunk tilt beyond this (deg) as a fall. Off by default:
+  a fall is the trunk touching the terrain. Tilt is logged either way."""
   min_contact_force_n: float = 1.0
   """Contacts carrying less force than this are ignored (margin touches with
   no constraint force, which would otherwise count as falls)."""
   debounce_steps: int = 2
   """Contact-free steps that don't split a contact event (bounces)."""
-  log_foot_contacts: bool = False
-  """Also log foot contacts as rows and events (one event per footstep)."""
   payload_kg: tuple[float, float] | None = None
   """Box payload mass range (kg) strapped on the trunk. None = no payload."""
   output_file: str = "heat_bench_fault_impact.npz"
   """Where to save the dataset."""
+  render_trials: int = 2
+  """Render this many trials per mode (fallen ones first) as image strips:
+  the robot at the fault and at each window end, with the elevation map,
+  impact cells and paths drawn in (see render_fault_impact.py). 0 = off."""
+  render_dir: str | None = None
+  """Where to save the strips; defaults to '<output_file stem>_frames'."""
 
 
 def _np(x: torch.Tensor) -> np.ndarray:
@@ -203,20 +226,32 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
   )
   slot_part = geom_part[slot_geom]
   num_parts = len(part_names)
-  part_is_foot = torch.tensor([g == "foot" for g in part_groups], device=device)
-  part_severe = torch.tensor(
-    [g in cfg.severe_groups for g in part_groups], device=device
+  part_trunk = torch.tensor([g in TRUNK_GROUPS for g in part_groups], device=device)
+  slot_logged = part_trunk[slot_part]
+
+  # Body-sweep footprint: spheres covering the robot's collision geoms.
+  sweep_geoms = [g for g in geom_names if body_group(g) in TRUNK_GROUPS]
+  sweep_gid = robot.indexing.geom_ids[
+    [robot.geom_names.index(g) for g in sweep_geoms]
+  ].long()
+  gid_np = sweep_gid.cpu().numpy()
+  mj_model = env.sim.mj_model
+  s_geom, s_off, s_rad = geom_sample_points(
+    mj_model.geom_type[gid_np], mj_model.geom_size[gid_np], mj_model.geom_rbound[gid_np]
   )
-  slot_logged = ~part_is_foot[slot_part] | cfg.log_foot_contacts
+  s_gid = sweep_gid[s_geom.to(device)]
+  s_off, s_rad = s_off.to(device), s_rad.to(device)
 
   n = cfg.num_envs
   step_dt = env.step_dt
   pre = round(cfg.pre_fault_s / step_dt)
   hor = round(cfg.horizon_s / step_dt)
-  post_fall = round(cfg.post_fall_s / step_dt)
   num_t = pre + hor + 1
+  post_fall = round(cfg.post_fall_s / step_dt) if cfg.post_fall_s is not None else num_t
   num_j = len(fault.joint_names)
-  tilt_thr = float(np.deg2rad(cfg.tilt_fall_deg))
+  tilt_thr = (
+    float(np.deg2rad(cfg.tilt_fall_deg)) if cfg.tilt_fall_deg is not None else np.inf
+  )
 
   def buf(*shape: int, dtype=torch.float32) -> torch.Tensor:
     return torch.zeros(n, num_t, *shape, dtype=dtype, device=device)
@@ -252,6 +287,22 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
   done = torch.zeros(n, dtype=torch.bool, device=device)
   reset_seen = torch.zeros(n, dtype=torch.bool, device=device)
   env_idx = torch.arange(n, device=device)
+  # Robot pose (full qpos) at the fault and at each window end, to render.
+  num_w = int(np.ceil(cfg.horizon_s / cfg.window_s - 1e-6))
+  frame_rel = torch.tensor(
+    [min(round(w * cfg.window_s / step_dt), hor) for w in range(num_w + 1)],
+    device=device,
+  )
+  frame_qpos = torch.full(
+    (n, num_w + 1, env.sim.data.qpos.shape[-1]), float("nan"), device=device
+  )
+  sweep_fy = SweepMap(n, grid, device)
+  sweep_fl = SweepMap(n, grid, device)
+
+  def body_points_w(e: torch.Tensor) -> torch.Tensor:
+    xpos = env.sim.data.geom_xpos[e][:, s_gid]  # [R, S, 3]
+    xmat = env.sim.data.geom_xmat[e][:, s_gid].view(len(e), -1, 3, 3)
+    return xpos + (xmat @ s_off[None, :, :, None]).squeeze(-1)
 
   def elevation_now(e: torch.Tensor) -> torch.Tensor:
     data = elev.data
@@ -335,6 +386,12 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
       rows["pos_b"].append(pos_b[he, hc])
       rows["force_b"].append(force_b[he, hc])
 
+    # Pose snapshots for rendering.
+    snap = log[:, None] & (rel[:, None] == frame_rel[None, :])
+    if snap.any():
+      se, sk = snap.nonzero(as_tuple=True)
+      frame_qpos[se, sk] = env.sim.data.qpos[se].float()
+
     # Elevation map at the fault.
     at_fault = log & (rel == 0)
     if at_fault.any():
@@ -343,21 +400,36 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
       r, c = terrain_tile(data.root_link_pos_w[ef], gen)
       tile_fault[ef] = torch.stack([r, c], dim=-1)
 
-    # Fall onset: first post-fault step with a severe contact or a big tilt.
-    severe = (p_active & part_severe).any(dim=-1)
+    # Fall onset: first post-fault step with the trunk on the terrain (or,
+    # if enabled, a big tilt).
+    trunk_hit = (p_active & part_trunk).any(dim=-1)
     tilted = tilt > tilt_thr
-    falling = log & (severe | tilted)
+    falling = log & (trunk_hit | tilted)
     pre_fault_fall |= falling & (rel < 0)
     new_fall = falling & (rel >= 0) & (fall_rel < 0)
     if new_fall.any():
       nf = new_fall.nonzero().squeeze(-1)
       fall_rel[nf] = rel[nf]
-      fall_cause[nf] = severe[nf].long() + 2 * tilted[nf].long()
+      fall_cause[nf] = trunk_hit[nf].long() + 2 * tilted[nf].long()
       fall_pos_w[nf] = data.root_link_pos_w[nf]
       fall_quat_w[nf] = data.root_link_quat_w[nf]
       elevation_fl[nf] = elevation_now(nf)
       r, c = terrain_tile(data.root_link_pos_w[nf], gen)
       tile_fall[nf] = torch.stack([r, c], dim=-1)
+
+    # Body sweep after the fault, and after the fall onset.
+    sw = log & (rel >= 0) & fault.faulted
+    if sw.any():
+      es = sw.nonzero().squeeze(-1)
+      pts_w = body_points_w(es)
+      dt_now = rel[es].float() * step_dt
+      pts = to_yaw_frame(pts_w, fault.fault_base_pos_w[es], fault.fault_base_quat_w[es])
+      sweep_fy.update(es, pts, s_rad, elevation_fy[es], dt_now)
+      after = (fall_rel[es] >= 0) & (rel[es] >= fall_rel[es])
+      if after.any():
+        ea = es[after]
+        pts = to_yaw_frame(pts_w[after], fall_pos_w[ea], fall_quat_w[ea])
+        sweep_fl.update(ea, pts, s_rad, elevation_fl[ea], dt_now[after])
 
     fell = fall_rel >= 0
     done |= log & ((rel >= hor) | (fell & (rel >= fall_rel + post_fall)))
@@ -376,6 +448,15 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     print(f"[WARN] Dropping {int(reset_seen.sum())} envs that reset mid-run.")
   if pre_fault_fall.any():
     print(f"[WARN] Dropping {int(pre_fault_fall.sum())} envs that fell pre-fault.")
+
+  # Spawn point of each env's fault-time tile (a stair pit's centre, say).
+  terrain_origins = env.scene.terrain.terrain_origins
+  assert terrain_origins is not None
+  tile_origin_fault = torch.where(
+    (tile_fault >= 0).all(dim=-1, keepdim=True),
+    terrain_origins[tile_fault[:, 0].clamp(min=0), tile_fault[:, 1].clamp(min=0)],
+    float("nan"),
+  )
 
   # Frames: fault yaw (fy) and fall-onset yaw (fl).
   f_pos, f_quat = fault.fault_base_pos_w, fault.fault_base_quat_w
@@ -450,7 +531,7 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     peak_force = torch.zeros(n, device=device)
 
   # Contact events per body part.
-  ev_active = dense["part_active"] & (~part_is_foot | cfg.log_foot_contacts)
+  ev_active = dense["part_active"] & part_trunk
   events = extract_contact_events(
     _np(ev_active), _np(dense["part_force"]), _np(dt_s), step_dt, cfg.debounce_steps
   )
@@ -466,6 +547,53 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
       dense["base_quat_w"][ev_env, ev_on], onset_w - dense["base_pos_w"][ev_env, ev_on]
     )
   )
+  ev_fl = fell[ev_env] & (ev_on - pre >= fall_rel[ev_env])
+  ev_pos_fl = to_yaw_frame(onset_w[:, None], fall_pos_w[ev_env], fall_quat_w[ev_env])[
+    :, 0
+  ]
+  ev_pos_fl[~ev_fl] = float("nan")
+  events["pos_fl"] = _np(ev_pos_fl)
+  ev_dt = torch.from_numpy(events["onset_dt"]).to(device)
+  ev_force = torch.from_numpy(events["peak_force_n"]).to(device)
+  ev_post = ev_dt >= 0
+  impacts_fy, _ = rasterize_contacts(
+    ev_env[ev_post],
+    torch.from_numpy(events["pos_fy"]).to(device)[ev_post],
+    ev_force[ev_post],
+    ev_dt[ev_post],
+    n,
+    grid,
+  )
+  impacts_fl, _ = rasterize_contacts(
+    ev_env[ev_fl], ev_pos_fl[ev_fl], ev_force[ev_fl], ev_dt[ev_fl], n, grid
+  )
+  risk_fy = assemble_risk(risk_fy, impacts_fy[:, 0])
+  risk_fl = assemble_risk(risk_fl, impacts_fl[:, 0])
+
+  # Impact maps per time window after the fault, in the frozen fault frame,
+  # plus the trunk pose (x, y, z, heading) at each window's end.
+  edges = torch.arange(num_w + 1, device=device) * cfg.window_s
+  edges[-1] = min(float(edges[-1]), cfg.horizon_s) + 1e-6  # Include dt == horizon.
+  if rows["env_id"]:
+    c_win = (
+      contacts["env_id"],
+      contacts["pos_fy"],
+      contacts["force_w"].norm(dim=-1),
+      contacts["dt"],
+    )
+  else:
+    empty = torch.empty(0, device=device)
+    c_win = (empty.long(), empty.view(0, 3), empty, empty)
+  e_win = (
+    ev_env,
+    torch.from_numpy(events["pos_fy"]).to(device),
+    ev_force,
+    ev_dt,
+  )
+  risk_window_fy = window_risk(c_win, e_win, edges, n, grid)
+  end_j = (pre + torch.round(edges[1:] / step_dt).long()).clamp(max=num_t - 1)
+  pose_window_fy = torch.cat([base_pos_fy[:, end_j], yaw_fy[:, end_j, None]], dim=-1)
+  pose_window_fy[~valid_t[:, end_j]] = float("nan")
   events["group"] = np.array(
     [BODY_GROUPS.index(part_groups[p]) for p in events["part"]], dtype=np.int64
   )
@@ -535,6 +663,20 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     "risk_fl": _np(risk_fl),
     "risk_outside_fy": _np(outside_fy),
     "risk_outside_fl": _np(outside_fl),
+    "risk_channels": np.array(RISK_CHANNELS),
+    "sweep_fy": _np(sweep_fy.result()),
+    "sweep_fl": _np(sweep_fl.result()),
+    "sweep_channels": np.array(SWEEP_CHANNELS),
+    "window_edges_s": _np(edges.clamp(max=cfg.horizon_s)),
+    "risk_window_fy": _np(risk_window_fy),
+    "pose_window_end_fy": _np(pose_window_fy),
+    "frame_qpos": _np(frame_qpos),
+    "sweep_geoms": np.array(sweep_geoms),
+    # From the tile under the robot, not env.scene.env_origins: play mode's
+    # randomize_terrain reset event moves env_origins to a new tile after
+    # the robot has already been placed.
+    "fault_tile_origin_w": _np(tile_origin_fault),
+    "fault_offset_from_tile_origin": _np(f_pos - tile_origin_fault),
     "grid_size": np.array(grid.size, dtype=np.float32),
     "grid_resolution": np.array(grid.resolution, dtype=np.float32),
     "payload_mass_kg": (
@@ -543,8 +685,11 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     "step_dt": np.array(step_dt),
     "pre_fault_s": np.array(cfg.pre_fault_s),
     "horizon_s": np.array(cfg.horizon_s),
-    "post_fall_s": np.array(cfg.post_fall_s),
-    "tilt_fall_deg": np.array(cfg.tilt_fall_deg),
+    "post_fall_s": np.array(cfg.post_fall_s if cfg.post_fall_s is not None else np.nan),
+    "window_s": np.array(cfg.window_s),
+    "tilt_fall_deg": np.array(
+      cfg.tilt_fall_deg if cfg.tilt_fall_deg is not None else np.nan
+    ),
     "min_contact_force_n": np.array(cfg.min_contact_force_n),
   }
   output_path = Path(cfg.output_file)
@@ -566,6 +711,12 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
       f"median peak force {np.median(out['peak_force_n'][sel]):.0f} N"
     )
   print(f"[INFO] {len(events['env_id'])} contact events saved to {output_path}")
+  if cfg.render_trials > 0:
+    render_dir = Path(
+      cfg.render_dir or output_path.with_name(f"{output_path.stem}_frames")
+    )
+    strips = render_trials(env.sim.mj_model, out, cfg.render_trials, render_dir)
+    print(f"[INFO] Rendered {len(strips)} trial strips to {render_dir}")
   env.close()
   return output_path
 

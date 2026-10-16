@@ -300,26 +300,56 @@ noted otherwise.
   version of the landing demo, meant for learning to predict a fault's
   impact. Each trial walks one constant command sampled from
   `--lin-vel-x/--lin-vel-y/--ang-vel-z` on curriculum-layout terrain
-  (`--terrain rough|stairs`; a tile's row is its difficulty, its column
-  its type, and every row is spawned). A joint fails, and the trial is
-  logged up to `--horizon-s` (15 s) after the fault, or `--post-fall-s`
-  after a fall. Survivors keep walking and drifting; there are no pushes,
-  so fragility comes only from the fault and the terrain. A fall is the
-  first post-fault step with trunk/head/hip/thigh terrain contact
-  (≥ `--min-contact-force-n`) or trunk tilt over `--tilt-fall-deg`. The
-  `.npz` holds:
+  (`--terrain rough|stairs|stairs_up`; a tile's row is its difficulty, its
+  column its type, and every row is spawned). `stairs_up` is a stair pit:
+  each robot starts on the low 3 m platform and climbs five 0.3 m treads
+  when it walks out, with risers from 2 cm (row 0) to 14 cm (row 9; the
+  reference policy trained up to 10 cm). A joint fails, and the trial is
+  logged for `--horizon-s` (5 s) after the fault, through any fall
+  (`--post-fall-s` can cut it short). Survivors keep walking and drifting; there are no pushes,
+  so fragility comes only from the fault and the terrain. Only the trunk
+  body (its box and the head sphere fixed to it) counts as contact with the
+  environment: a fall is the first post-fault step with trunk-terrain
+  contact (≥ `--min-contact-force-n`; `--tilt-fall-deg` optionally adds a
+  tilt rule), and contact rows, events, impact zones and the body sweep are
+  trunk-only. The `.npz` holds:
   - **Per-step logs:** the command; the body-velocity error `dv_b` (actual
     minus commanded twist, the quantity a HIM-style internal model tracks);
     the planar path vs the commanded one integrated from the fault pose;
-    joint state; per-body-part contact.
-  - **Contact events:** which part touched, when it started and ended (in
-    seconds after the fault), its order in the trial, peak force, impulse,
-    and where it was.
+    joint state; per-body-part contact (legs included, as context).
+  - **Trunk contact events:** trunk box or head, when it started and ended
+    (in seconds after the fault), its order in the trial, peak force,
+    impulse, and where it was.
   - **Per-trial labels:** `fell` / `time_to_fall_s` and first-contact time
     per part and group.
   - **Maps:** a 4×4 m, 0.1 m elevation map (`fault_elevation_map`, aligned
-    like `terrain_scan`), with contact risk grids on the same cells. Both
-    are given at fault time (`*_fy`) and at fall onset (`*_fl`).
+    like `terrain_scan` but cast from 2 m above the trunk so higher terrain
+    isn't missed), with two maps on the same cells:
+    - `risk_*` (`risk_channels`): touched, peak force, first contact time,
+      impacts (contact events that *started* in the cell, so a robot lying
+      still doesn't swamp the map), and raw contact-steps;
+    - `sweep_*` (`sweep_channels`): cells the trunk passed over, when
+      first, and its smallest clearance to that cell's terrain (≤ 0 =
+      touching), from spheres covering the trunk geoms.
+
+    Both are given at fault time (`*_fy`) and at fall onset (`*_fl`).
+    `risk_window_fy` `[B, W, 5, 41, 41]` splits the fault-frame impact map
+    into `--window-s` (1 s) windows after the fault (`window_edges_s`), and
+    `pose_window_end_fy` `[B, W, 4]` gives the trunk's x, y, z and heading
+    at each window's end. The fault frame is frozen at failure, so these
+    say where the trunk is, and what it hits, at +1, +2, … s relative to
+    where it was when the joint failed.
+
+  Fault modes default to `lock` and `free` (the two failure modes studied)
+  plus `none` as the no-fault baseline. `--render-trials N` (default 2)
+  renders N trials per mode, fallen ones first, as a 6-frame image strip in
+  `<output stem>_frames/`: the robot at the fault and at +1…+5 s from one
+  fixed camera, with the data drawn into the scene -- elevation map tiles,
+  trunk impact cells coloured by the second they were first hit, the trunk
+  path vs the commanded one, the fault pose and the failed joint. Rendering
+  happens in the same process, so the terrain matches the data exactly.
+    `fault_offset_from_tile_origin` places the fault on its tile, e.g. on
+    the `stairs_up` platform (< 1.5 m, Chebyshev) or the steps (1.5–3 m).
 
   See `envs_mjlab/fault_impact.py` for the frames. Robots that walk far
   before falling land off the fault-time map (`risk_outside_fy`), which is
@@ -378,14 +408,26 @@ uv run python -m heat_bench.scripts.fault_landing \
 uv run python -m heat_bench.scripts.plot_fault_landing \
   --input-file landing.npz --output-dir landing_plots
 
-# Fault impact dataset: 15 s after each fault, sampled commands, every
+# Fault impact dataset: 5 s after each fault, sampled commands, every
 # terrain difficulty; then survival / velocity-error / contact-timing /
-# risk-map figures (per mode, or --group-by joint_mode).
+# impact-zone / body-sweep figures (per mode, or --group-by joint_mode).
 uv run python -m heat_bench.scripts.fault_impact \
   --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
   --num-envs 256 --output-file impact.npz
 uv run python -m heat_bench.scripts.plot_fault_impact \
   --input-file impact.npz --output-dir impact_plots
+
+# Stair climbing: straight commands into a stair pit, faults while climbing.
+uv run python -m heat_bench.scripts.fault_impact \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 256 --terrain stairs_up --lin-vel-x 0.4 0.8 \
+  --lin-vel-y 0 0 --ang-vel-z 0 0 --fault-time-s 3 6 --output-file stairs.npz
+
+# Watch it: a knee locks at 4 s mid-climb, elevation map under the robot.
+uv run python -m heat_bench.scripts.play \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 4 --terrain stairs_up --elevation-map \
+  --fault-joints FR_calf_joint --fault-modes lock --fault-command-vel 0.6 0 0
 ```
 
 ## Tests

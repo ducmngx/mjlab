@@ -14,8 +14,10 @@ One figure per group (fault mode, or fault joint x mode):
   survived) against the commanded ones (dashed);
 - contact event raster: one row per trial, each event at its onset time
   after the fault, coloured by body group, sized by peak force;
-- contact risk maps (share of trials touching each cell) over the mean
-  elevation map, in the fault-time frame and in the fall-onset frame.
+- maps over the mean elevation map: impact zone (share of trials with a
+  contact event starting in each cell) in the fault-time and fall-onset
+  frames, and the body-sweep zone (share of trials whose body came within
+  ``clearance_m`` of each cell's terrain) in the fault-time frame.
 """
 
 from __future__ import annotations
@@ -53,6 +55,8 @@ class PlotConfig:
   """Per-group figures by fault mode, or by fault joint set and mode."""
   max_paths: int = 80
   """Paths drawn per path fan."""
+  clearance_m: float = 0.05
+  """Body-sweep panel: count a cell when the body came this close to it."""
 
 
 def _nanmean(x: np.ndarray, axis: int) -> np.ndarray:
@@ -104,19 +108,28 @@ def _plot_survival(d, kept: np.ndarray, path: Path) -> None:
 
   ax = axes[1]
   faulted = kept & (d["mode_names"][d["fault_mode"]] != "none")
-  col = d["terrain_tile_fault"][:, 1]
-  for c, name in enumerate(d["terrain_names"]):
-    sel = faulted & (col == c)
+  # One terrain type (e.g. stairs_up): split by difficulty row instead.
+  by_row = len(d["terrain_names"]) == 1
+  key = d["terrain_tile_fault"][:, 0 if by_row else 1]
+  if by_row:
+    names = [
+      f"row {r} (difficulty {x:.2f})" for r, x in enumerate(d["terrain_row_difficulty"])
+    ]
+  else:
+    names = list(d["terrain_names"])
+  for c, name in enumerate(names):
+    sel = faulted & (key == c)
     if sel.any():
       ttf = np.where(d["fell"][sel], d["time_to_fall_s"][sel], np.inf)
       ax.plot(
         t, (ttf[None, :] > t[:, None]).mean(axis=1), label=f"{name} (n={sel.sum()})"
       )
+  what = f"{d['terrain_names'][0]} difficulty" if by_row else "terrain"
   ax.set(
     xlabel="time since fault (s)",
     ylabel="share still up",
     ylim=(0, 1.02),
-    title="Survival by terrain at fault (faulted trials)",
+    title=f"Survival by {what} at fault (faulted trials)",
   )
   ax.legend(fontsize=8)
   fig.tight_layout()
@@ -154,8 +167,12 @@ def _plot_dv(d, kept: np.ndarray, path: Path) -> None:
 
 
 def _plot_first_contact(d, kept: np.ndarray, path: Path) -> None:
-  groups = [g for g in d["group_names"] if g != "foot"]
-  fig, axes = plt.subplots(1, len(groups), figsize=(4 * len(groups), 3.8), sharey=True)
+  # Only groups that ever had contact events (trunk and head by default).
+  groups = [d["group_names"][g] for g in np.unique(d["event_group"])] or ["trunk"]
+  fig, axes = plt.subplots(
+    1, len(groups), figsize=(5 * len(groups), 3.8), sharey=True, squeeze=False
+  )
+  axes = axes[0]
   bins = np.linspace(0.0, float(d["horizon_s"]), 31)
   for ax, g in zip(axes, groups, strict=True):
     gi = list(d["group_names"]).index(g)
@@ -174,11 +191,11 @@ def _plot_first_contact(d, kept: np.ndarray, path: Path) -> None:
   plt.close(fig)
 
 
-def _risk_panel(fig, ax, d, sel: np.ndarray, frame: str, title: str) -> None:
-  risk = d[f"risk_{frame}"][sel]
+def _map_panel(
+  fig, ax, d, sel: np.ndarray, frame: str, share: np.ndarray, label: str, title: str
+) -> None:
   elev = _nanmean(d[f"elevation_{frame}"][sel], 0)
   extent = _grid_extent(d)
-  share = (risk[:, 0] > 0).mean(axis=0) if risk.size else np.zeros(elev.shape)
   if np.isfinite(elev).any():
     ax.contour(
       elev, levels=12, colors="0.55", linewidths=0.5, origin="lower", extent=extent
@@ -191,18 +208,55 @@ def _risk_panel(fig, ax, d, sel: np.ndarray, frame: str, title: str) -> None:
     vmin=0,
     vmax=max(float(np.max(share)), 1e-6),
   )
-  fig.colorbar(im, ax=ax, shrink=0.8, label="share of trials touching cell")
+  fig.colorbar(im, ax=ax, shrink=0.8, label=label)
+  ax.set(xlabel="x fwd (m)", ylabel="y left (m)", title=title)
+
+
+def _impact_panel(fig, ax, d, sel: np.ndarray, frame: str, title: str) -> None:
+  """Share of trials with a contact event starting in each cell."""
+  ch = list(d["risk_channels"]).index("impacts")
+  risk = d[f"risk_{frame}"][sel]
+  share = (risk[:, ch] > 0).mean(axis=0) if len(risk) else np.zeros(risk.shape[-2:])
   outside = d[f"risk_outside_{frame}"][sel].sum()
-  ax.set(
-    xlabel="x fwd (m)",
-    ylabel="y left (m)",
-    title=f"{title}\n(contour: mean terrain; {outside} contacts off-map)",
+  _map_panel(
+    fig,
+    ax,
+    d,
+    sel,
+    frame,
+    share,
+    "share of trials with an impact in cell",
+    f"{title}\n(contour: mean terrain; {outside} contact samples off-map)",
   )
 
 
-def _plot_group(d, sel: np.ndarray, title: str, path: Path, max_paths: int) -> None:
+def _sweep_panel(
+  fig, ax, d, sel: np.ndarray, frame: str, title: str, clearance_m: float
+) -> None:
+  """Share of trials whose body (bounding spheres) came within
+  ``clearance_m`` of each cell's terrain."""
+  ch = list(d["sweep_channels"]).index("min_clearance_m")
+  clear = d[f"sweep_{frame}"][sel, ch]
+  share = (
+    (clear <= clearance_m).mean(axis=0) if len(clear) else np.zeros(clear.shape[-2:])
+  )
+  _map_panel(
+    fig,
+    ax,
+    d,
+    sel,
+    frame,
+    share,
+    f"share of trials with body within {clearance_m * 100:.0f} cm of terrain",
+    title,
+  )
+
+
+def _plot_group(
+  d, sel: np.ndarray, title: str, path: Path, max_paths: int, clearance: float
+) -> None:
   t = _time_axis(d)
-  fig, axes = plt.subplots(1, 4, figsize=(24, 5.8))
+  fig, axes = plt.subplots(1, 5, figsize=(30, 5.8))
   fig.suptitle(f"{title}  ({sel.sum()} trials, fell {d['fell'][sel].mean():.0%})")
 
   ax = axes[0]
@@ -256,10 +310,52 @@ def _plot_group(d, sel: np.ndarray, title: str, path: Path, max_paths: int) -> N
   )
   ax.legend(fontsize=7, loc="lower right")
 
-  _risk_panel(fig, axes[2], d, sel, "fy", "Contact risk, fault-time frame")
-  _risk_panel(fig, axes[3], d, sel & d["fell"], "fl", "Contact risk, fall-onset frame")
+  _impact_panel(fig, axes[2], d, sel, "fy", "Impact zone, fault-time frame")
+  _sweep_panel(
+    fig, axes[3], d, sel, "fy", "Body near ground, fault-time frame", clearance
+  )
+  _impact_panel(fig, axes[4], d, sel & d["fell"], "fl", "Impact zone, fall-onset frame")
   fig.tight_layout()
   fig.savefig(path, dpi=130)
+  plt.close(fig)
+
+
+def _plot_windows(d, sel: np.ndarray, title: str, path: Path) -> None:
+  """One impact map per time window after the fault, in the frozen fault
+  frame, with the trunk position at each window's end."""
+  edges = d["window_edges_s"]
+  ch = list(d["risk_channels"]).index("impacts")
+  risk = d["risk_window_fy"][sel]  # [n, W, C, ny, nx]
+  pose = d["pose_window_end_fy"][sel]  # [n, W, 4]
+  num_w = risk.shape[1]
+  fig, axes = plt.subplots(1, num_w, figsize=(5.2 * num_w, 5.2), squeeze=False)
+  share = (risk[:, :, ch] > 0).mean(axis=0)
+  vmax = max(float(share.max()), 1e-6)
+  for w, ax in enumerate(axes[0]):
+    _map_panel(
+      fig,
+      ax,
+      d,
+      sel,
+      "fy",
+      share[w],
+      "share of trials with an impact in cell",
+      f"{edges[w]:.0f}-{edges[w + 1]:.0f} s after fault: "
+      f"{(risk[:, w, ch] > 0).any(axis=(1, 2)).mean():.0%} of trials hit",
+    )
+    ax.images[-1].set_clim(0, vmax)
+    ok = np.isfinite(pose[:, w, 0])
+    fell = d["fell"][sel] & (d["time_to_fall_s"][sel] <= edges[w + 1])
+    ax.scatter(*pose[ok & ~fell, w, :2].T, s=6, color="tab:blue", label="trunk (up)")
+    ax.scatter(*pose[ok & fell, w, :2].T, s=6, color="tab:red", label="trunk (fallen)")
+    ax.plot(0, 0, marker="^", color="k", ms=8)
+    ax.set(xlim=(-2.05, 2.05), ylim=(-2.05, 2.05))
+  axes[0][0].legend(loc="upper left", fontsize=7)
+  fig.suptitle(
+    f"{title}: where the trunk hits, per second after the fault (frozen fault frame; triangle = trunk at fault)"
+  )
+  fig.tight_layout()
+  fig.savefig(path, dpi=110)
   plt.close(fig)
 
 
@@ -288,8 +384,12 @@ def plot_fault_impact(cfg: PlotConfig) -> list[Path]:
   for k in np.unique(key[kept]):
     sel = kept & (key == k)
     path = out_dir / f"{k}.png"
-    _plot_group(d, sel, str(k), path, cfg.max_paths)
+    _plot_group(d, sel, str(k), path, cfg.max_paths, cfg.clearance_m)
     paths.append(path)
+    if "risk_window_fy" in d:
+      wpath = out_dir / f"{k}_windows.png"
+      _plot_windows(d, sel, str(k), wpath)
+      paths.append(wpath)
   print(f"[INFO] Wrote {len(paths)} figures to {out_dir}")
   return paths
 

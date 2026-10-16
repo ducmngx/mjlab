@@ -29,6 +29,7 @@ from heat_bench.envs_mjlab.go2_eval_env_cfg import (
   add_push_disturbance,
   add_scripted_joint_fault,
   go2_eval_env_cfg,
+  use_fault_terrain,
 )
 from heat_bench.viewer import HealthMonitoringViewer
 from mjlab.envs import ManagerBasedRlEnv
@@ -96,6 +97,10 @@ class PlayConfig:
   payload_kg: tuple[float, float] | None = None
   """Box payload strapped on top of the trunk, mass sampled per reset in
   this range (kg), drawn as a grey sphere. E.g. '--payload-kg 5 5'."""
+  terrain: str | None = None
+  """Swap in a fault-trial terrain preset: rough, stairs, or stairs_up (a
+  stair pit -- every robot starts at the bottom and climbs ~5 steps when it
+  walks out). Rows of tiles get harder (taller risers) along x."""
   elevation_map: bool = False
   """Draw the fault-impact elevation map (4x4 m, 0.1 m cells, cast from 2 m
   above the trunk; see envs_mjlab/fault_impact.py) as height-coloured tiles
@@ -129,6 +134,8 @@ def run_play(cfg: PlayConfig) -> None:
       fault_time_s=(cfg.fault_time_s, cfg.fault_time_s),
       command_vel=cfg.fault_command_vel,
     )
+  if cfg.terrain is not None:
+    use_fault_terrain(env_cfg, cfg.terrain)
   if cfg.elevation_map:
     env_cfg.scene.sensors = (env_cfg.scene.sensors or ()) + (
       fault_elevation_sensor_cfg(debug_vis=True),

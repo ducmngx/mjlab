@@ -378,6 +378,41 @@ Original scope:
 
   The `none` controls fall mostly on steep slopes, so the controls carry
   the terrain's baseline hazard.
+- Contact simplified to the trunk body only (box + head sphere): falls,
+  events, impact zones and the body sweep. Leg contact is per-step context.
+  Risk grids gained an `impacts` channel (event onsets) because raw
+  contact-steps are dominated by a robot lying still. A trunk body-sweep map
+  (clearance to terrain per cell) was added alongside.
+- `stairs_up` terrain (stair pit, risers 2–14 cm). First 256-env run,
+  straight commands, faults at 3–6 s; fell within 15 s:
+
+  | Mode   | Fault on platform | Fault on steps |
+  |--------|-------------------|----------------|
+  | `none` | 41% (n=17)        | 4% (n=48)      |
+  | `lock` | 58% (n=19)        | 23% (n=39)     |
+  | `free` | 77% (n=22)        | 90% (n=30)     |
+
+  A fault before the climb is worse than one during it for `lock`: the
+  robot then has to climb the whole flight on a jammed knee. Robots still
+  on the platform at 3–6 s are partly ones already struggling (the
+  controls there fall 41%), so platform rates mix fault and selection.
+- Horizon cut to 5 s after the fault, logged through falls, with per-second
+  impact maps (`risk_window_fy`) and window-end trunk poses in the frozen
+  fault frame. On `stairs_up`, the share of trials with a trunk impact
+  per second, from 0-1 s to 4-5 s after the fault:
+
+  | Mode    | 0-1 s | 1-2 s | 2-3 s | 3-4 s | 4-5 s |
+  |---------|-------|-------|-------|-------|-------|
+  | `free`  | 16%   | 44%   | 42%   | 44%   | 30%   |
+  | `lock`  | 5%    | 10%   | 13%   | 21%   | 13%   |
+  | `limit` | 5%    | 6%    | 6%    | 6%    | 5%    |
+  | `none`  | 2%    | 3%    | 8%    | 8%    | 6%    |
+
+  All impacts stay on the 4×4 m map within 5 s.
+- Scope: failure modes are `lock` and `free` only; `none` stays as the
+  no-fault baseline (`limit` is still available but off by default).
+  Trial strips (`--render-trials`) render the robot at the fault and at
+  +1…+5 s with the elevation map, impact cells and paths drawn in.
 
 ### Phase 4 — Difficulty presets
 - Named tiers bundling terrain config + payload + push/impulse

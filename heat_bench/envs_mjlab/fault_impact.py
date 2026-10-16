@@ -39,9 +39,11 @@ if TYPE_CHECKING:
 
 FAULT_ELEVATION_SENSOR = "fault_elevation_map"
 BODY_GROUPS = ("trunk", "head", "hip", "thigh", "calf", "foot")
-SEVERE_GROUPS = ("trunk", "head", "hip", "thigh")
-"""Groups whose ground contact counts as a fall. Calves are left out: they
-graze stair edges during normal walking."""
+TRUNK_GROUPS = ("trunk", "head")
+"""The trunk body: its box plus the head sphere fixed to it. Only these
+count as the robot hitting the environment -- a fall, a contact event, an
+impact or the body sweep. Legs touch the terrain in normal walking (calves
+graze stair edges), so leg contact is logged per step but isn't impact."""
 
 
 def body_group(geom_name: str) -> str:
@@ -285,6 +287,170 @@ def rasterize_contacts(
   first[first.isinf()] = float("nan")
   risk = torch.stack([count, peak, first]).view(3, num_envs, grid.ny, grid.nx)
   return risk.transpose(0, 1).contiguous(), outside
+
+
+def geom_sample_points(
+  geom_type: np.ndarray, geom_size: np.ndarray, geom_rbound: np.ndarray
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Spheres covering each collision geom, for the body-sweep footprint.
+
+  Capsules and cylinders get 5 spheres along their axis, boxes a 3x3 grid
+  in their local xy plane (radius = half-height), spheres one; anything
+  else one sphere of its bounding radius. Returns ``(geom_index [S],
+  local_offset [S, 3], radius [S])``.
+  """
+  idx, off, rad = [], [], []
+  for g, (t, size, rb) in enumerate(
+    zip(geom_type, geom_size, geom_rbound, strict=True)
+  ):
+    if t == mujoco.mjtGeom.mjGEOM_SPHERE:
+      pts, r = [(0.0, 0.0, 0.0)], size[0]
+    elif t in (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_CYLINDER):
+      pts = [(0.0, 0.0, z) for z in np.linspace(-size[1], size[1], 5)]
+      r = size[0]
+    elif t == mujoco.mjtGeom.mjGEOM_BOX:
+      pts = [
+        (x, y, 0.0) for x in (-size[0], 0.0, size[0]) for y in (-size[1], 0.0, size[1])
+      ]
+      r = size[2]
+    else:
+      pts, r = [(0.0, 0.0, 0.0)], rb
+    idx += [g] * len(pts)
+    off += pts
+    rad += [r] * len(pts)
+  return (
+    torch.tensor(idx, dtype=torch.long),
+    torch.tensor(off, dtype=torch.float32),
+    torch.tensor(rad, dtype=torch.float32),
+  )
+
+
+def sweep_cells(
+  points: torch.Tensor, radius: torch.Tensor, grid: GridSpec
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Grid cells under body spheres.
+
+  ``points [B, S, 3]`` are sphere centres in the grid's frame and ``radius
+  [S]`` their radii. A cell counts when its centre is within ``radius +
+  resolution / 2`` of the centre in xy. Returns flat ``(env_id, cell,
+  bottom_z)`` entries, ``bottom_z`` being the sphere's lowest point.
+  """
+  res = grid.resolution
+  reach = int(np.ceil(float(radius.max()) / res)) + 1
+  k = torch.arange(-reach, reach + 1, device=points.device)
+  dy, dx = torch.meshgrid(k, k, indexing="ij")
+  dx, dy = dx.flatten(), dy.flatten()
+  ix0 = torch.round((points[..., 0] + grid.size[0] / 2) / res).long()
+  iy0 = torch.round((points[..., 1] + grid.size[1] / 2) / res).long()
+  ix = ix0[..., None] + dx  # [B, S, K]
+  iy = iy0[..., None] + dy
+  cx = -grid.size[0] / 2 + ix * res
+  cy = -grid.size[1] / 2 + iy * res
+  dist = torch.hypot(cx - points[..., 0:1], cy - points[..., 1:2])
+  r = radius.to(points.device)[None, :, None]
+  hit = (
+    (dist <= r + res / 2 + 1e-6)
+    & (ix >= 0)
+    & (ix < grid.nx)
+    & (iy >= 0)
+    & (iy < grid.ny)
+  )
+  b, si, ki = hit.nonzero(as_tuple=True)
+  cell = iy[b, si, ki] * grid.nx + ix[b, si, ki]
+  bottom = points[b, si, 2] - r[0, si, 0]
+  return b, cell, bottom
+
+
+class SweepMap:
+  """Per-env footprint of the robot's body on an elevation-map grid,
+  accumulated over steps: whether each cell was ever under the body, when
+  first (s since the fault), and the smallest clearance between the body's
+  bottom and that cell's terrain (m; <= 0 means touching)."""
+
+  def __init__(self, num_envs: int, grid: GridSpec, device: str):
+    self.grid = grid
+    cells = grid.ny * grid.nx
+    self.occupied = torch.zeros(num_envs * cells, dtype=torch.bool, device=device)
+    self.first_dt = torch.full((num_envs * cells,), float("inf"), device=device)
+    self.min_clearance = torch.full((num_envs * cells,), float("inf"), device=device)
+
+  def update(
+    self,
+    rows: torch.Tensor,
+    points: torch.Tensor,
+    radius: torch.Tensor,
+    terrain: torch.Tensor,
+    dt: torch.Tensor,
+  ) -> None:
+    """Add one step for envs ``rows``: ``points [R, S, 3]`` in the map
+    frame, ``terrain [R, ny, nx]`` the map's heights in that frame (NaN =
+    unknown), ``dt [R]`` the time since the fault."""
+    b, cell, bottom = sweep_cells(points, radius, self.grid)
+    flat = rows[b] * (self.grid.ny * self.grid.nx) + cell
+    self.occupied[flat] = True
+    self.first_dt.scatter_reduce_(0, flat, dt[b], reduce="amin")
+    clear = bottom - terrain.flatten(1)[b, cell]
+    ok = ~clear.isnan()
+    self.min_clearance.scatter_reduce_(0, flat[ok], clear[ok], reduce="amin")
+
+  def result(self) -> torch.Tensor:
+    """``[B, 3, ny, nx]``: occupied (0/1), first time (NaN if never), min
+    clearance (NaN if never or terrain unknown)."""
+    n = self.occupied.numel() // (self.grid.ny * self.grid.nx)
+    first = self.first_dt.masked_fill(self.first_dt.isinf(), float("nan"))
+    clear = self.min_clearance.masked_fill(self.min_clearance.isinf(), float("nan"))
+    out = torch.stack([self.occupied.float(), first, clear])
+    return out.view(3, n, self.grid.ny, self.grid.nx).transpose(0, 1).contiguous()
+
+
+RISK_CHANNELS = (
+  "touched",
+  "peak_force_n",
+  "first_contact_dt_s",
+  "impacts",
+  "contact_steps",
+)
+"""Channels of a contact risk grid: any contact (0/1), the largest contact
+force (N), the earliest contact time after the fault (s, NaN if never),
+the number of contact events that *started* in the cell (impacts, not time
+spent resting), and contact-steps (20 ms steps x contact points; dominated
+by a robot lying still)."""
+SWEEP_CHANNELS = ("occupied", "first_dt_s", "min_clearance_m")
+
+
+def assemble_risk(contacts: torch.Tensor, impacts: torch.Tensor) -> torch.Tensor:
+  """``RISK_CHANNELS`` grid ``[B, 5, ny, nx]`` from a ``rasterize_contacts``
+  grid of contact rows ``[B, 3, ny, nx]`` and per-cell event onset counts
+  ``[B, ny, nx]``."""
+  count, peak, first = contacts.unbind(1)
+  touched = (count > 0).float()
+  return torch.stack([touched, peak, first, impacts, count], dim=1)
+
+
+def window_risk(
+  contacts: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+  events: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+  edges: torch.Tensor,
+  num_envs: int,
+  grid: GridSpec,
+) -> torch.Tensor:
+  """``RISK_CHANNELS`` grids per time window after the fault.
+
+  ``contacts`` and ``events`` are ``(env_id [N], pos [N, 3], force [N],
+  dt [N])`` in the grid's frame -- contact rows, and event onsets with
+  their peak force. Window ``w`` holds rows with ``edges[w] <= dt <
+  edges[w + 1]``. Returns ``[B, W, 5, ny, nx]``.
+  """
+  out = []
+  for lo, hi in zip(edges[:-1].tolist(), edges[1:].tolist(), strict=True):
+    c_in = (contacts[3] >= lo) & (contacts[3] < hi)
+    e_in = (events[3] >= lo) & (events[3] < hi)
+    c_env, c_pos, c_force, c_dt = (x[c_in] for x in contacts)
+    e_env, e_pos, e_force, e_dt = (x[e_in] for x in events)
+    base, _ = rasterize_contacts(c_env, c_pos, c_force, c_dt, num_envs, grid)
+    impacts, _ = rasterize_contacts(e_env, e_pos, e_force, e_dt, num_envs, grid)
+    out.append(assemble_risk(base, impacts[:, 0]))
+  return torch.stack(out, dim=1)
 
 
 def extract_contact_events(
