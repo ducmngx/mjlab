@@ -20,6 +20,7 @@ from heat_bench.envs_mjlab.actuator_health import (
   enabled_gear_break,
   scripted_joint_fault,
 )
+from heat_bench.envs_mjlab.course_terrain import FLOORS, ObstacleLaneTerrainCfg
 from heat_bench.envs_mjlab.eval_observations import (
   ThermalEnergyObservation,
   battery_capacity_loss_pct,
@@ -76,10 +77,45 @@ STAIRS_UP_TERRAINS_CFG = TerrainGeneratorCfg(
   add_lights=True,
 )
 
+COURSE_COPIES = 3
+"""Independently generated columns per floor type on the course."""
+
+COURSE_TERRAINS_CFG = TerrainGeneratorCfg(
+  size=(16.0, 6.0),
+  border_width=10.0,
+  num_rows=10,
+  curriculum=True,
+  # Fixed so a course can be regenerated to re-render or relabel trials;
+  # pass a different seed (--terrain-seed) for a fresh set of layouts.
+  seed=7,
+  # COURSE_COPIES columns per floor type (flat, flat_2, flat_3, rough, ...),
+  # each its own random draw of obstacles and rough ground. Each tile is a
+  # lane along +x: the robot spawns at the start facing down it, the floor
+  # feature starts 3 m in, and walls, pillars, pole fences and crates stand
+  # beside the lane, closer and more numerous down the difficulty rows (see
+  # course_terrain.py).
+  sub_terrains={
+    floor if k == 0 else f"{floor}_{k + 1}": ObstacleLaneTerrainCfg(floor=floor)
+    for floor in FLOORS
+    for k in range(COURSE_COPIES)
+  },
+  add_lights=True,
+)
+
+COURSE_SPAWN_POSE_RANGE = {
+  "x": (-0.15, 0.15),
+  "y": (-0.15, 0.15),
+  "z": (0.01, 0.05),
+  "yaw": (-0.15, 0.15),
+}
+"""Spawn jitter on course tiles: the robot starts at the lane start facing
+down the lane (+x), instead of anywhere within 0.5 m at any heading."""
+
 FAULT_TERRAINS = {
   "rough": ROUGH_TERRAINS_CFG,
   "stairs": STAIRS_TERRAINS_CFG,
   "stairs_up": STAIRS_UP_TERRAINS_CFG,
+  "course": COURSE_TERRAINS_CFG,
 }
 """Terrain presets for fault trials, generated in curriculum layout so each
 tile's row is its difficulty and its column its sub-terrain type."""
@@ -335,17 +371,25 @@ def add_scripted_joint_fault(
   cfg.events["actuator_health"] = health_event
 
 
-def use_fault_terrain(cfg: ManagerBasedRlEnvCfg, terrain: str) -> None:
-  """Swap in a ``FAULT_TERRAINS`` preset, mutating ``cfg`` in place."""
+def use_fault_terrain(
+  cfg: ManagerBasedRlEnvCfg, terrain: str, seed: int | None = None
+) -> None:
+  """Swap in a ``FAULT_TERRAINS`` preset, mutating ``cfg`` in place.
+
+  ``seed`` overrides the preset's terrain seed, so the randomized tiles
+  (obstacle layouts, rough ground) are drawn afresh; ``None`` keeps it."""
   if terrain not in FAULT_TERRAINS:
     raise ValueError(f"Unknown terrain {terrain!r}; expected {list(FAULT_TERRAINS)}.")
   assert cfg.scene.terrain is not None
-  cfg.scene.terrain.terrain_generator = replace(
-    FAULT_TERRAINS[terrain], curriculum=True, border_width=10.0
-  )
+  gen = replace(FAULT_TERRAINS[terrain], curriculum=True, border_width=10.0)
+  if seed is not None:
+    gen = replace(gen, seed=seed)
+  cfg.scene.terrain.terrain_generator = gen
   # Fault trials never reset, so the initial spawn is the only draw: cover
   # every difficulty row, not just the training curriculum's starting levels.
   cfg.scene.terrain.max_init_terrain_level = None
+  if terrain == "course":
+    cfg.events["reset_base"].params["pose_range"] = dict(COURSE_SPAWN_POSE_RANGE)
 
 
 def add_joint_fault_injection(
@@ -359,7 +403,9 @@ def add_joint_fault_injection(
   command_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
   | None = None,
   terrain: str | None = None,
+  terrain_seed: int | None = None,
   elevation_map: bool = False,
+  elevation_map_size: float = 4.0,
 ) -> None:
   """Fail joints mid-run without resetting, mutating ``cfg`` in place.
 
@@ -374,10 +420,11 @@ def add_joint_fault_injection(
   env at reset from ((vx lo, hi), (vy lo, hi), (wz lo, hi)) and holds it
   for the whole run, so velocity errors are measured against a constant
   command; the two are mutually exclusive. ``terrain`` picks a
-  ``FAULT_TERRAINS`` preset (``None`` keeps the task's random tiles).
+  ``FAULT_TERRAINS`` preset (``None`` keeps the task's random tiles) and
+  ``terrain_seed`` overrides its seed.
   ``elevation_map`` adds the ``fault_elevation_map`` raycast grid (see
-  ``fault_impact.py``). The gearbox break is turned off so only the
-  scripted fault fires.
+  ``fault_impact.py``), ``elevation_map_size`` metres on a side. The
+  gearbox break is turned off so only the scripted fault fires.
   """
   if command_vel is not None and command_ranges is not None:
     raise ValueError("Pass command_vel or command_ranges, not both.")
@@ -409,33 +456,43 @@ def add_joint_fault_injection(
 
   sensors = (fault_contact_sensor_cfg(),)
   if elevation_map:
-    sensors += (fault_elevation_sensor_cfg(),)
+    size = (elevation_map_size, elevation_map_size)
+    sensors += (fault_elevation_sensor_cfg(size=size),)
   cfg.scene.sensors = (cfg.scene.sensors or ()) + sensors
   cfg.terminations = {}
   cfg.episode_length_s = int(1e9)
   cfg.curriculum = {}
 
   if terrain is not None:
-    use_fault_terrain(cfg, terrain)
+    use_fault_terrain(cfg, terrain, terrain_seed)
 
   if command_vel is not None:
     vx, vy, wz = command_vel
     command_ranges = ((vx, vx), (vy, vy), (wz, wz))
   if command_ranges is not None:
-    twist = cfg.commands["twist"]
-    assert isinstance(twist, UniformVelocityCommandCfg)
-    rx, ry, rz = command_ranges
-    twist.heading_command = False
-    twist.rel_standing_envs = 0.0
-    twist.rel_heading_envs = 0.0
-    twist.rel_world_envs = 0.0
-    twist.rel_forward_envs = 0.0
-    twist.init_velocity_prob = 0.0
-    # Sampled at reset only; never resampled mid-run.
-    twist.resampling_time_range = (1e9, 1e9)
-    twist.ranges = UniformVelocityCommandCfg.Ranges(
-      lin_vel_x=rx, lin_vel_y=ry, ang_vel_z=rz
-    )
+    hold_twist_command(cfg, command_ranges)
+
+
+def hold_twist_command(
+  cfg: ManagerBasedRlEnvCfg,
+  ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+) -> None:
+  """Sample one twist per env at reset from ((vx lo, hi), (vy lo, hi),
+  (wz lo, hi)) and hold it until the next reset, mutating ``cfg``."""
+  twist = cfg.commands["twist"]
+  assert isinstance(twist, UniformVelocityCommandCfg)
+  rx, ry, rz = ranges
+  twist.heading_command = False
+  twist.rel_standing_envs = 0.0
+  twist.rel_heading_envs = 0.0
+  twist.rel_world_envs = 0.0
+  twist.rel_forward_envs = 0.0
+  twist.init_velocity_prob = 0.0
+  # Sampled at reset only; never resampled mid-run.
+  twist.resampling_time_range = (1e9, 1e9)
+  twist.ranges = UniformVelocityCommandCfg.Ranges(
+    lin_vel_x=rx, lin_vel_y=ry, ang_vel_z=rz
+  )
 
 
 def add_box_payload(

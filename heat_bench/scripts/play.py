@@ -29,6 +29,7 @@ from heat_bench.envs_mjlab.go2_eval_env_cfg import (
   add_push_disturbance,
   add_scripted_joint_fault,
   go2_eval_env_cfg,
+  hold_twist_command,
   use_fault_terrain,
 )
 from heat_bench.viewer import HealthMonitoringViewer
@@ -98,9 +99,17 @@ class PlayConfig:
   """Box payload strapped on top of the trunk, mass sampled per reset in
   this range (kg), drawn as a grey sphere. E.g. '--payload-kg 5 5'."""
   terrain: str | None = None
-  """Swap in a fault-trial terrain preset: rough, stairs, or stairs_up (a
+  """Swap in a fault-trial terrain preset: rough, stairs, stairs_up (a
   stair pit -- every robot starts at the bottom and climbs ~5 steps when it
-  walks out). Rows of tiles get harder (taller risers) along x."""
+  walks out), or course (obstacle lanes: three columns per floor type -- flat,
+  rough, slope up/down, stairs up/down -- with walls, pillars, pole fences
+  and crates beside the lane). Rows of tiles get harder along x."""
+  terrain_seed: int | None = None
+  """Override the terrain preset's seed for a fresh draw of its randomized
+  tiles (course obstacle layouts, rough ground)."""
+  course_command_vel: tuple[float, float, float] = (0.6, 0.0, 0.0)
+  """Fixed (lin_vel_x, lin_vel_y, ang_vel_z) command on course tiles when no
+  fault_joints are set, so robots walk straight down their lanes."""
   elevation_map: bool = False
   """Draw the fault-impact elevation map (4x4 m, 0.1 m cells, cast from 2 m
   above the trunk; see envs_mjlab/fault_impact.py) as height-coloured tiles
@@ -135,7 +144,10 @@ def run_play(cfg: PlayConfig) -> None:
       command_vel=cfg.fault_command_vel,
     )
   if cfg.terrain is not None:
-    use_fault_terrain(env_cfg, cfg.terrain)
+    use_fault_terrain(env_cfg, cfg.terrain, cfg.terrain_seed)
+  if cfg.terrain == "course" and not cfg.fault_joints:
+    vx, vy, wz = cfg.course_command_vel
+    hold_twist_command(env_cfg, ((vx, vx), (vy, vy), (wz, wz)))
   if cfg.elevation_map:
     env_cfg.scene.sensors = (env_cfg.scene.sensors or ()) + (
       fault_elevation_sensor_cfg(debug_vis=True),

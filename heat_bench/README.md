@@ -300,14 +300,15 @@ noted otherwise.
   version of the landing demo, meant for learning to predict a fault's
   impact. Each trial walks one constant command sampled from
   `--lin-vel-x/--lin-vel-y/--ang-vel-z` on curriculum-layout terrain
-  (`--terrain rough|stairs|stairs_up`; a tile's row is its difficulty, its
-  column its type, and every row is spawned). `stairs_up` is a stair pit:
-  each robot starts on the low 3 m platform and climbs five 0.3 m treads
-  when it walks out, with risers from 2 cm (row 0) to 14 cm (row 9; the
-  reference policy trained up to 10 cm). A joint fails, and the trial is
-  logged for `--horizon-s` (5 s) after the fault, through any fall
-  (`--post-fall-s` can cut it short). Survivors keep walking and drifting; there are no pushes,
-  so fragility comes only from the fault and the terrain. Only the trunk
+  (`--terrain rough|stairs|stairs_up|course`; a tile's row is its
+  difficulty, its column its type, and every row is spawned). `stairs_up`
+  is a stair pit: each robot starts on the low 3 m platform and climbs five
+  0.3 m treads when it walks out, with risers from 2 cm (row 0) to 14 cm
+  (row 9; the reference policy trained up to 10 cm). `course` is the
+  obstacle-lane map described in the next item. A joint fails, and the
+  trial is logged for `--horizon-s` (5 s) after the fault, through any
+  fall (`--post-fall-s` can cut it short). Survivors keep walking and
+  drifting; there are no pushes, so fragility comes only from the fault and the terrain. Only the trunk
   body (its box and the head sphere fixed to it) counts as contact with the
   environment: a fall is the first post-fault step with trunk-terrain
   contact (≥ `--min-contact-force-n`; `--tilt-fall-deg` optionally adds a
@@ -322,7 +323,7 @@ noted otherwise.
     impulse, and where it was.
   - **Per-trial labels:** `fell` / `time_to_fall_s` and first-contact time
     per part and group.
-  - **Maps:** a 4×4 m, 0.1 m elevation map (`fault_elevation_map`, aligned
+  - **Maps:** a 4×4 m (`--map-size-m`), 0.1 m elevation map (`fault_elevation_map`, aligned
     like `terrain_scan` but cast from 2 m above the trunk so higher terrain
     isn't missed), with two maps on the same cells:
     - `risk_*` (`risk_channels`): touched, peak force, first contact time,
@@ -358,6 +359,52 @@ noted otherwise.
   reference policy's no-fault controls fall in ~18% of 15 s trials, mostly
   on steep slopes at difficulty rows ≥ 4. Compare faulted trials against
   them.
+- **Obstacle course map** (`--terrain course` on `fault_impact.py` and
+  `play.py`; `envs_mjlab/course_terrain.py`) — scenes where a robot that
+  drifts after a fault can hit structures, not just the floor. Built from
+  simple primitives (boxes, cylinders, heightfields), since only the
+  geometry that can be hit matters, not realism.
+  - **Layout:** 16 x 6 m tiles, each a lane along +x. The robot spawns
+    1 m in, on the lane centre, facing down it (±0.15 m, ±0.15 rad
+    jitter). The floor spans the full tile width, so there are no drop-off
+    edges inside a tile.
+  - **Floors**, one per column type, the feature starting 3 m in:
+
+    | Floor | Row 0 → row 9 |
+    |---|---|
+    | `flat` | flat |
+    | `rough` | smoothed-noise heightfield, 2 → 10 cm peak to peak (flat spawn pad) |
+    | `slope_up` / `slope_down` | 3 m ramp, 5° → 20° |
+    | `stairs_up` / `stairs_down` | 5 → 8 steps, 0.3 m tread, riser 3 → 14 cm |
+
+  - **Objects** beside the lane, 3 → 8 per tile: walls (0.6–1.2 m tall),
+    pillars (radius 0.10–0.25 m), pole fences (rows of 5 cm poles) and
+    crates (0.2–0.6 m tall, random yaw). Their inner faces sit 1.0–2.0 m
+    from the lane centre on row 0 and 0.55–1.0 m on row 9; never closer
+    than 0.55 m, just outside the policy's ±0.5 m height scan. Objects sit
+    on the local floor height, so they stand on slopes and stairs too.
+    Geoms are named `course_<kind>_<n>` (floors `course_floor_<n>`).
+  - **Variety:** three independently drawn columns per floor (`flat`,
+    `flat_2`, `flat_3`, `rough`, …), 18 columns x 10 rows = 180 tiles. The
+    preset seed (7) fixes the layout so trials can be re-rendered;
+    `--terrain-seed N` draws a fresh set (saved as `terrain_seed` in the
+    `.npz`), so each cluster job can get its own.
+  - **Contacts are 2.5D:** each trunk contact is an (x, y) cell plus a
+    height on the fault-time elevation map, which the obstacles show up in
+    (cast from 2 m above the trunk). Anything in a hit zone counts as at
+    risk; the contacted object isn't identified. In a 512-trial run ~76%
+    of trunk contacts land on the mapped surface and ~23% against a
+    vertical face (wall, obstacle, riser, ramp side) at the cell where the
+    height jumps. Robots move faster here than in the stair pit, so use
+    `--map-size-m 8`: a 4 m map keeps 91% of course contacts, 6 m 98.5%,
+    8 m 99.9%.
+  - **Commands and baseline:** trials use the usual sampled commands, so
+    turning or sideways ones can carry a robot into a neighbouring lane
+    (each trial records its tile at fault and fall). The reference policy
+    turns ~0.05 rad/s on a zero yaw command and bumps obstacles even
+    without a fault (`none` fell 18–24% within 5 s); a better baseline
+    policy is to be trained on these scenes. 512 envs peak at ~7.5 GB GPU
+    (~2500 collision geoms).
 - **Box payload** (`--payload-kg LO HI` on `play.py` and
   `fault_landing.py`) — a solid box of sampled mass strapped on top of the
   trunk (`envs_mjlab/payload.py`), combined exactly with the trunk's
@@ -428,6 +475,17 @@ uv run python -m heat_bench.scripts.play \
   --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
   --num-envs 4 --terrain stairs_up --elevation-map \
   --fault-joints FR_calf_joint --fault-modes lock --fault-command-vel 0.6 0 0
+
+# Obstacle lanes: walls, pillars, pole fences and crates beside the path.
+uv run python -m heat_bench.scripts.fault_impact \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 512 --terrain course --map-size-m 8 --terrain-seed 1 \
+  --output-file course.npz
+
+# Walk the lanes without faults (straight 0.6 m/s, see --course-command-vel).
+uv run python -m heat_bench.scripts.play \
+  --checkpoint-file logs/rsl_rl/go1_velocity/<run>/model_<N>.pt \
+  --num-envs 64 --terrain course --elevation-map
 ```
 
 ## Tests

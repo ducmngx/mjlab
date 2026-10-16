@@ -129,11 +129,22 @@ class FaultImpactConfig:
   """Lateral command range (m/s)."""
   ang_vel_z: tuple[float, float] = (-0.5, 0.5)
   """Yaw-rate command range (rad/s)."""
-  terrain: Literal["rough", "stairs", "stairs_up"] = "rough"
+  terrain: Literal["rough", "stairs", "stairs_up", "course"] = "rough"
   """Terrain preset (curriculum layout: tile row = difficulty, col = type).
   ``stairs_up`` spawns every robot at the bottom of a stair pit, so walking
   out climbs; pair it with a straight command (``--lin-vel-y 0 0
-  --ang-vel-z 0 0``) and a fault time while on the steps (~2-5 s)."""
+  --ang-vel-z 0 0``) and a fault time while on the steps (~2-5 s).
+  ``course`` spawns every robot at the start of a 16 m obstacle lane facing
+  +x, three columns per floor type, with walls, pillars, pole fences and crates
+  beside the lane (see envs_mjlab/course_terrain.py)."""
+  terrain_seed: int | None = None
+  """Terrain generator seed; ``None`` keeps the preset's fixed seed. Give
+  each job its own seed for fresh obstacle layouts and rough ground. The
+  seed used is saved as ``terrain_seed``."""
+  map_size_m: float = 4.0
+  """Side of the square elevation map (0.1 m cells) that contacts and risk
+  grids are mapped onto. On ``course`` at up to 1 m/s, 4 m keeps ~91% of
+  post-fault trunk contacts on the map, 6 m ~98.5% and 8 m ~99.9%."""
   pre_fault_s: float = 1.0
   """Also log this long before the fault, as a baseline."""
   horizon_s: float = 5.0
@@ -183,7 +194,9 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     command_vel=None,
     command_ranges=(cfg.lin_vel_x, cfg.lin_vel_y, cfg.ang_vel_z),
     terrain=cfg.terrain,
+    terrain_seed=cfg.terrain_seed,
     elevation_map=True,
+    elevation_map_size=cfg.map_size_m,
   )
   if cfg.payload_kg is not None:
     add_box_payload(env_cfg, cfg.payload_kg)
@@ -636,6 +649,7 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     "joint_names": np.array(fault.joint_names),
     "mode_names": np.array([m.name.lower() for m in FaultMode]),
     "terrain_names": np.array(sub_names),
+    "terrain_seed": np.array(-1 if gen.seed is None else gen.seed),
     "terrain_row_difficulty": row_difficulty.astype(np.float32),
     "env_kept": _np(keep),
     "fault_joint": _np(fault.fault_joint),

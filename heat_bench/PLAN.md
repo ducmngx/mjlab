@@ -413,6 +413,22 @@ Original scope:
   no-fault baseline (`limit` is still available but off by default).
   Trial strips (`--render-trials`) render the robot at the fault and at
   +1…+5 s with the elevation map, impact cells and paths drawn in.
+- `course` terrain (2026-10-16): obstacle lanes from simple primitives so
+  a drifting robot can hit structures, not just the floor. One column per
+  floor (flat, rough, slope up/down, stairs up/down), 3-8 walls, pillars,
+  pole fences and crates beside each lane, one difficulty knob down the
+  rows. First 512-env run (sampled commands, faults at 3-5 s, 5 s horizon)
+  works end to end: even coverage over floors and rows, fell within 5 s
+  `free` 63%, `lock` 19%, `none` 24%. The reference policy drifts and
+  bumps obstacles even without a fault (it turns ~0.05 rad/s on a zero
+  yaw command), so `none` is a noisy baseline; a better baseline policy
+  will be retrained on these scenes later. Contact labels by obstacle kind
+  (geom names `course_<kind>_<n>`) are not in the dataset yet.
+  Then: three independently drawn columns per floor (180 tiles),
+  `--terrain-seed` for a fresh draw per job, and `--map-size-m` (8 m keeps
+  99.9% of course contacts on the map vs 91% at 4 m). Contacts stay 2.5D:
+  an (x, y) cell plus height on the fault-time elevation map; ~23% land
+  against a vertical face (wall, riser, ramp side) at the height jump.
 
 ### Phase 4 — Difficulty presets
 - Named tiers bundling terrain config + payload + push/impulse
