@@ -16,6 +16,8 @@ export WANDB_DIR="${WANDB_DIR:-$DATA_ROOT}"
 # uv's package cache and the project virtualenv (several GB with CUDA torch).
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$DATA_ROOT/.cache/uv}"
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$DATA_ROOT/venv}"
+# Cache and venv may sit on different filesystems (NFS): copy, don't hardlink.
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 
 if ! mkdir -p "$DATA_ROOT" "$LOG_ROOT" "$WANDB_DIR" "$UV_CACHE_DIR" 2>/dev/null; then
   echo "[env] Cannot create $DATA_ROOT; set DATA_ROOT to a writable scratch path." >&2
