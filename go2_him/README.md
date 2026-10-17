@@ -80,42 +80,66 @@ uv run python -m go2_him.scripts.play Go2-HIM-Rough \
 
 ## Training on a SLURM cluster
 
-No hand-made virtual environment is needed. uv builds `.venv` from the
+The scripts in `go2_him/cluster/` are set up for GMU's Hopper cluster:
+- partition `gpuq` and QOS `gpu`;
+- one `A100.80gb` GPU and up to 3 days per job;
+- job logs in `/scratch/$USER/logs/`.
+
+No hand-made virtual environment is needed. uv builds one from the
 committed `uv.lock`, including Python 3.13 and the CUDA 12.8 PyTorch wheels.
 
+**Everything that gets written goes to scratch.** The clone holds only
+code and meshes, about 60 MB, so it can stay in `$HOME`. `env.sh` sets the
+paths; each can be overridden:
+
+| Path | Contents |
+|---|---|
+| `/scratch/$USER/logs/go2_him-<jobid>.out` | job stdout and stderr |
+| `$DATA_ROOT` (default `/scratch/$USER/go2_him`) | root for everything below |
+| `$DATA_ROOT/venv` | the virtualenv (`UV_PROJECT_ENVIRONMENT`) |
+| `$DATA_ROOT/.cache/uv` | uv's package cache |
+| `$DATA_ROOT/rsl_rl/go2_him/<date>_<run>/` | checkpoints `model_<N>.pt` (every 100 iterations, about 6.5 MB each), ONNX policy, the exact configs and the git state |
+| `$DATA_ROOT/wandb/` | W&B's local run files (curves and checkpoints also upload to the W&B project `go2_him`) |
+
 ```sh
-git clone git@github.com:ducmngx/mjlab.git && cd mjlab
+git clone git@github.com:ducmngx/mjlab.git ~/mjlab && cd ~/mjlab
 git checkout heat-bench-actuator-health
-bash go2_him/cluster/setup.sh     # installs uv if needed, uv sync, CUDA check
-uv run wandb login                # once; or export WANDB_API_KEY in the job
+bash go2_him/cluster/setup.sh     # installs uv if needed, builds the venv on
+                                  # scratch, CUDA check
+source go2_him/cluster/env.sh     # in any shell where you run `uv run ...`
+uv run wandb login                # once
 sbatch go2_him/cluster/train.sbatch
 ```
 
 - **Script settings.** `train.sbatch` trains `Go2-HIM-Rough-Original` with
-  4096 envs for 20000 iterations on one GPU. Override with environment
-  variables (`TASK`, `NUM_ENVS`, `MAX_ITERS`, `SEED`, `RUN_NAME`, `LOGGER`,
-  `EXTRA_ARGS`). Edit the `#SBATCH` lines (partition, account, time) for
-  your cluster.
+  4096 envs for 20000 iterations. Override with environment variables
+  (`TASK`, `NUM_ENVS`, `MAX_ITERS`, `SEED`, `RUN_NAME`, `LOGGER`,
+  `EXTRA_ARGS`). To get job email at your own address, uncomment
+  `--mail-user` in the script.
 
   ```sh
   TASK=Go2-HIM-Rough sbatch go2_him/cluster/train.sbatch    # lighter task
   sbatch --array=1-3 go2_him/cluster/train.sbatch           # seeds 1, 2, 3
-  EXTRA_ARGS="--agent.resume True --agent.load-run <run_dir>" \
-    sbatch go2_him/cluster/train.sbatch                     # resume
   ```
 
-- **Outputs.**
-  - The job log goes to `logs/slurm/<job>-<id>.out`.
-  - Checkpoints and ONNX files go to `logs/rsl_rl/go2_him/<date>_<run>/`.
-  - Curves go to the W&B project `go2_him`.
-  - Copy a `model_<N>.pt` back to watch it with `go2_him.scripts.play`.
+- **Resuming after the 3-day limit.** Submit again with
+  `--agent.resume True` and the run directory name:
+
+  ```sh
+  EXTRA_ARGS="--agent.resume True --agent.load-run <date>_<run>" \
+    sbatch go2_him/cluster/train.sbatch
+  ```
+
+- **Watching a checkpoint.** Copy a `model_<N>.pt` back and play it with
+  `go2_him.scripts.play`.
+- **Scratch may be purged.** Copy checkpoints you want to keep off scratch;
+  W&B also keeps them.
 - **Out of memory.** If `Go2-HIM-Rough-Original` at 4096 envs runs out of
   GPU memory, lower `NUM_ENVS`, or pass
   `EXTRA_ARGS="--env.sim.mujoco.ccd-iterations 200"`.
 - **One GPU per job.** mjlab's multi-GPU mode (`--gpu-ids all`) runs
   worker processes that have not been tested with the `go2_him` task
   registration.
-- **Home quota.** If `$SCRATCH` is set, `setup.sh` puts uv's cache there.
 
 ## Settings
 
