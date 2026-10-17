@@ -26,6 +26,17 @@ Added
   and body-sweep maps per second after the fault, and rendered trial strips
   with the data drawn into the scene.
 
+- ``go2_him``, a port of HIMLoco (Hybrid Internal Model, ICLR 2024) to mjlab
+  on Unitree's Go2 model: the ``Go2-HIM-Rough`` and
+  ``Go2-HIM-Rough-Original`` tasks with HIMLoco's observations, rewards,
+  terrain mix, commands, curricula and domain randomization, the HIM
+  velocity/latent estimator and actor as rsl_rl models, and ``HIMPPO``,
+  which trains the estimator alongside PPO on terminal-aware next-step
+  targets. The two tasks differ only in collision shapes, CCD iterations and
+  PD gains (GPU memory versus fidelity). Train and play through
+  ``go2_him/scripts``; ``go2_him/cluster`` has a uv setup script and a
+  SLURM job script.
+
 Changed
 ^^^^^^^
 

@@ -93,6 +93,10 @@ papers themselves:
    in the MIT Cheetah: Impact Mitigation and High-Bandwidth Physical
    Interaction for Dynamic Legged Robots,"* IEEE T-RO 33(3), 509–522,
    2017, 10.1109/TRO.2016.2640183 — reflected rotor inertia → gearbox load.
+10. Long, Wang, Li, Gao, Cao, Pang, *"Hybrid Internal Model: Learning
+    Agile Legged Locomotion with Simulated Robot Response,"* ICLR 2024,
+    arXiv:2312.11460; code github.com/InternRobotics/HIMLoco — the Go2
+    baseline policy in `go2_him/` (see `go2_him/README.md`).
 
 When adding a new heat_bench design decision backed by research, cite it
 in both places: inline in the relevant module/config comment, and in
