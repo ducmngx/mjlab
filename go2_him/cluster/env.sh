@@ -19,6 +19,21 @@ export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$DATA_ROOT/venv}"
 # Cache and venv may sit on different filesystems (NFS): copy, don't hardlink.
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 
+# rsl_rl imports GitPython, which needs a git binary to start; compute nodes
+# may only have it as a module.
+if ! command -v git >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
+  # Lmod's module function trips over `set -u`.
+  case $- in *u*) _env_nounset=1 && set +u ;; *) _env_nounset= ;; esac
+  module load git >/dev/null 2>&1 || true
+  [ -n "$_env_nounset" ] && set -u
+  unset _env_nounset
+fi
+if [ -z "${GIT_PYTHON_GIT_EXECUTABLE:-}" ] && ! command -v git >/dev/null 2>&1; then
+  echo "[env] git not found on ${HOSTNAME:-this node}; rsl_rl needs it. Load a git module" \
+    "(module avail git) or set GIT_PYTHON_GIT_EXECUTABLE." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 if ! mkdir -p "$DATA_ROOT" "$LOG_ROOT" "$WANDB_DIR" "$UV_CACHE_DIR" 2>/dev/null; then
   echo "[env] Cannot create $DATA_ROOT; set DATA_ROOT to a writable scratch path." >&2
   return 1 2>/dev/null || exit 1
