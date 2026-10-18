@@ -17,3 +17,7 @@ benchmark_results/
 # Documentation outputs.
 **/_build/*
 **/generated/*
+
+# Curated policy binaries (see policies/README.md).
+policies/**/*.pt
+policies/**/*.onnx
