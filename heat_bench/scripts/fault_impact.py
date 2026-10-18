@@ -1,7 +1,8 @@
 """Headless fault impact dataset: path drift and contact risk after a fault.
 
-Runs a trained checkpoint on ``go2_eval_env_cfg`` with
-``add_joint_fault_injection``: each env walks a sampled constant command on
+Runs a trained checkpoint -- the reference Go1 policy on ``go2_eval_env_cfg``,
+or a Go2 HIMLoco policy (``--task Go2-HIM-Rough[-Original]``) on its own
+task -- with ``add_joint_fault_injection``: each env walks a sampled constant command on
 curriculum-layout terrain, one or more joints fail at a sampled time (see
 ``heat_bench/envs_mjlab/joint_fault_injection.py``), and nothing resets.
 Each trial is logged from ``pre_fault_s`` before the fault until
@@ -26,6 +27,12 @@ Everything goes into one ``.npz`` (plot it with
 - ``contact_*``: one row per trunk-terrain contact (slot and step).
 - ``event_*``: trunk contact events (trunk box or head, onset/end time
   after the fault, order, peak force, impulse, where).
+- with an HIMLoco policy, ``dense_him_vel_est`` ``[B, T, 3]`` (the
+  estimator's base velocity, m/s, base frame), ``dense_him_latent``
+  ``[B, T, 16]``, and ``dense_dv_est_b``: actual minus estimated velocity.
+  The estimate at step ``t`` comes from the history up to ``t``, which HIM
+  trains to predict the velocity after that step's action, so
+  ``dv_est_b[t] = lin_vel_b[t] - him_vel_est[t - 1]`` (NaN at ``t = 0``).
 - per-trial labels: fault, command, terrain tile, ``fell`` /
   ``time_to_fall_s``, first-contact times per part, peak force, final path
   deviation, elevation maps and contact risk grids at fault time
@@ -43,9 +50,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import go2_him.him.tasks  # noqa: F401  (registers the Go2 HIM tasks)
 import numpy as np
 import torch
 import tyro
+from go2_him.him.env_cfg import LIN_VEL_SCALE
+from go2_him.him.modules import HIMActor
 
 from heat_bench.envs_mjlab.fault_impact import (
   BODY_GROUPS,
@@ -81,12 +91,15 @@ from heat_bench.envs_mjlab.joint_fault_injection import (
   FaultMode,
   contacts_in_base_frame,
 )
-from heat_bench.scripts.policy_loading import load_policy
+from heat_bench.scripts.policy_loading import REFERENCE_TASK_ID, load_runner
 from heat_bench.scripts.render_fault_impact import render_trials
-from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.sensor import GridPatternCfg, RayCastSensor
+from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_apply_inverse, wrap_to_pi
 from mjlab.utils.torch import configure_torch_backends
+
+GO2_HIM_RANDOMIZATION = ("payload", "base_com", "pd_gains", "foot_friction")
 
 ALL_LEG_JOINTS = tuple(
   f"{leg}_{j}_joint"
@@ -101,6 +114,11 @@ class FaultImpactConfig:
 
   checkpoint_file: str | None = None
   """Path to a local checkpoint file. Mutually exclusive with wandb_run_path."""
+  task: str = REFERENCE_TASK_ID
+  """Task the checkpoint was trained on. The reference Go1 task runs on
+  heat_bench's ``go2_eval_env_cfg``; ``Go2-HIM-Rough`` /
+  ``Go2-HIM-Rough-Original`` run the Go2 HIMLoco policy on its own task
+  (play variant, domain randomization off) and log HIM's estimates."""
   wandb_run_path: str | None = None
   """W&B run path ('entity/project/run_id') to resolve a checkpoint from."""
   wandb_checkpoint_name: str | None = None
@@ -179,11 +197,33 @@ def _np(x: torch.Tensor) -> np.ndarray:
   return x.detach().cpu().numpy()
 
 
+def _base_env_cfg(task: str) -> ManagerBasedRlEnvCfg:
+  """The env a ``task`` checkpoint runs on, before fault injection."""
+  if task == REFERENCE_TASK_ID:
+    return go2_eval_env_cfg(play=True)
+  cfg = load_env_cfg(task, play=True)
+  # Nominal robot for clean fault labels: no randomized mass, COM, gains or
+  # friction (pushes and disturbances are already off in play mode).
+  for name in GO2_HIM_RANDOMIZATION:
+    cfg.events.pop(name, None)
+  return cfg
+
+
+def _dv_est(dense: dict[str, torch.Tensor]) -> torch.Tensor:
+  """Actual base velocity minus the previous step's HIM estimate (HIM
+  predicts the velocity after the action taken on that history)."""
+  dv = torch.full_like(dense["lin_vel_b"], float("nan"))
+  dv[:, 1:] = dense["lin_vel_b"][:, 1:] - dense["him_vel_est"][:, :-1]
+  both = dense["valid"][:, 1:] & dense["valid"][:, :-1]
+  dv[:, 1:][~both] = float("nan")
+  return dv
+
+
 def run_fault_impact(cfg: FaultImpactConfig) -> Path:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-  env_cfg = go2_eval_env_cfg(play=True)
+  env_cfg = _base_env_cfg(cfg.task)
   add_joint_fault_injection(
     env_cfg,
     cfg.joints,
@@ -202,14 +242,18 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     add_box_payload(env_cfg, cfg.payload_kg)
   env_cfg.scene.num_envs = cfg.num_envs
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-  wrapped, policy = load_policy(
+  wrapped, runner = load_runner(
     env,
     device,
     cfg.checkpoint_file,
     cfg.wandb_run_path,
     cfg.wandb_checkpoint_name,
     cfg.log_root,
+    cfg.task,
   )
+  policy = runner.get_inference_policy(device=device)
+  actor = runner.alg.get_policy()
+  him = isinstance(actor, HIMActor)
 
   fault = env.event_manager.get_term_cfg("joint_fault_injection").func
   payload = (
@@ -284,6 +328,9 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     "part_pos_w": buf(num_parts, 3),
     "valid": buf(dtype=torch.bool),
   }
+  if him:
+    dense["him_vel_est"] = buf(3)
+    dense["him_latent"] = buf(actor.latent_dim)
   rows: dict[str, list[torch.Tensor]] = {
     k: [] for k in ("env_id", "step", "geom", "pos_w", "force_w", "pos_b", "force_b")
   }
@@ -384,6 +431,11 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
       "part_force": p_force,
       "part_pos_w": p_pos,
     }
+    if him:
+      with torch.no_grad():
+        vel_est, latent = actor.estimate(obs)
+      step_values["him_vel_est"] = vel_est / LIN_VEL_SCALE
+      step_values["him_latent"] = latent
     for k, v in step_values.items():
       dense[k][e, je] = v[e].to(dense[k].dtype)
     dense["valid"][e, je] = True
@@ -635,6 +687,7 @@ def run_fault_impact(cfg: FaultImpactConfig) -> Path:
     **{f"dense_{k}": _np(v) for k, v in dense.items() if k != "part_pos_w"},
     "dense_dt_s": _np(dt_s),
     "dense_dv_b": _np(dv_b),
+    **({"dense_dv_est_b": _np(_dv_est(dense))} if him else {}),
     "dense_base_pos_fy": _np(base_pos_fy),
     "dense_actual_fy": _np(actual_fy),
     "dense_expected_fy": _np(expected_fy),

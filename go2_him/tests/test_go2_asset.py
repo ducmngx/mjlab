@@ -148,3 +148,46 @@ def test_go2_xml_parses_unmodified():
 
   model = mujoco.MjModel.from_xml_path(str(GO2_XML))
   assert model.nu == 12 and model.nkey == 1
+
+
+@pytest.mark.slow
+def test_free_fault_without_actuator_health():
+  """On the Go2 HIM task (no heat_bench thermal stack) a FREE fault zeroes
+  the failed joint's motor and a reset restores it; the HIM command sampler
+  is replaced by a held uniform command."""
+  from heat_bench.envs_mjlab.go2_eval_env_cfg import add_joint_fault_injection
+  from heat_bench.scripts.fault_impact import _base_env_cfg
+
+  from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+
+  cfg = _base_env_cfg("Go2-HIM-Rough")
+  add_joint_fault_injection(
+    cfg,
+    ("FR_calf_joint",),
+    modes=("free",),
+    fault_time_s=(0.1, 0.1),
+    command_vel=(0.5, 0.0, 0.0),
+  )
+  assert type(cfg.commands["twist"]) is UniformVelocityCommandCfg
+  cfg.scene.num_envs = 2
+  _flat(cfg)
+  env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
+  try:
+    env.reset()
+    fault = env.event_manager.get_term_cfg("joint_fault_injection").func
+    for _ in range(10):
+      env.step(torch.zeros(2, 12))
+    rows = torch.arange(2)
+    ctrl = fault._ctrl_ids[fault.fault_joint[:, 0]]
+    forcerange = env.sim.model.actuator_forcerange
+    assert fault.faulted.all()
+    assert (forcerange[rows, ctrl] == 0).all()
+    assert (forcerange[0, fault._ctrl_ids].abs().sum(-1) > 0).sum() == 11
+    env.reset()
+    assert (forcerange[rows, ctrl, 1] > 40).all()
+    cmd = env.command_manager.get_command("twist")
+    assert cmd is not None
+    torch.testing.assert_close(cmd[:, 0], torch.full((2,), 0.5))
+  finally:
+    env.close()

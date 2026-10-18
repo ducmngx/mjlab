@@ -24,7 +24,9 @@ Added
   flat, rough, sloped or stepped floors; ``--terrain-seed`` for fresh
   layouts, ``--map-size-m`` for a larger elevation map), trunk-only impact
   and body-sweep maps per second after the fault, and rendered trial strips
-  with the data drawn into the scene.
+  with the data drawn into the scene. ``--task Go2-HIM-Rough[-Original]`` runs the trials
+  with a Go2 HIMLoco policy (no thermal stack needed) and logs its velocity
+  estimate and latent per step.
 
 - ``go2_him``, a port of HIMLoco (Hybrid Internal Model, ICLR 2024) to mjlab
   on Unitree's Go2 model: the ``Go2-HIM-Rough`` and

@@ -298,7 +298,13 @@ noted otherwise.
 - **Fault impact dataset** (`scripts/fault_impact.py`,
   `scripts/plot_fault_impact.py`) — the long-horizon, training-ready
   version of the landing demo, meant for learning to predict a fault's
-  impact. Each trial walks one constant command sampled from
+  impact. It runs the reference Go1 policy on `go2_eval_env_cfg`, or a Go2
+  HIMLoco policy with `--task Go2-HIM-Rough` / `Go2-HIM-Rough-Original`
+  (`go2_him/`; on its own task in play mode with domain randomization off,
+  no thermal stack). An HIMLoco run also logs the estimator's base velocity
+  and latent each step (`dense_him_vel_est`, `dense_him_latent`) and the
+  actual-minus-estimated velocity `dense_dv_est_b`.
+  Each trial walks one constant command sampled from
   `--lin-vel-x/--lin-vel-y/--ang-vel-z` on curriculum-layout terrain
   (`--terrain rough|stairs|stairs_up|course`; a tile's row is its
   difficulty, its column its type, and every row is spawned). `stairs_up`

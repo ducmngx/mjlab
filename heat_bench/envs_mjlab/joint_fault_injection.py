@@ -12,8 +12,10 @@ can be recorded (``heat_bench/scripts/fault_landing.py``).
   holding the joint. The motor is left alone, so it keeps pushing (and
   heating) against the jam. MuJoCo limits are soft constraints, so the joint
   can give by a few mrad under impact.
-- ``FREE``: the motor goes limp through ``apply_actuator_health`` (``derate``
-  = 0) and the joint swings passively.
+- ``FREE``: the motor goes limp and the joint swings passively: through
+  ``apply_actuator_health`` (``derate`` = 0) when the env has that term,
+  otherwise by zeroing the joint's ``actuator_forcerange`` directly (envs
+  without the heat_bench thermal stack, e.g. the Go2 HIM task).
 - ``NONE``: a control trial. The fault "fires" (time and frame are recorded
   like any other) but nothing changes, so other stressors -- e.g. a payload
   -- can be measured on their own.
@@ -36,7 +38,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from heat_bench.envs_mjlab.actuator_health import ActuatorState, apply_actuator_health
+from heat_bench.envs_mjlab.actuator_health import (
+  ActuatorState,
+  apply_actuator_health,
+  ctrl_ids_for_joints,
+)
 from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
@@ -125,13 +131,14 @@ def contacts_in_base_frame(
 class inject_joint_fault:
   """Fail sampled joints at a sampled time per episode; see module docstring.
 
-  Use with ``mode="step"``, registered before ``actuator_health``. At each
-  reset every env draws ``num_fault_joints`` distinct joints from
+  Use with ``mode="step"``, registered before ``actuator_health`` when there
+  is one (``health_term``; ``None`` makes FREE write the force range itself).
+  At each reset every env draws ``num_fault_joints`` distinct joints from
   ``joint_names``, one mode from ``modes``, and a fault time uniformly in
   ``fault_time_s``. The fault latches until the next reset.
   """
 
-  model_fields = ("jnt_range",)
+  model_fields = ("jnt_range", "actuator_forcerange")
   recompute = RecomputeLevel.none
 
   def __init__(self, cfg: "EventTermCfg", env: "ManagerBasedRlEnv"):
@@ -139,7 +146,7 @@ class inject_joint_fault:
     asset_cfg: SceneEntityCfg = params.get("asset_cfg", SceneEntityCfg("robot"))
     self._env = env
     self._asset = env.scene[asset_cfg.name]
-    self._health_term_name: str = params["health_term"]
+    self._health_term_name: str | None = params.get("health_term")
     self._health: apply_actuator_health | None = None
 
     local_ids, self.candidate_names = self._asset.find_joints(
@@ -163,6 +170,13 @@ class inject_joint_fault:
 
     self.joint_names: list[str] = list(self._asset.joint_names)
     self._global_jnt_ids = self._asset.indexing.joint_ids.to(env.device)
+    self._ctrl_ids = ctrl_ids_for_joints(
+      self._asset, list(range(len(self.joint_names))), self.joint_names
+    ).to(env.device)
+    self._nominal_forcerange: torch.Tensor | None = None
+    """Per-env ``actuator_forcerange`` of each joint's motor before any FREE
+    fault, [B, J, 2]; read lazily, once fields are expanded per env. Only
+    used without a health term."""
     self.nominal_jnt_range = env.sim.model.jnt_range[:, self._global_jnt_ids].clone()
     """Per-env ``jnt_range`` of the asset's joints before any fault, [B, J, 2]."""
 
@@ -203,6 +217,10 @@ class inject_joint_fault:
     self._env.sim.model.jnt_range[rows[:, None], self._global_jnt_ids] = (
       self.nominal_jnt_range[rows]
     )
+    if self._nominal_forcerange is not None:
+      self._env.sim.model.actuator_forcerange[rows[:, None], self._ctrl_ids] = (
+        self._nominal_forcerange[rows]
+      )
 
   def __call__(
     self,
@@ -211,13 +229,23 @@ class inject_joint_fault:
     joint_names: tuple[str, ...],
     modes: tuple[str, ...],
     fault_time_s: tuple[float, float],
-    health_term: str,
+    health_term: str | None = None,
     num_fault_joints: int = 1,
     limit_half_width_rad: float = 0.15,
     asset_cfg: SceneEntityCfg | None = None,
   ) -> None:
     del env_ids, joint_names, modes, fault_time_s, health_term
     del num_fault_joints, limit_half_width_rad, asset_cfg
+    if self._health_term_name is None:
+      if self._nominal_forcerange is None:
+        self._nominal_forcerange = env.sim.model.actuator_forcerange[
+          :, self._ctrl_ids
+        ].clone()
+      t = env.episode_length_buf.float() * env.step_dt
+      fire = ~self.faulted & (t >= self.fault_time_s)
+      if fire.any():
+        self._fire(fire.nonzero().squeeze(-1))
+      return
     health = self._health
     if health is None:
       health = env.event_manager.get_term_cfg(self._health_term_name).func
@@ -268,6 +296,14 @@ class inject_joint_fault:
     env.sim.model.jnt_range[rows[:, None], self._global_jnt_ids[cols]] = torch.where(
       keep, nominal, new_range
     )
+    # Without a health term, FREE zeroes the motor's force range here; it
+    # stays zero (latched) until the next reset restores it.
+    if self._health_term_name is None:
+      free = mode == FaultMode.FREE
+      if free.any():
+        free_rows = rows[free]
+        ctrl = self._ctrl_ids[self.fault_joint[free_rows]]
+        env.sim.model.actuator_forcerange[free_rows[:, None], ctrl] = 0.0
 
   def debug_vis(self, visualizer: "DebugVisualizer") -> None:
     """Faulted joints as spheres colored by mode; terrain contacts as small

@@ -141,6 +141,34 @@ sbatch go2_him/cluster/train.sbatch
   worker processes that have not been tested with the `go2_him` task
   registration.
 
+## Fault-impact data
+
+`heat_bench/scripts/fault_impact.py` runs joint-fault trials (lock, free,
+or no fault) with a trained Go2 HIM checkpoint. Pass the task it was trained
+on:
+
+```sh
+uv run python -m heat_bench.scripts.fault_impact --task Go2-HIM-Rough-Original \
+  --checkpoint-file <run>/model_<N>.pt --terrain course --map-size-m 8 \
+  --num-envs 512 --output-file go2_impact.npz
+```
+
+- **Environment:** the play variant of the task, with the robot's randomized
+  properties off (payload, COM, Kp/Kd, foot friction) so the fault labels
+  are clean.
+- **Commands:** HIMLoco's command sampler is swapped for one constant
+  command per trial.
+- **FREE faults:** no thermal stack is needed. FREE zeroes the failed
+  joint's motor force range directly; LOCK and LIMIT narrow the joint's
+  range as before.
+- **HIM fields** in the `.npz`, alongside the usual velocity error, path,
+  contact and impact-map data:
+  - `dense_him_vel_est`: the estimator's base velocity, in m/s;
+  - `dense_him_latent`: its 16-d latent;
+  - `dense_dv_est_b`: actual velocity minus the previous step's estimate.
+    HIM predicts the velocity after the action taken on that history, so
+    it is compared with the next step.
+
 ## Settings
 
 Values come from HIMLoco's `legged_robot_config.py` and `go1_config.py`

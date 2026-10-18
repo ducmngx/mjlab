@@ -9,7 +9,7 @@ rough-terrain task; no reward or action terms are touched.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
@@ -430,15 +430,17 @@ def add_joint_fault_injection(
     raise ValueError("Pass command_vel or command_ranges, not both.")
   if terrain is not None and terrain not in FAULT_TERRAINS:
     raise ValueError(f"Unknown terrain {terrain!r}; expected {list(FAULT_TERRAINS)}.")
-  if "actuator_health" not in cfg.events:
-    raise ValueError("add_joint_fault_injection requires actuator_health enabled.")
   parse_fault_modes(modes)  # Fail fast on a typo.
-  health_event = cfg.events.pop("actuator_health")
-  health_cfg = health_event.params["config"]["actuator_health"]
-  if health_cfg.get("gear_break") is not None:
-    health_cfg["gear_break"]["enabled"] = False
-  health_event.params.pop("gear_obs_group", None)
-  health_event.params.pop("gear_obs_term", None)
+  # Envs with heat_bench's actuator_health term (the Go1 eval env) route FREE
+  # through it; others (e.g. the Go2 HIM task) let the fault term zero the
+  # motor's force range itself.
+  health_event = cfg.events.pop("actuator_health", None)
+  if health_event is not None:
+    health_cfg = health_event.params["config"]["actuator_health"]
+    if health_cfg.get("gear_break") is not None:
+      health_cfg["gear_break"]["enabled"] = False
+    health_event.params.pop("gear_obs_group", None)
+    health_event.params.pop("gear_obs_term", None)
   cfg.events["joint_fault_injection"] = EventTermCfg(
     func=inject_joint_fault,
     mode="step",
@@ -446,13 +448,17 @@ def add_joint_fault_injection(
       "joint_names": tuple(joint_names),
       "modes": tuple(modes),
       "fault_time_s": tuple(fault_time_s),
-      "health_term": "actuator_health",
+      "health_term": None if health_event is None else "actuator_health",
       "num_fault_joints": num_fault_joints,
       "limit_half_width_rad": limit_half_width_rad,
       "asset_cfg": SceneEntityCfg("robot"),
     },
   )
-  cfg.events["actuator_health"] = health_event
+  if health_event is not None:
+    cfg.events["actuator_health"] = health_event
+  # Trials start from rest, whatever the task's reset randomizes.
+  if "reset_base" in cfg.events:
+    cfg.events["reset_base"].params["velocity_range"] = {}
 
   sensors = (fault_contact_sensor_cfg(),)
   if elevation_map:
@@ -478,9 +484,18 @@ def hold_twist_command(
   ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
 ) -> None:
   """Sample one twist per env at reset from ((vx lo, hi), (vy lo, hi),
-  (wz lo, hi)) and hold it until the next reset, mutating ``cfg``."""
+  (wz lo, hi)) and hold it until the next reset, mutating ``cfg``.
+
+  A subclass of ``UniformVelocityCommandCfg`` (e.g. HIMLoco's sampler, which
+  rewrites and zeroes commands) is replaced by the plain uniform command
+  with the same settings, so the held twist is exactly what was sampled."""
   twist = cfg.commands["twist"]
   assert isinstance(twist, UniformVelocityCommandCfg)
+  if type(twist) is not UniformVelocityCommandCfg:
+    twist = UniformVelocityCommandCfg(
+      **{f.name: getattr(twist, f.name) for f in fields(UniformVelocityCommandCfg)}
+    )
+    cfg.commands["twist"] = twist
   rx, ry, rz = ranges
   twist.heading_command = False
   twist.rel_standing_envs = 0.0
