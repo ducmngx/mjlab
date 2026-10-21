@@ -11,8 +11,12 @@ control step ``s`` with ``r`` control steps per bin, bin ``k`` covers steps
 - ``dv[k]``: mean over the bin of (vx, vy, wz) minus the command the step
   was taken under, in the body frame of the moment.
 - ``pose[k]``: (x, y, yaw) at the end of the bin in the start yaw frame.
-- ``upright[k]``: no fall yet (trunk/head contact or tilt over
-  ``fall_tilt_deg``) at the end of the bin.
+- ``cmd_path[k]``: the same for the commanded twist integrated from the
+  start pose, so ``pose - cmd_path`` is the drift from the plan.
+- ``upright[k]``: no fall yet (``fallen``: tilt over ``fall_tilt_deg`` or
+  the trunk under ``fall_height_m`` above the ground) at the end of the bin.
+- ``collision[k]``: the trunk or head touched terrain or an obstacle in the
+  bin (walls on the course, a step edge) whether or not the robot fell.
 - contacts: non-foot contacts in the bin on the start map grid, as CSR rows
   (``contact_ptr`` per sample into ``contact_bin/ix/iy/part``); contacts
   off the map set ``contact_offmap[k]``.
@@ -22,10 +26,13 @@ head LiDAR could see of it (``known_single`` from this pose,
 ``known_fused`` from it and the poses ``fuse_back_s`` before; see
 ``failbench/sensing.py``), ``state`` (33: HIM's velocity estimate, angular
 velocity, projected gravity, joint positions and velocities), the true
-velocity, the HIM latent, and the encoded fault (72).
+velocity, the HIM latent, ``history`` (the last ``history_s`` at
+``target_hz``, oldest first, ending at the start: ``state`` plus the
+command, 36 per step), and the encoded fault (24). ``plan_hold``: the
+post-fault plan holds the fault-time command.
 
 ``split``: 0 train, 1 val, 2 test_terrain (unseen terrain seeds), 3
-test_fault (severe faults on ``held_out_joints``, never trained on).
+test_fault (the ``held_out`` joint and family pairs, never trained on).
 
 Each shard is a directory of ``.npy`` files (memory-mappable) plus
 ``meta.json``.
@@ -43,12 +50,26 @@ import torch
 import tyro
 from heat_bench.envs_mjlab.fault_impact import heading, to_yaw_frame
 
-from failbench.faults import FaultFamily, encode_fault
+from failbench.faults import FaultFamily, encode_fault, faulted_joint
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
 from mjlab.utils.lab_api.math import wrap_to_pi
 
 SPLITS = ("train", "val", "test_terrain", "test_fault")
-TERRAINS = ("rough", "stairs", "stairs_up", "course")
+TERRAINS = ("rough", "stairs", "stairs_up", "course", "stairs_tall", "stairs_up_tall")
+FALL_TILT_DEG = 60.0
+FALL_HEIGHT_M = 0.15
+"""Trunk height above the ground (nominal 0.30) below which it is down."""
+
+
+def fallen(
+  tilt: torch.Tensor,
+  base_height: torch.Tensor,
+  tilt_deg: float = FALL_TILT_DEG,
+  height_m: float = FALL_HEIGHT_M,
+) -> torch.Tensor:
+  """The robot is down: tipped over, or its trunk on (or near) the ground.
+  Trunk contact alone isn't a fall: on the course it is often a wall."""
+  return (tilt > math.radians(tilt_deg)) | (base_height < height_m)
 
 
 @dataclass(frozen=True)
@@ -58,9 +79,12 @@ class BuildConfig:
   output_dir: str
   horizon_s: float = 5.0
   target_hz: float = 10.0
-  fall_tilt_deg: float = 60.0
+  fall_tilt_deg: float = FALL_TILT_DEG
+  fall_height_m: float = FALL_HEIGHT_M
   fuse_back_s: tuple[float, ...] = (0.5, 1.0, 1.5)
-  held_out_joints: tuple[str, ...] = ("RL_calf_joint",)
+  history_s: float = 2.0
+  held_out: tuple[str, ...] = ("RL_calf_joint:LOCK",)
+  """``joint:FAMILY`` pairs held out as test_fault."""
   val_seed_mod: int = 1
   test_seed_mod: int = 0
   """Terrain seeds with ``seed % 10`` equal to these go to val / test_terrain."""
@@ -79,11 +103,11 @@ def _split(
   elif seed >= 0 and seed % 10 == cfg.val_seed_mod:
     base = 1
   split = np.full(len(family), base, dtype=np.uint8)
-  held = [list(joints).index(j) for j in cfg.held_out_joints]
-  healthy = np.array([1, 1, 1, 1, 1, math.pi], dtype=np.float32)
-  touched = ~np.isclose(params, healthy).all(-1)  # [N, J]
-  ood = (family == FaultFamily.SEVERE) & touched[:, held].any(-1)
-  split[ood] = 3
+  joint = faulted_joint(torch.as_tensor(params)).numpy()
+  for pair in cfg.held_out:
+    name, fam = pair.split(":")
+    ood = (family == FaultFamily[fam]) & (joint == list(joints).index(name))
+    split[ood] = 3
   return split
 
 
@@ -99,6 +123,12 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
   res = float(raw["map_resolution"])
   cells = raw["map"].shape[-1]
   back = [round(b / step_dt) for b in cfg.fuse_back_s]
+  num_hist = round(cfg.history_s * cfg.target_hz)
+  if (num_hist - 1) * r > pre:
+    raise ValueError(
+      f"{path} logs {pre * step_dt} s before the fault, less than "
+      f"the {cfg.history_s} s history."
+    )
 
   def dense(name: str) -> torch.Tensor:
     return torch.as_tensor(raw[f"dense_{name}"][idx], device=device)
@@ -106,6 +136,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
   pos, quat = dense("base_pos_w"), dense("base_quat_w")
   cmd, lin, ang = dense("cmd"), dense("lin_vel_b"), dense("ang_vel_b")
   tilt, trunk = dense("tilt"), dense("trunk_contact")
+  base_height = dense("base_height")
   state_all = torch.cat(
     [
       dense("him_vel_est"),
@@ -119,7 +150,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
   latent = dense("him_latent")
   valid_t = dense("valid")
   n, num_t = valid_t.shape
-  fallen_t = trunk | (tilt > math.radians(cfg.fall_tilt_deg))
+  fallen_t = fallen(tilt, base_height, cfg.fall_tilt_deg, cfg.fall_height_m)
   t_ar = torch.arange(num_t, device=device)
   post = t_ar[None, :] >= pre
   fall_step = torch.where(fallen_t & post, t_ar, num_t).min(dim=1).values  # [n]
@@ -168,7 +199,12 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     p = to_yaw_frame(pos[:, ends], o_pos, o_quat)
     yaw = wrap_to_pi(heading(quat[:, ends]) - o_yaw[:, None])
     put("pose", torch.cat([p[..., :2], yaw[..., None]], dim=-1))
+    put("cmd_path", _integrate(cmd[:, s : s + r * nb], step_dt)[:, r - 1 :: r])
+    hist = s - r * torch.arange(num_hist - 1, -1, -1, device=device)
+    put("history", torch.cat([state_all[:, hist], cmd[:, hist]], dim=-1))
     put("tilt", tilt[:, ends])
+    put("base_height", base_height[:, ends])
+    put("collision", trunk[:, steps].any(dim=-1))
     put("upright", ends[None, :] < fall_step[:, None])
     put("valid", valid_t[:, ends])
     put("fallen_at_start", fall_step <= s)
@@ -217,7 +253,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     put("fault_family", family.astype(np.uint8))
     put("split", split)
     put("trial", idx.astype(np.int32))
-    put("cmd_style", raw["cmd_style"][idx].astype(np.uint8))
+    put("plan_hold", raw["plan_hold"][idx])
     put("tile", raw["tile_fault"][idx].astype(np.int16))
 
   # CSR contacts over samples ordered (snapshot, trial).
@@ -255,10 +291,24 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     "fault_param_names": raw["fault_param_names"].tolist(),
     "splits": list(SPLITS),
     "fall_tilt_deg": cfg.fall_tilt_deg,
+    "fall_height_m": cfg.fall_height_m,
     "fuse_back_s": list(cfg.fuse_back_s),
   }
   (shard / "meta.json").write_text(json.dumps(meta, indent=2))
   return shard
+
+
+def _integrate(cmd: torch.Tensor, dt: float) -> torch.Tensor:
+  """(x, y, yaw) after each step ``[n, T, 3]`` of body-frame twists ``cmd
+  [n, T, 3]`` held ``dt`` each, from the origin facing +x."""
+  yaw = torch.cumsum(cmd[..., 2] * dt, dim=1)
+  yaw0 = yaw - cmd[..., 2] * dt
+  c, s = torch.cos(yaw0), torch.sin(yaw0)
+  dx = (c * cmd[..., 0] - s * cmd[..., 1]) * dt
+  dy = (s * cmd[..., 0] + c * cmd[..., 1]) * dt
+  return torch.stack(
+    [torch.cumsum(dx, 1), torch.cumsum(dy, 1), wrap_to_pi(yaw)], dim=-1
+  )
 
 
 def _yaw_rotate_quat(quat: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:

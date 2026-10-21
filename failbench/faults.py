@@ -1,25 +1,23 @@
-"""Kinodynamic joint faults: a per-joint parameter vector and the model writes.
+"""Single-joint actuator faults: a per-joint parameter vector and the model
+writes.
 
-Every joint carries six parameters (``FAULT_PARAMS``), relative to nominal:
+Every joint carries two parameters (``FAULT_PARAMS``):
 
-- ``torque``: scale on the motor's force range (0 = limp, as FREE).
-- ``damping``: scale on ``dof_damping`` (gearbox drag; nominal 0.1 on Go2).
-- ``friction``: scale on ``dof_frictionloss`` (nominal 0.2 N m on Go2).
-- ``kp`` / ``kd``: scale on the position actuator's PD gains (driver fault).
-- ``range``: half-width (rad) of the joint range around its fault-time
-  angle, clipped to the nominal range. 0 = LOCK (jammed); ``RANGE_FREE``
-  or more leaves the range alone.
+- ``torque``: scale on the motor's force range (0 = limp, as heat_bench's
+  FREE; between, a motor or driver losing power).
+- ``lock``: 1 = the joint jams at its fault-time angle (heat_bench's LOCK,
+  a seized gearbox), 0 = free to move.
 
 ``sample_fault_params`` draws a vector per env from a mixture of families
-(``FaultFamily``); ``inject_kinodynamic_fault`` writes it at a sampled
-fault time and restores the nominal model at reset. Like
-``inject_joint_fault`` (heat_bench), whose LOCK/FREE/LIMIT modes are
-special cases here, the run continues without a reset after the fault.
+(``FaultFamily``), each faulting at most one joint;
+``inject_kinodynamic_fault`` writes it when the fault fires (at a sampled
+time, or on stair tiles where the robot reaches a sampled distance from the
+tile centre) and restores the nominal model at reset. Like ``inject_joint_fault`` (heat_bench), the
+run continues without a reset after the fault.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING
@@ -34,11 +32,9 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.managers.event_manager import EventTermCfg
 
-FAULT_PARAMS = ("torque", "damping", "friction", "kp", "kd", "range")
-TORQUE, DAMPING, FRICTION, KP, KD, RANGE = range(len(FAULT_PARAMS))
-RANGE_FREE = math.pi
-"""A ``range`` half-width at or above this leaves the joint range alone."""
-NOMINAL = (1.0, 1.0, 1.0, 1.0, 1.0, RANGE_FREE)
+FAULT_PARAMS = ("torque", "lock")
+TORQUE, LOCK = range(len(FAULT_PARAMS))
+NOMINAL = (1.0, 0.0)
 
 FAULT_TERM = "kinodynamic_fault"
 
@@ -46,142 +42,74 @@ FAULT_TERM = "kinodynamic_fault"
 class FaultFamily(IntEnum):
   NOMINAL = 0
   """No change: the fault time is recorded, nothing is written."""
-  SEVERE = 1
-  """One joint: locked, limp (torque 0) or a torque limit of at most 0.3."""
-  CONTINUOUS = 2
-  """One joint, each parameter perturbed with probability 0.5."""
-  MULTI_MILD = 3
-  """Two to four joints, every parameter mildly perturbed."""
+  LOCK = 1
+  """One joint jammed at its fault-time angle."""
+  WEAK = 2
+  """One joint's torque limit scaled into ``weak_torque`` (or to 0, limp)."""
 
 
 @dataclass(frozen=True)
 class FaultMixture:
   """Family probabilities and parameter ranges for ``sample_fault_params``."""
 
-  probs: tuple[float, float, float, float] = (0.15, 0.35, 0.30, 0.20)
+  probs: tuple[float, float, float] = (0.15, 0.40, 0.45)
   """Probability of each ``FaultFamily``, in enum order."""
-  severe_torque_max: float = 0.3
-  torque: tuple[float, float] = (0.2, 1.0)
-  damping: tuple[float, float] = (1.0, 30.0)
-  """Log-uniform."""
-  friction: tuple[float, float] = (1.0, 30.0)
-  """Log-uniform."""
-  gain: tuple[float, float] = (0.2, 1.2)
-  """Kp and Kd scale."""
-  range_prob: float = 0.25
-  """CONTINUOUS: probability the joint range also narrows."""
-  range_half_width: tuple[float, float] = (0.05, 0.5)
-  mild_joints: tuple[int, int] = (2, 4)
-  mild_torque: tuple[float, float] = (0.5, 1.0)
-  mild_damping: tuple[float, float] = (1.0, 10.0)
-  mild_friction: tuple[float, float] = (1.0, 10.0)
-  mild_gain: tuple[float, float] = (0.6, 1.1)
+  weak_torque: tuple[float, float] = (0.0, 0.5)
+  """Uniform torque scale for WEAK."""
+  limp_prob: float = 0.25
+  """WEAK: probability the torque is exactly 0 (fully limp)."""
 
 
 def _uniform(shape, lo: float, hi: float, device) -> torch.Tensor:
   return lo + (hi - lo) * torch.rand(shape, device=device)
 
 
-def _log_uniform(shape, lo: float, hi: float, device) -> torch.Tensor:
-  return torch.exp(_uniform(shape, math.log(lo), math.log(hi), device))
-
-
 def sample_fault_params(
   n: int, num_joints: int, mix: FaultMixture, device: torch.device | str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  """Fault parameters ``[n, num_joints, 6]`` and family ``[n]`` per env."""
+  """Fault parameters ``[n, num_joints, 2]`` and family ``[n]`` per env."""
   params = torch.tensor(NOMINAL, device=device).repeat(n, num_joints, 1)
   probs = torch.tensor(mix.probs, device=device)
   family = torch.multinomial(probs / probs.sum(), n, replacement=True)
-  rows = torch.arange(n, device=device)
-  # One random joint per env (SEVERE, CONTINUOUS), or a random subset (MILD).
-  order = torch.rand(n, num_joints, device=device).argsort(dim=-1)
-  joint = order[:, 0]
+  joint = torch.randint(num_joints, (n,), device=device)
 
-  sev = rows[family == FaultFamily.SEVERE]
-  if sev.numel():
-    kind = torch.randint(3, (sev.numel(),), device=device)  # lock, limp, weak
-    j = joint[sev]
-    params[sev[kind == 0], j[kind == 0], RANGE] = 0.0
-    params[sev[kind == 1], j[kind == 1], TORQUE] = 0.0
-    weak = kind == 2
-    params[sev[weak], j[weak], TORQUE] = _uniform(
-      int(weak.sum()), 0.0, mix.severe_torque_max, device
-    )
+  lock = (family == FaultFamily.LOCK).nonzero().squeeze(-1)
+  params[lock, joint[lock], LOCK] = 1.0
 
-  con = rows[family == FaultFamily.CONTINUOUS]
-  if con.numel():
-    j, m = joint[con], con.numel()
-    draws = (
-      (TORQUE, _uniform(m, *mix.torque, device)),
-      (DAMPING, _log_uniform(m, *mix.damping, device)),
-      (FRICTION, _log_uniform(m, *mix.friction, device)),
-      (KP, _uniform(m, *mix.gain, device)),
-      (KD, _uniform(m, *mix.gain, device)),
-    )
-    hit = torch.rand(m, len(draws), device=device) < 0.5
-    # At least one parameter changes, so the family never collapses to NOMINAL.
-    none = ~hit.any(dim=-1)
-    hit[none, torch.randint(len(draws), (int(none.sum()),), device=device)] = True
-    for col, (p, value) in enumerate(draws):
-      params[con, j, p] = torch.where(hit[:, col], value, params[con, j, p])
-    narrow = torch.rand(m, device=device) < mix.range_prob
-    params[con[narrow], j[narrow], RANGE] = _uniform(
-      int(narrow.sum()), *mix.range_half_width, device
-    )
-
-  mild = rows[family == FaultFamily.MULTI_MILD]
-  if mild.numel():
-    lo, hi = mix.mild_joints
-    k = torch.randint(lo, hi + 1, (mild.numel(),), device=device)
-    rank = torch.empty_like(order[mild])
-    rank.scatter_(
-      1, order[mild], torch.arange(num_joints, device=device).expand_as(rank)
-    )
-    chosen = rank < k[:, None]
-    shape = (mild.numel(), num_joints)
-    draws = (
-      (TORQUE, _uniform(shape, *mix.mild_torque, device)),
-      (DAMPING, _log_uniform(shape, *mix.mild_damping, device)),
-      (FRICTION, _log_uniform(shape, *mix.mild_friction, device)),
-      (KP, _uniform(shape, *mix.mild_gain, device)),
-      (KD, _uniform(shape, *mix.mild_gain, device)),
-    )
-    for p, value in draws:
-      params[mild, :, p] = torch.where(chosen, value, params[mild, :, p])
+  weak = (family == FaultFamily.WEAK).nonzero().squeeze(-1)
+  m = weak.numel()
+  torque = _uniform(m, *mix.weak_torque, device)
+  limp = torch.rand(m, device=device) < mix.limp_prob
+  params[weak, joint[weak], TORQUE] = torch.where(limp, 0.0, torque)
   return params, family
 
 
+def faulted_joint(params: torch.Tensor) -> torch.Tensor:
+  """Index of the faulted joint per env (``[..., J, 2]`` -> ``[...]``), or
+  -1 for a healthy robot."""
+  touched = (params[..., TORQUE] < 1.0) | (params[..., LOCK] > 0.5)
+  return torch.where(touched.any(-1), touched.float().argmax(-1), -1)
+
+
 def encode_fault(params: torch.Tensor) -> torch.Tensor:
-  """Network encoding of ``[..., J, 6]`` parameters, flattened to
-  ``[..., J * 6]``: torque, Kp, Kd as is; damping and friction as
-  ``log(scale) / log(30)``; range as ``min(half_width, pi) / pi``. A
-  healthy joint is (1, 0, 0, 1, 1, 1)."""
-  out = params.clone()
-  log30 = math.log(30.0)
-  out[..., DAMPING] = params[..., DAMPING].clamp(min=1e-6).log() / log30
-  out[..., FRICTION] = params[..., FRICTION].clamp(min=1e-6).log() / log30
-  out[..., RANGE] = params[..., RANGE].clamp(max=RANGE_FREE) / RANGE_FREE
-  return out.flatten(-2)
+  """Network encoding of ``[..., J, 2]`` parameters: the parameters as is,
+  flattened to ``[..., J * 2]``. A healthy joint is (1, 0)."""
+  return params.flatten(-2)
 
 
 class inject_kinodynamic_fault:
-  """Write each env's sampled fault parameters at its fault time.
+  """Write each env's sampled fault parameters when its fault fires.
 
   ``mode="step"`` event. At every reset each env draws a parameter vector
   (``sample_fault_params``) and a fault time uniformly in ``fault_time_s``,
-  and the model is restored to nominal. Not for envs with heat_bench's
+  and the model is restored to nominal. With ``fire_radius`` the fault
+  instead fires once the trunk is a sampled distance in ``fire_radius``
+  (Chebyshev, m) from its terrain origin, the centre of a stair pyramid, and
+  at least ``min_time_s`` in; ``fault_time_s`` is then the timeout. Not for envs with heat_bench's
   ``actuator_health`` term, which rewrites the force range every step.
   """
 
-  model_fields = (
-    "jnt_range",
-    "actuator_forcerange",
-    "actuator_gainprm",
-    "actuator_biasprm",
-    "dof_damping",
-    "dof_frictionloss",
-  )
+  model_fields = ("jnt_range", "actuator_forcerange")
   recompute = RecomputeLevel.none
 
   def __init__(self, cfg: "EventTermCfg", env: "ManagerBasedRlEnv"):
@@ -191,12 +119,16 @@ class inject_kinodynamic_fault:
     self._asset = env.scene[asset_cfg.name]
     self.mixture: FaultMixture = params.get("mixture", FaultMixture())
     self._time_range: tuple[float, float] = tuple(params["fault_time_s"])
+    radius = params.get("fire_radius")
+    self._radius_range: tuple[float, float] | None = (
+      None if radius is None else tuple(radius)
+    )
+    self._min_time_s: float = params.get("min_time_s", 0.0)
 
     self.joint_names: list[str] = list(self._asset.joint_names)
     num_j = len(self.joint_names)
     idx = self._asset.indexing
     self._jnt = idx.joint_ids.to(env.device)
-    self._dof = idx.joint_v_adr.to(env.device)
     self._ctrl = ctrl_ids_for_joints(
       self._asset, list(range(num_j)), self.joint_names
     ).to(env.device)
@@ -206,6 +138,8 @@ class inject_kinodynamic_fault:
     """Fault parameters per env and joint (``FAULT_PARAMS`` order)."""
     self.family = torch.zeros(n, dtype=torch.long, device=env.device)
     self.fault_time_s = torch.zeros(n, device=env.device)
+    """Fault time, or the timeout with ``fire_radius``."""
+    self.fire_radius = torch.full((n,), float("inf"), device=env.device)
     self.faulted = torch.zeros(n, dtype=torch.bool, device=env.device)
     self.fault_step = torch.full((n,), -1, dtype=torch.long, device=env.device)
     """``episode_length_buf`` value when the fault fired; -1 before."""
@@ -225,6 +159,10 @@ class inject_kinodynamic_fault:
     self.family[rows] = fam
     lo, hi = self._time_range
     self.fault_time_s[rows] = _uniform(rows.numel(), lo, hi, self._env.device)
+    if self._radius_range is not None:
+      self.fire_radius[rows] = _uniform(
+        rows.numel(), *self._radius_range, self._env.device
+      )
     self.faulted[rows] = False
     self.fault_step[rows] = -1
 
@@ -238,10 +176,6 @@ class inject_kinodynamic_fault:
     m.actuator_forcerange[r, self._ctrl] = self._default(
       "actuator_forcerange", self._ctrl
     )
-    m.actuator_gainprm[r, self._ctrl] = self._default("actuator_gainprm", self._ctrl)
-    m.actuator_biasprm[r, self._ctrl] = self._default("actuator_biasprm", self._ctrl)
-    m.dof_damping[r, self._dof] = self._default("dof_damping", self._dof)
-    m.dof_frictionloss[r, self._dof] = self._default("dof_frictionloss", self._dof)
 
   def __call__(
     self,
@@ -249,11 +183,18 @@ class inject_kinodynamic_fault:
     env_ids: torch.Tensor | None,
     fault_time_s: tuple[float, float],
     mixture: FaultMixture | None = None,
+    fire_radius: tuple[float, float] | None = None,
+    min_time_s: float = 0.0,
     asset_cfg: SceneEntityCfg | None = None,
   ) -> None:
-    del env_ids, fault_time_s, mixture, asset_cfg
+    del env_ids, fault_time_s, mixture, fire_radius, min_time_s, asset_cfg
     t = env.episode_length_buf.float() * env.step_dt
-    fire = ~self.faulted & (t >= self.fault_time_s)
+    due = t >= self.fault_time_s
+    if self._radius_range is not None:
+      rel = self._asset.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+      out = rel.abs().max(dim=-1).values >= self.fire_radius
+      due |= out & (t >= self._min_time_s)
+    fire = ~self.faulted & due
     if fire.any():
       self._fire(fire.nonzero().squeeze(-1))
 
@@ -269,25 +210,7 @@ class inject_kinodynamic_fault:
     self.fault_base_quat_w[rows] = data.root_link_quat_w[rows]
 
     nominal = self._default("jnt_range", self._jnt).expand(len(rows), -1, -1)
-    half = p[..., RANGE]
-    narrowed = torch.stack(
-      [
-        torch.maximum(q - half, nominal[..., 0]),
-        torch.minimum(q + half, nominal[..., 1]),
-      ],
-      dim=-1,
-    )
-    keep = (half >= RANGE_FREE)[..., None]
-    m.jnt_range[r, self._jnt] = torch.where(keep, nominal, narrowed)
-
+    locked = (p[..., LOCK] > 0.5)[..., None]
+    m.jnt_range[r, self._jnt] = torch.where(locked, q[..., None], nominal)
     force = self._default("actuator_forcerange", self._ctrl)
     m.actuator_forcerange[r, self._ctrl] = force * p[..., TORQUE, None]
-    gain = self._default("actuator_gainprm", self._ctrl)[:, 0]
-    bias = self._default("actuator_biasprm", self._ctrl)
-    m.actuator_gainprm[r, self._ctrl, 0] = gain * p[..., KP]
-    m.actuator_biasprm[r, self._ctrl, 1] = bias[:, 1] * p[..., KP]
-    m.actuator_biasprm[r, self._ctrl, 2] = bias[:, 2] * p[..., KD]
-    damping = self._default("dof_damping", self._dof)
-    m.dof_damping[r, self._dof] = damping * p[..., DAMPING]
-    friction = self._default("dof_frictionloss", self._dof)
-    m.dof_frictionloss[r, self._dof] = friction * p[..., FRICTION]

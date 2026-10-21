@@ -3,11 +3,11 @@
 # one terrain seed per array task. Submit from the repo root after
 # `bash go2_him/cluster/setup.sh` (same virtualenv):
 #
-#   sbatch --array=0-39 failbench/cluster/generate.sbatch
+#   sbatch --array=0-59 failbench/cluster/generate.sbatch
 #   sbatch --array=0 --export=ALL,ROUNDS=1 failbench/cluster/generate.sbatch  # smoke
 #
-# Task i uses terrain seed i and terrain preset TERRAINS[(i / 10) % 4]
-# (rough, stairs, stairs_up, course), so every block of ten seeds has one
+# Task i uses terrain seed i and terrain preset TERRAINS[(i / 10) % 6]
+# (rough, stairs, stairs_up, course, stairs_tall, stairs_up_tall), so every block of ten seeds has one
 # test-terrain seed (i % 10 == 0) and one val seed (i % 10 == 1) per preset.
 #
 # Settings (environment variables, with defaults):
@@ -47,8 +47,8 @@ CHECKPOINT="${CHECKPOINT:-$LOG_ROOT/go2_him/2026-10-17_20-44-47_Go2-HIM-Rough-Or
 NUM_ENVS="${NUM_ENVS:-4096}"
 ROUNDS="${ROUNDS:-4}"
 SEED="${SEED:-${SLURM_ARRAY_TASK_ID:-0}}"
-TERRAINS=(rough stairs stairs_up course)
-TERRAIN="${TERRAIN:-${TERRAINS[$(( (SEED / 10) % 4 ))]}}"
+TERRAINS=(rough stairs stairs_up course stairs_tall stairs_up_tall)
+TERRAIN="${TERRAIN:-${TERRAINS[$(( (SEED / 10) % 6 ))]}}"
 
 echo "[failbench] $(date) host=$(hostname) job=${SLURM_JOB_ID:-local} commit=$(git rev-parse --short HEAD)"
 echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS -> $FAILBENCH_ROOT"

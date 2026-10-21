@@ -15,10 +15,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import tyro
 
 from failbench.data.dataset import FailBenchDataset, MapMode
-from failbench.faults import FaultFamily
+from failbench.faults import TORQUE, FaultFamily, faulted_joint
 
 
 @dataclass(frozen=True)
@@ -96,22 +97,24 @@ def main():
       ax[3].plot(t, dv[:, k], label=name)
     up = item["upright"].numpy()
     ax[3].plot(t, up.astype(float), "k--", label="upright")
+    hit = item["collision"].numpy()
+    ax[3].plot(t[hit], np.full(hit.sum(), 0.9), "rx", ms=4, label="collision")
     cmd = item["cmd_seq"].numpy()
     ax[3].step(t, cmd[:, 0], "C0:", where="pre", label="cmd vx")
     ax[3].legend(fontsize=8)
     ax[3].set_xlabel("time after start (s)")
     fam = FaultFamily(int(item["fault_family"])).name
     params = ds.shards[s]["fault_params"][row]
-    healthy = np.array([1, 1, 1, 1, 1, np.pi], dtype=np.float32)
-    bad = np.flatnonzero(~np.isclose(params, healthy).all(-1))
-    joints = [meta["joint_names"][j] for j in bad]
+    joint = int(faulted_joint(torch.as_tensor(params)))
+    meta_s = ds.metas[s]
+    what = fam
+    if joint >= 0:
+      torque = params[joint, TORQUE]
+      what += f" {meta_s['joint_names'][joint]}"
+      what += "" if fam == "LOCK" else f" torque {torque:.2f}"
     fig.suptitle(
-      f"{meta['terrain']} seed {meta['terrain_seed']}, +{float(item['offset_s']):.1f} s"
-      f" after fault, {fam}: "
-      + ", ".join(
-        f"{j} {np.round(params[k], 2).tolist()}"
-        for j, k in zip(joints, bad, strict=True)
-      )[:200]
+      f"{meta_s['terrain']} seed {meta_s['terrain_seed']},"
+      f" +{float(item['offset_s']):.1f} s after fault, {what}"
     )
     fig.tight_layout()
     path = out / f"sample_{n:03d}.png"

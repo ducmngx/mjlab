@@ -1,8 +1,8 @@
 """Normalisation statistics over the train split of built FailBench shards.
 
 Writes ``<root>/stats.json``: per-channel mean and std of the vector inputs
-and targets (``dv`` and ``pose`` only over upright, valid bins) and of the
-clean map heights, plus split, family and fall counts.
+and targets (``dv``, ``pose`` and ``cmd_path`` only over upright, valid
+bins) and of the clean map heights, plus split, family and fall counts.
 """
 
 from __future__ import annotations
@@ -17,7 +17,16 @@ import tyro
 from failbench.data.build import SPLITS
 from failbench.faults import FaultFamily
 
-_VECTORS = ("state", "state_true_vel", "him_latent", "cmd_seq", "dv", "pose")
+_VECTORS = (
+  "state",
+  "state_true_vel",
+  "him_latent",
+  "history",
+  "cmd_seq",
+  "dv",
+  "pose",
+  "cmd_path",
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +74,7 @@ def main():
     total += int(train.sum())
     for k in _VECTORS:
       x = np.load(d / f"{k}.npy", mmap_mode="r")[train]
-      moments[k].add(x[up] if k in ("dv", "pose") else x)
+      moments[k].add(x[up] if k in ("dv", "pose", "cmd_path") else x)
     m = np.load(d / "map_clean.npy", mmap_mode="r")[train].astype(np.float32)
     moments["map"].add(m[~np.isnan(m)][:, None])
   out: dict[str, object] = {k: v.result() for k, v in moments.items()}

@@ -5,12 +5,12 @@ Shards are memory-mapped. Each item is a dict of tensors:
 - ``map`` ``[2, H, W]``: LiDAR-realistic height (0 where unknown) and the
   known mask (``map_mode``: ``fused`` / ``single`` visibility with
   ``corrupt_map`` noise, or ``clean``: every cell, no noise);
-- ``state`` (33), ``state_true_vel`` (3), ``him_latent`` (16), ``cmd_seq``
-  ``[T, 3]``, ``fault`` (72);
-- targets ``dv`` / ``pose`` ``[T, 3]``, ``upright`` / ``valid`` /
-  ``contact_offmap`` ``[T]``, and ``contact`` ``[T, H, W]`` rasterised from
+- ``state`` (33), ``state_true_vel`` (3), ``him_latent`` (16), ``history``
+  ``[20, 36]``, ``cmd_seq`` ``[T, 3]``, ``fault`` (24);
+- targets ``dv`` / ``pose`` / ``cmd_path`` ``[T, 3]``, ``upright`` / ``collision`` /
+  ``valid`` / ``contact_offmap`` ``[T]``, and ``contact`` ``[T, H, W]`` rasterised from
   the CSR rows;
-- labels ``fault_family``, ``terrain_id``, ``offset_s``.
+- labels ``fault_family``, ``plan_hold``, ``terrain_id``, ``offset_s``.
 """
 
 from __future__ import annotations
@@ -32,14 +32,18 @@ _PER_SAMPLE = (
   "state",
   "state_true_vel",
   "him_latent",
+  "history",
   "cmd_seq",
   "fault",
   "dv",
   "pose",
+  "cmd_path",
   "upright",
+  "collision",
   "valid",
   "contact_offmap",
   "fault_family",
+  "plan_hold",
   "offset_s",
 )
 
