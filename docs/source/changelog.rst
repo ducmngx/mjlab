@@ -39,6 +39,15 @@ Added
   ``go2_him/scripts``; ``go2_him/cluster`` has a uv setup script and a
   SLURM job script.
 
+- ``failbench``, a failure-impact data pipeline on the frozen Go2 HIMLoco
+  policy: a 72-d kinodynamic joint fault (torque limit, damping, friction,
+  PD gains, range) sampled from a family mixture, post-fault command knots,
+  raw trial shards, and sample shards with 5 s velocity-deviation, path,
+  fall and per-0.1 s contact targets on a 64x64 elevation map, plus
+  head-LiDAR visibility masks (terrain occlusion, field of view,
+  self-occlusion, fused over recent poses) and map noise for sensor
+  realism. ``failbench/cluster`` has a SLURM array job.
+
 Changed
 ^^^^^^^
 

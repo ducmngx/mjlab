@@ -133,7 +133,7 @@ torch = [
 ]
 
 [tool.ruff]
-src = ["src", "heat_bench", "go2_him"]  # Helpful for recognizing first-party imports.
+src = ["src", "heat_bench", "go2_him", "failbench"]  # Helpful for recognizing first-party imports.
 indent-width = 2
 exclude = [
   "src/mjlab/utils/lab_api",
@@ -155,7 +155,7 @@ stubPath = "typings"
 extra-paths = ["typings"]
 
 [tool.ty.src]
-include = ["src", "tests", "heat_bench", "go2_him"]
+include = ["src", "tests", "heat_bench", "go2_him", "failbench"]
 exclude = ["src/mjlab/utils/lab_api", "typings"]
 
 [tool.pytest.ini_options]
