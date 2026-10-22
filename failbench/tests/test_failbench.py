@@ -21,6 +21,8 @@ from failbench.faults import (
   faulted_joint,
   sample_fault_params,
 )
+from failbench.model.losses import LossWeights, hazard_nll, impact_loss
+from failbench.model.model import ImpactModel, ImpactModelCfg
 from failbench.plans import PlanCfg, SegmentPlan
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
 
@@ -108,6 +110,71 @@ def test_lane_plans_return_to_the_centre_line():
   for _ in range(250):
     plan.step(ids, 0.02)
   assert plan.pose[:, 1].abs().median() < 0.15
+
+
+def _fake_batch(b: int = 3) -> dict[str, torch.Tensor]:
+  t, cells = 50, 64
+  upright = torch.ones(b, t, dtype=torch.bool)
+  upright[0, 20:] = False  # Sample 0 falls in step 20.
+  return {
+    "map": torch.stack(
+      [torch.full((b, cells, cells), -0.3), torch.ones(b, cells, cells)], dim=1
+    ),
+    "state": torch.randn(b, 33),
+    "him_latent": torch.randn(b, 16),
+    "history": torch.randn(b, 20, 36),
+    "fault": torch.tensor(NOMINAL).repeat(b, 12),
+    "cmd_seq": torch.rand(b, t, 3),
+    "cmd_path": torch.cumsum(torch.rand(b, t, 3) * 0.1, dim=1),
+    "pose": torch.cumsum(torch.rand(b, t, 3) * 0.1, dim=1),
+    "dv": torch.randn(b, t, 3) * 0.1,
+    "upright": upright,
+    "valid": torch.ones(b, t, dtype=torch.bool),
+    "collision": torch.zeros(b, t, dtype=torch.bool),
+    "contact_offmap": torch.zeros(b, t, dtype=torch.bool),
+    "contact": torch.rand(b, t, cells, cells) > 0.999,
+  }
+
+
+def _unit_stats() -> dict:
+  dims = {
+    "state": 33,
+    "him_latent": 16,
+    "history": 36,
+    "cmd_seq": 3,
+    "cmd_path": 3,
+    "map": 1,
+  }
+  return {k: {"mean": [0.0] * n, "std": [1.0] * n} for k, n in dims.items()}
+
+
+def test_impact_model_shapes_and_plan_batching():
+  torch.manual_seed(0)
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  model = ImpactModel(cfg, _unit_stats()).eval()
+  batch = _fake_batch()
+  pred = model(batch)
+  assert pred["drift"].shape == (3, 50, 3)
+  assert pred["contact_logit"].shape == (3, 5, 64, 64)
+  # P(fallen by t) never decreases.
+  assert (pred["p_fallen"].diff(dim=1) >= -1e-6).all()
+  total, terms = impact_loss(pred, batch, LossWeights(), cfg.steps_per_map)
+  assert torch.isfinite(total) and set(terms) >= {"drift", "fall", "contact"}
+  # One context scores many plans.
+  ctx = model.encode({k: v[:1] for k, v in batch.items()})
+  many = model.decode(ctx, torch.rand(8, 50, 3), torch.rand(8, 50, 3), False)
+  assert many["drift"].shape == (8, 50, 3) and "contact_logit" not in many
+
+
+def test_hazard_nll_prefers_the_true_fall_step():
+  upright = torch.ones(1, 50, dtype=torch.bool)
+  upright[0, 20:] = False
+  valid = torch.ones(1, 50, dtype=torch.bool)
+  right = torch.full((1, 50), -6.0)
+  right[0, 20] = 6.0
+  wrong = torch.full((1, 50), -6.0)
+  wrong[0, 40] = 6.0
+  assert hazard_nll(right, upright, valid) < hazard_nll(wrong, upright, valid)
 
 
 def _visible(height: torch.Tensor, lidar: LidarCfg) -> torch.Tensor:

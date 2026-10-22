@@ -47,6 +47,10 @@ dataset.py                 torch Dataset: noisy LiDAR map, contact grids
 | `scripts/inspect_samples.py` | render samples for checking by eye |
 | `scripts/play_trial.py` | replay a logged trial as a video, with the goal, plan and drift drawn in |
 | `cluster/generate.sbatch` | Hopper array job: generate, then build |
+| `model/model.py` | `ImpactModel`: context encoder + plan decoder |
+| `model/losses.py` | losses and metrics |
+| `scripts/train.py` | training (clean map, then LiDAR map) |
+| `cluster/train.sbatch` | Hopper training job, W&B |
 
 ## Trials
 
@@ -178,6 +182,47 @@ ablation.
 > The mount pose comes from Unitree's `go2_description` URDF (`radar_joint`),
 > and the 90° half-angle field of view is an approximation of the L1's
 > 360°×90°. Check both against Unitree's datasheet before quoting them.
+
+## Model
+
+`ImpactModel` predicts how the robot moves under a 5 s plan, given what it
+knows at the start: the map, its state, HIM's latent, the last 2 s and the
+fault (the nominal vector for a healthy robot, so the same model gives MPPI
+the healthy dynamics too). Per 0.1 s step it predicts:
+- drift from the plan's commanded path (x, y, yaw), as a mean and a
+  variance;
+- the velocity deviation `dv` (auxiliary);
+- the fall hazard, so P(fallen by t) can only grow;
+- trunk/head contact and off-map contact.
+
+It also predicts one 64×64 body-contact map per second.
+
+Obstacle avoidance is not learned. A planner sweeps the robot's footprint
+along `cmd_path + drift ± kσ` over the map, which works on layouts the
+model never saw. The contact maps cover what that geometry can't: what the
+body hits while stumbling or falling.
+
+The model has two parts:
+- a **context encoder**: map CNN tokens, state, latent, history and 12
+  fault tokens with leg and joint-type embeddings, through a transformer;
+- a **plan decoder**: 50 query tokens built from each step's command and
+  commanded pose, cross-attending to the context.
+
+A planner runs the encoder once per cycle (once per fault for a safety
+filter) and the decoder once per candidate plan.
+
+Losses:
+- drift: Gaussian NLL;
+- `dv`: Huber;
+- falls: the discrete-time hazard likelihood;
+- collision and off-map: weighted BCE;
+- contact maps: focal BCE plus Dice.
+
+Training runs in two phases: the clean map first, then the LiDAR map
+starting from phase 1. Evaluation reports drift error at 1, 3 and 5 s
+against a zero-drift baseline, 2σ coverage, and fall and collision AUROC.
+Each is pooled and also split by fault family, so "nominal" gives the
+healthy-robot numbers.
 
 ## Running
 

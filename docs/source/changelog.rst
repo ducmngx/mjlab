@@ -47,6 +47,10 @@ Added
   head-LiDAR visibility masks (terrain occlusion, field of view,
   self-occlusion, fused over recent poses) and map noise for sensor
   realism. ``failbench/cluster`` has a SLURM array job.
+- ``failbench.model``, the FailBench impact model: a map, state, history and
+  fault context encoder and a per-step plan decoder predicting drift from
+  the plan (with variance), fall hazard, trunk contact and per-second
+  body-contact maps, with a two-phase training script and a Hopper job.
 
 Changed
 ^^^^^^^
