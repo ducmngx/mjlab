@@ -224,6 +224,38 @@ against a zero-drift baseline, 2σ coverage, and fall and collision AUROC.
 Each is pooled and also split by fault family, so "nominal" gives the
 healthy-robot numbers.
 
+### Drift uncertainty: limits and what to try next
+
+The drift variance is diagonal, one value per axis in the start frame, so
+it can't express correlation. Real drift is correlated:
+- a faulted robot mostly errs along its path, and after a turn "along the
+  path" is diagonal in the start frame;
+- heading error turns into sideways error (`dyaw` and `dy` share a sign);
+- a given fault pushes one way.
+
+NLL still learns the correct per-axis (marginal) spreads. So the
+footprint sweep must inflate per axis as a **box** `±kσx, ±kσy`, with yaw
+handled separately. A box always contains the true tilted kσ ellipse, so
+the planner can only be too cautious, never too bold. An axis-aligned
+ellipse would miss the tips of the real distribution in the direction of
+drift. `cover2s` is the box test; a calibrated model scores about 91% at
+2σ.
+
+The variances are also independent across steps. That is fine for a
+per-step sweep, but you can't sample coherent trajectories from them.
+
+**Trigger:** in the course evaluation, the planner rejects gaps the robot
+actually gets through, i.e. the box is too loose. Then try, in order:
+1. Predict drift in the plan's path frame (along-track and cross-track at
+   each step's commanded heading). This removes the rotation-induced
+   correlation with no change to the output head; the sweep rotates the
+   box back into the map frame.
+2. Full 3×3 covariance: a Cholesky factor (3 diagonal terms through `exp`,
+   3 off-diagonal), loss `½(rᵀΣ⁻¹r + log|Σ|)`, and the sweep uses the tilted
+   ellipse.
+3. A mixture of 2–3 Gaussians, for outcomes that split (e.g. stumbling
+   left or right after a hip lock).
+
 ## Running
 
 Locally, as a smoke test:
