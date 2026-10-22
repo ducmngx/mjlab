@@ -37,6 +37,8 @@ set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$(git rev-parse --show-toplevel)}"
 source go2_him/cluster/env.sh
+# Print step lines to the log as they happen, not when Python's buffer fills.
+export PYTHONUNBUFFERED=1
 
 FAILBENCH_ROOT="${FAILBENCH_ROOT:-/scratch/$USER/failbench}"
 SAMPLES="$FAILBENCH_ROOT/samples"
