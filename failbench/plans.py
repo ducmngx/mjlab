@@ -125,66 +125,82 @@ class SegmentPlan:
     self.line[ids] = goal
     self.lane_off[ids] = 0.0
 
-  def _new_segments(self, ids: torch.Tensor) -> None:
-    c, m, dev = self.cfg, len(ids), self.device
-    err = wrap_to_pi(self.bearing[ids] - self.pose[ids, 2])
+  def _new_segments(self, due: torch.Tensor) -> None:
+    """Start a new segment on rows ``due`` (mask); draws for every row, so
+    no row count is read back from the GPU."""
+    c, n, dev = self.cfg, self.cmd.shape[0], self.device
+    err = wrap_to_pi(self.bearing - self.pose[:, 2])
 
-    u = torch.rand(m, device=dev)
-    new_speed = c.speed[0] + (c.speed[1] - c.speed[0]) * torch.rand(m, device=dev)
-    vx = torch.where(u < c.stop_prob + c.keep_prob, self.target[ids, 0], new_speed)
+    u = torch.rand(n, device=dev)
+    new_speed = c.speed[0] + (c.speed[1] - c.speed[0]) * torch.rand(n, device=dev)
+    vx = torch.where(u < c.stop_prob + c.keep_prob, self.target[:, 0], new_speed)
     vx = torch.where(u < c.stop_prob, 0.0, vx)
-    lane = self.lane[ids]
-    noise = torch.randn(m, device=dev)
+    lane = self.lane
+    noise = torch.randn(n, device=dev)
     wz = torch.where(lane, noise * c.lane_wz_std, c.goal_gain * err + noise * c.wz_std)
-    side = torch.rand(m, device=dev) < c.vy_prob
+    side = torch.rand(n, device=dev) < c.vy_prob
     vy_std = torch.where(lane, c.lane_vy_std, c.vy_std)
-    vy = torch.where(side, torch.randn(m, device=dev) * vy_std, 0.0)
+    vy = torch.where(side, torch.randn(n, device=dev) * vy_std, 0.0)
     target = torch.stack([vx, vy, wz], dim=-1)
     lim = torch.tensor(c.limits, device=dev)
     target = torch.maximum(torch.minimum(target, lim), -lim)
     target[:, 0] = target[:, 0].clamp(min=0.0)
-    self.target[ids] = target
-    self.ramp_from[ids] = self.cmd[ids]
-    self.ramp_from[ids, 2] = torch.where(lane, self.lane_off[ids], self.cmd[ids, 2])
-    length = -c.seg_mean_s * torch.log(torch.rand(m, device=dev).clamp(min=1e-6))
-    self.seg_left[ids] += length.clamp(*c.seg_s)
-    self.seg_count[ids] += 1
+    ramp_from = self.cmd.clone()
+    ramp_from[:, 2] = torch.where(lane, self.lane_off, self.cmd[:, 2])
+    length = -c.seg_mean_s * torch.log(torch.rand(n, device=dev).clamp(min=1e-6))
+    d = due[:, None]
+    self.target = torch.where(d, target, self.target)
+    self.ramp_from = torch.where(d, ramp_from, self.ramp_from)
+    self.seg_left = torch.where(
+      due, self.seg_left + length.clamp(*c.seg_s), self.seg_left
+    )
+    self.seg_count = self.seg_count + due.long()
 
-  def step(self, ids: torch.Tensor, dt: float) -> None:
-    """Advance plans ``ids`` by ``dt``: integrate the predicted pose under
-    the current command, then move the command along the schedule."""
+  def step(self, ids: torch.Tensor | None, dt: float) -> None:
+    """Advance plans ``ids`` (all if None) by ``dt``: integrate the predicted
+    pose under the current command, then move the command along the
+    schedule."""
     c = self.cfg
-    cmd, yaw = self.cmd[ids], self.pose[ids, 2]
+    n = self.cmd.shape[0]
+    sel = torch.ones(n, dtype=torch.bool, device=self.device)
+    if ids is not None:
+      sel = torch.zeros_like(sel).index_fill_(0, ids, True)
+    cmd, yaw = self.cmd, self.pose[:, 2]
     cy, sy = torch.cos(yaw), torch.sin(yaw)
-    self.pose[ids, 0] += (cy * cmd[:, 0] - sy * cmd[:, 1]) * dt
-    self.pose[ids, 1] += (sy * cmd[:, 0] + cy * cmd[:, 1]) * dt
-    self.pose[ids, 2] = wrap_to_pi(yaw + cmd[:, 2] * dt)
+    moved = torch.stack(
+      [
+        self.pose[:, 0] + (cy * cmd[:, 0] - sy * cmd[:, 1]) * dt,
+        self.pose[:, 1] + (sy * cmd[:, 0] + cy * cmd[:, 1]) * dt,
+        wrap_to_pi(yaw + cmd[:, 2] * dt),
+      ],
+      dim=-1,
+    )
+    self.pose = torch.where(sel[:, None], moved, self.pose)
 
-    ids = ids[~self.hold[ids]]
-    if not len(ids):
-      return
-    due = ids[self.seg_left[ids] <= 0.0]
-    if len(due):
-      self._new_segments(due)
-    cmd, target = self.cmd[ids], self.target[ids]
+    run = sel & ~self.hold
+    self._new_segments(run & (self.seg_left <= 0.0))
+    cmd, target = self.cmd, self.target
     dvx = (target[:, 0] - cmd[:, 0]).clamp(-c.max_accel * dt, c.max_accel * dt)
-    rate = (target[:, 1:] - self.ramp_from[ids, 1:]).abs() / c.ramp_s * dt
+    rate = (target[:, 1:] - self.ramp_from[:, 1:]).abs() / c.ramp_s * dt
     d = target[:, 1:] - cmd[:, 1:]
-    cmd = torch.cat([cmd[:, :1] + dvx[:, None], cmd[:, 1:] + d.clamp(-rate, rate)], -1)
-    self.cmd[ids] = cmd
-    self.seg_left[ids] -= dt
+    ramped = torch.cat(
+      [cmd[:, :1] + dvx[:, None], cmd[:, 1:] + torch.clamp(d, -rate, rate)], -1
+    )
+    self.cmd = torch.where(run[:, None], ramped, cmd)
+    self.seg_left = torch.where(run, self.seg_left - dt, self.seg_left)
 
-    lane = ids[self.lane[ids]]
-    if len(lane):
-      # The wz ramp above ran on the command; for lane plans it moves the
-      # noise offset instead, and wz is the centre-line pull plus it.
-      off = self.lane_off[lane]
-      step = (self.target[lane, 2] - self.ramp_from[lane, 2]).abs() / c.ramp_s * dt
-      off = off + (self.target[lane, 2] - off).clamp(-step, step)
-      self.lane_off[lane] = off
-      b, pose = self.bearing[lane], self.pose[lane]
-      rel = pose[:, :2] - self.line[lane]
-      lateral = -torch.sin(b) * rel[:, 0] + torch.cos(b) * rel[:, 1]
-      err = wrap_to_pi(b - pose[:, 2])
-      wz = c.lane_heading_gain * err - c.lane_offset_gain * lateral + off
-      self.cmd[lane, 2] = wz.clamp(-c.limits[2], c.limits[2])
+    # Lane plans: the wz ramp above ran on the command; for them it moves the
+    # noise offset instead, and wz is the centre-line pull plus it.
+    lane = run & self.lane
+    step = (self.target[:, 2] - self.ramp_from[:, 2]).abs() / c.ramp_s * dt
+    off = self.lane_off + torch.clamp(self.target[:, 2] - self.lane_off, -step, step)
+    self.lane_off = torch.where(lane, off, self.lane_off)
+    b, pose = self.bearing, self.pose
+    rel = pose[:, :2] - self.line
+    lateral = -torch.sin(b) * rel[:, 0] + torch.cos(b) * rel[:, 1]
+    err = wrap_to_pi(b - pose[:, 2])
+    wz = c.lane_heading_gain * err - c.lane_offset_gain * lateral + self.lane_off
+    wz = wz.clamp(-c.limits[2], c.limits[2])
+    self.cmd = torch.cat(
+      [self.cmd[:, :2], torch.where(lane, wz, self.cmd[:, 2])[:, None]], -1
+    )

@@ -11,7 +11,9 @@
 # test-terrain seed (i % 10 == 0) and one val seed (i % 10 == 1) per preset.
 #
 # Settings (environment variables, with defaults):
-#   CHECKPOINT  the frozen HIM policy; default: model_7200.pt of the
+#   TASK        the policy's task: Go2-HIM-Rough-Original (default) or
+#               Go2-Plain-Rough-Original (the no-internal-model control)
+#   CHECKPOINT  the frozen policy; default: HIM's model_7200.pt of the
 #               Go2-HIM-Rough-Original run under $LOG_ROOT (see env.sh)
 #   NUM_ENVS    4096 trials per round
 #   ROUNDS      4 rounds (one raw shard each)
@@ -44,6 +46,7 @@ export MUJOCO_GL=egl
 
 FAILBENCH_ROOT="${FAILBENCH_ROOT:-/scratch/$USER/failbench}"
 CHECKPOINT="${CHECKPOINT:-$LOG_ROOT/go2_him/2026-10-17_20-44-47_Go2-HIM-Rough-Original_s42/model_7200.pt}"
+TASK="${TASK:-Go2-HIM-Rough-Original}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 ROUNDS="${ROUNDS:-4}"
 SEED="${SEED:-${SLURM_ARRAY_TASK_ID:-0}}"
@@ -56,6 +59,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 uv run python -m failbench.scripts.generate \
   --checkpoint-file "$CHECKPOINT" \
+  --task "$TASK" \
   --output-dir "$FAILBENCH_ROOT/raw" \
   --terrain "$TERRAIN" \
   --terrain-seed "$SEED" \

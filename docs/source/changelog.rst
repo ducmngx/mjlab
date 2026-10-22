@@ -51,6 +51,21 @@ Added
   fault context encoder and a per-step plan decoder predicting drift from
   the plan (with variance), fall hazard, trunk contact and per-second
   body-contact maps, with a two-phase training script and a Hopper job.
+- ``failbench.mppi``, an MPPI planner on the impact model (plan sampler,
+  geometric footprint sweep with the predicted drift spread, cost and
+  update, no simulator dependencies), ``failbench/scripts/run_mppi.py`` to
+  run it in closed loop in sim with only the robot's own sensing, and
+  ``play_mppi.py`` to replay runs as videos.
+- ``run_mppi.py`` options for analysis: ``--no-fault-aware`` (the planner
+  is never told the fault), ``--controller follower`` (the data's goal
+  follower, a no-planner baseline), ``--replan-every-s`` (commit to each
+  plan open loop for longer) and ``--explain`` (log every candidate scored
+  with and without the fault), plus a per-trial closest approach to an
+  obstacle.
+- ``Go2-Plain-Rough-Original``: the Go2 HIMLoco task without the internal
+  model (plain MLP actor, standard PPO), the control for what HIM
+  contributes. FailBench data generation accepts it (``TASK`` in
+  ``generate.sbatch``); its HIM-only inputs are zeros.
 
 Changed
 ^^^^^^^

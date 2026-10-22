@@ -1,5 +1,6 @@
 """HIMLoco runner configuration (legged_gym ``LeggedRobotCfgPPO``, runner
-``HIMOnPolicyRunner``: HIMActorCritic + HIMPPO)."""
+``HIMOnPolicyRunner``: HIMActorCritic + HIMPPO), and the same without the
+internal model (``go2_plain_runner_cfg``)."""
 
 from __future__ import annotations
 
@@ -65,4 +66,39 @@ def go2_him_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     save_interval=100,
     num_steps_per_env=100,
     max_iterations=20_000,
+  )
+
+
+def go2_plain_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """``go2_him_runner_cfg`` without the hybrid internal model: a plain MLP
+  actor on the same 6-frame observation history (no velocity or latent
+  estimator) and standard PPO, every other setting unchanged. The control
+  that separates what the internal model contributes."""
+  cfg = go2_him_runner_cfg()
+  return RslRlOnPolicyRunnerCfg(
+    actor=RslRlModelCfg(
+      hidden_dims=cfg.actor.hidden_dims,
+      activation=cfg.actor.activation,
+      obs_normalization=False,
+      distribution_cfg=cfg.actor.distribution_cfg,
+    ),
+    critic=cfg.critic,
+    algorithm=RslRlPpoAlgorithmCfg(
+      value_loss_coef=1.0,
+      use_clipped_value_loss=True,
+      clip_param=0.2,
+      entropy_coef=0.01,
+      num_learning_epochs=5,
+      num_mini_batches=4,
+      learning_rate=1.0e-3,
+      schedule="adaptive",
+      gamma=0.99,
+      lam=0.95,
+      desired_kl=0.01,
+      max_grad_norm=1.0,
+    ),
+    experiment_name="go2_plain",
+    save_interval=cfg.save_interval,
+    num_steps_per_env=cfg.num_steps_per_env,
+    max_iterations=cfg.max_iterations,
   )

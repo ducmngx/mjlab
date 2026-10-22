@@ -214,22 +214,11 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     height = maps[:, si]
     put("map_clean", height.half())
     pose_steps = [s] + [max(s - b, 0) for b in back]
-    p_pos = to_yaw_frame(pos[:, pose_steps], o_pos, o_quat)  # [n,P,3]
-    rel_quat = _yaw_rotate_quat(quat[:, pose_steps], -o_yaw)
-    s_pos, s_axis = sensor_poses(p_pos, rel_quat, cfg.lidar)
-    b_yaw = wrap_to_pi(heading(quat[:, pose_steps]) - o_yaw[:, None])
-    single, fused = [], []
-    for c0 in range(0, n, cfg.chunk):
-      sl = slice(c0, c0 + cfg.chunk)
-      sp, sa, bp, by = (x[sl] for x in (s_pos, s_axis, p_pos, b_yaw))
-      single.append(
-        visible_cells(
-          height[sl], sp[:, :1], sa[:, :1], bp[:, :1], by[:, :1], res, cfg.lidar
-        )
-      )
-      fused.append(visible_cells(height[sl], sp, sa, bp, by, res, cfg.lidar))
-    put("known_single", torch.cat(single))
-    put("known_fused", torch.cat(fused))
+    single, fused = lidar_known(
+      height, pos[:, pose_steps], quat[:, pose_steps], res, cfg.lidar, cfg.chunk
+    )
+    put("known_single", single)
+    put("known_fused", fused)
 
     # Contacts in bins (s, s + r * nb] on this map.
     in_win = (c_step > s) & (c_step <= s + r * nb)
@@ -296,6 +285,37 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
   }
   (shard / "meta.json").write_text(json.dumps(meta, indent=2))
   return shard
+
+
+def lidar_known(
+  height: torch.Tensor,
+  pos: torch.Tensor,
+  quat: torch.Tensor,
+  resolution: float,
+  lidar: LidarCfg,
+  chunk: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """What the head LiDAR saw of trunk-centred, yaw-aligned maps ``height [n,
+  H, W]``: from the current pose only and fused over all poses. ``pos [n, P,
+  3]`` / ``quat [n, P, 4]`` are base poses in any common frame, the current
+  one (the map's) first."""
+  o_pos, o_quat = pos[:, 0], quat[:, 0]
+  o_yaw = heading(o_quat)
+  p_pos = to_yaw_frame(pos, o_pos, o_quat)  # [n,P,3]
+  rel_quat = _yaw_rotate_quat(quat, -o_yaw)
+  s_pos, s_axis = sensor_poses(p_pos, rel_quat, lidar)
+  b_yaw = wrap_to_pi(heading(quat) - o_yaw[:, None])
+  single, fused = [], []
+  for c0 in range(0, height.shape[0], chunk):
+    sl = slice(c0, c0 + chunk)
+    sp, sa, bp, by = (x[sl] for x in (s_pos, s_axis, p_pos, b_yaw))
+    single.append(
+      visible_cells(
+        height[sl], sp[:, :1], sa[:, :1], bp[:, :1], by[:, :1], resolution, lidar
+      )
+    )
+    fused.append(visible_cells(height[sl], sp, sa, bp, by, resolution, lidar))
+  return torch.cat(single), torch.cat(fused)
 
 
 def _integrate(cmd: torch.Tensor, dt: float) -> torch.Tensor:

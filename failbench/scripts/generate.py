@@ -95,6 +95,21 @@ class GenerateConfig:
   """Shard name prefix; defaults to '<terrain>_s<seed>'."""
 
 
+HIM_LATENT_DIM = 16
+
+
+def policy_estimates(
+  actor, obs, n: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """HIM's velocity estimate (scaled, as the policy sees it) and latent; zeros
+  for a policy without the internal model, so data and impact model keep one
+  layout and a plain policy's model learns from the history alone."""
+  if isinstance(actor, HIMActor):
+    return actor.estimate(obs)
+  zeros = torch.zeros(n, 3 + HIM_LATENT_DIM, device=device)
+  return zeros[:, :3], zeros[:, 3:]
+
+
 def _np(x: torch.Tensor) -> np.ndarray:
   return x.detach().cpu().numpy()
 
@@ -160,7 +175,7 @@ def run_round(
     "base_quat_w": buf(4),
     "joint_pos": buf(num_j),
     "joint_vel": buf(num_j),
-    "him_latent": buf(actor.latent_dim),
+    "him_latent": buf(HIM_LATENT_DIM),
     "tilt": buf(),
     "base_height": buf(),
     "trunk_contact": buf(dtype=torch.bool),
@@ -182,7 +197,7 @@ def run_round(
   for _ in range(max_steps):
     with torch.no_grad():
       obs, _, _, _ = wrapped.step(policy(obs))
-      vel_est, latent = actor.estimate(obs)
+      vel_est, latent = policy_estimates(actor, obs, n, device)
     # Terminations are stripped, so a shrinking counter is an unexpected reset.
     reset_seen |= env.episode_length_buf < prev_len
     prev_len = env.episode_length_buf.clone()
@@ -312,9 +327,6 @@ def generate(cfg: GenerateConfig) -> list[Path]:
   )
   policy = runner.get_inference_policy(device=device)
   actor = runner.alg.get_policy()
-  if not isinstance(actor, HIMActor):
-    raise ValueError(f"{cfg.checkpoint_file} isn't a HIMLoco policy.")
-
   out_dir = Path(cfg.output_dir)
   out_dir.mkdir(parents=True, exist_ok=True)
   seed = "none" if cfg.terrain_seed is None else str(cfg.terrain_seed)

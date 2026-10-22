@@ -51,6 +51,9 @@ dataset.py                 torch Dataset: noisy LiDAR map, contact grids
 | `model/losses.py` | losses and metrics |
 | `scripts/train.py` | training (clean map, then LiDAR map) |
 | `cluster/train.sbatch` | Hopper training job, W&B |
+| `mppi/` | the MPPI planner: sampler, obstacle sweep, cost, model wrappers (plain torch, no simulator) |
+| `scripts/run_mppi.py` | run MPPI in closed loop in sim, with only what the robot would have |
+| `scripts/play_mppi.py` | replay an MPPI run as a video, with the plan and its prediction drawn in |
 
 ## Trials
 
@@ -257,6 +260,70 @@ actually gets through, i.e. the box is too loose. Then try, in order:
 3. A mixture of 2–3 Gaussians, for outcomes that split (e.g. stumbling
    left or right after a hip lock).
 
+## MPPI
+
+`failbench/mppi` plans with the impact model. It is plain torch with no
+simulator imports, so the same code can run on the robot. Every 0.1 s, for
+each robot:
+
+1. **Sample** 256 plans of 50 steps: last cycle's plan shifted (warm
+   start), a hold, a stop, straight cruises at 0.5/0.8/1.1 m/s, half fresh
+   `SegmentPlan` draws (the data's plans, so the model stays in
+   distribution; lane plans on the course), and half the warm start plus
+   smooth noise. All are clipped to the data's limits (vx in [0, 1.2]) and
+   deadbanded as the command term will apply them. With a one-cycle delay
+   (the default, as on the robot) the first step is the command already
+   committed.
+2. **Predict** drift (and its spread), falls and trunk contact for every
+   plan with the dynamics model: one encode per robot, one batched decode.
+   `ZeroDriftModel` stands in for a trained model (a kinematic planner, and
+   later the fault-unaware baseline).
+3. **Cost**: closest approach to the goal plus mean distance, the
+   footprint sweep of `cmd_path + drift ± 2σ` over the obstacle map, cells
+   with no map, P(fallen at 5 s), P(trunk contact), smoothness, and the
+   lane-centre offset on the course.
+4. **Average** the plans weighted by
+   `exp(-(cost - min) / (0.25 · (median - min)))`. Scaling by the median
+   gap keeps a few hopeless plans from flattening the weights.
+
+The obstacle map is the elevation map's walls: cells standing more than
+0.18 m above a neighbour on a 3×3 median of the map (so map noise doesn't
+turn stair edges into walls), plus thin poles standing that far above
+their neighbourhood. The trunk is three circles of 0.2 m along its axis,
+each grown by `2·sqrt(σx² + σy²)` plus heading spread (the box rule under
+"Drift uncertainty"), checked against a chamfer distance field. Growth is
+capped at the 1.5 m distance range, so an uncertain plan in open ground
+isn't charged for walls that aren't there.
+
+`scripts/run_mppi.py` runs it in sim and gives the planner only what the
+Go2 has:
+- HIM's state and latent;
+- an 8 m elevation map with the training LiDAR visibility and noise (the
+  model sees its centre 64×64; `--sweep-map oracle` gives the sweep the
+  clean map instead);
+- odometry with random-walk drift, for the goal, the lane and map fusion;
+- the fault, known once it fires.
+
+Robots follow the goal follower until 2.5 s (the history is then full),
+then MPPI drives. A planner command takes effect one control step after
+it is written.
+
+Each cycle also logs the cost, predicted progress and P(fall) of the
+three cruise plans, which shows why MPPI won't move when it doesn't.
+
+For analysis, `run_mppi.py` can also:
+- `--no-fault-aware`: never tell the model the fault (the same planner,
+  fault-blind);
+- `--controller follower`: drive with the data's goal follower instead of
+  MPPI (the no-planner baseline);
+- `--replan-every-s 5`: execute each 5 s plan open loop before replanning,
+  so the robot's real path can be compared with the plan's predictions;
+- `--explain`: once a second, log every candidate scored with both the
+  told and the other fault vector, and the plan MPPI would pick with each.
+
+Each trial also reports its closest approach to an obstacle after the fault
+(on the clean map) and whether it came within 0.3 m (a close call).
+
 ## Running
 
 Locally, as a smoke test:
@@ -270,6 +337,17 @@ uv run python -m failbench.data.build --raw /tmp/fb/raw/stairs_s2_r0.npz \
 uv run python -m failbench.data.stats --root /tmp/fb/samples
 uv run python -m failbench.scripts.inspect_samples --root /tmp/fb/samples \
   --output-dir /tmp/fb/inspect
+```
+
+MPPI on the course (drop `--model` for the zero-drift stub), then a video
+of robot 0:
+
+```sh
+uv run python -m failbench.scripts.run_mppi \
+  --checkpoint-file policies/go2_him_rough_original_7200/model.pt \
+  --model <phase 1 or 2>/best.pt --output /tmp/fb/mppi/run --num-envs 16
+uv run python -m failbench.scripts.play_mppi --log /tmp/fb/mppi/run.npz \
+  --env 0 --output /tmp/fb/mppi/env0.mp4
 ```
 
 On Hopper (see `go2_him/README.md` for the one-time setup):

@@ -15,6 +15,9 @@ known the moment it fires (no detection), and the command is:
   course), along the lane centre line through the goal. It never reacts to the drift the impact
   model has to predict, like a candidate sequence MPPI scores.
 
+Where ``use_external`` is set, ``external`` (a planner's command, e.g.
+``failbench/scripts/run_mppi.py``) replaces both.
+
 Planar commands with norm at or below ``zero_below`` are zeroed, as in
 HIMLoco's sampler (``go2_him/him/commands.py``). Step events run before the
 command update in ``ManagerBasedRlEnv.step``, so the plan starts on the
@@ -49,6 +52,10 @@ class GoalVelocityCommand(UniformVelocityCommand):
     self.plan = SegmentPlan(n, cfg.plan, dev)
     self.c0 = torch.zeros(n, 3, device=dev)
     self.started = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.external = torch.zeros(n, 3, device=dev)
+    """A command written from outside (a planner), used where
+    ``use_external``; still deadbanded."""
+    self.use_external = torch.zeros(n, dtype=torch.bool, device=dev)
 
   def _deadband(self, cmd: torch.Tensor) -> torch.Tensor:
     small = cmd[..., :2].norm(dim=-1, keepdim=True) <= self.goal_cfg.zero_below
@@ -58,6 +65,7 @@ class GoalVelocityCommand(UniformVelocityCommand):
     lo, hi = self.goal_cfg.speed
     self.speed[env_ids] = lo + (hi - lo) * torch.rand(len(env_ids), device=self.device)
     self.started[env_ids] = False
+    self.use_external[env_ids] = False
     self.vel_command_b[env_ids] = 0.0
 
   @property
@@ -100,6 +108,7 @@ class GoalVelocityCommand(UniformVelocityCommand):
       )
       self.started[new] = True
     cmd = torch.where(fault.faulted[:, None], self.plan.cmd, follow)
+    cmd = torch.where(self.use_external[:, None], self.external, cmd)
     self.vel_command_b[:] = self._deadband(cmd)
 
 

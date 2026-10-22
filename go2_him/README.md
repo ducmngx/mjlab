@@ -53,6 +53,13 @@ the robot itself:
 | PD gains | Kp 20, Kd 0.5 (Unitree's Go2 configs) | Kp 40, Kd 1 (HIMLoco's Go1 config) |
 | GPU | 2048 envs in 8 GB, about 13.5 s per iteration | needs a large GPU; 128 envs take about 10.7 s per iteration on an 8 GB card |
 
+`Go2-Plain-Rough-Original` is `Go2-HIM-Rough-Original` without the
+internal model: the same environment, critic and PPO settings, with a plain
+MLP actor on the same 6-frame observation history and no velocity or latent
+estimator. It is the control for what HIM itself contributes (FailBench
+compares the two). Train it the same way, e.g.
+`TASK=Go2-Plain-Rough-Original MAX_ITERS=7200 sbatch go2_him/cluster/train.sbatch`.
+
 Other combinations come from
 `go2_him_env_cfg(collision=..., gains=..., ccd_iterations=...)`.
 `--env.sim.mujoco.ccd-iterations N` overrides the iteration count from the
