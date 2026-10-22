@@ -164,6 +164,12 @@ def test_impact_model_shapes_and_plan_batching():
   ctx = model.encode({k: v[:1] for k, v in batch.items()})
   many = model.decode(ctx, torch.rand(8, 50, 3), torch.rand(8, 50, 3), False)
   assert many["drift"].shape == (8, 50, 3) and "contact_logit" not in many
+  # Changing the plan after step 30 leaves steps up to 30 unchanged.
+  seq, path = batch["cmd_seq"].clone(), batch["cmd_path"].clone()
+  seq[:, 31:], path[:, 31:] = 0.5, 0.5
+  late = model.decode(model.encode(batch), seq, path, False)
+  assert torch.allclose(late["drift"][:, :31], pred["drift"][:, :31], atol=1e-5)
+  assert not torch.allclose(late["drift"][:, 31:], pred["drift"][:, 31:])
 
 
 def test_hazard_nll_prefers_the_true_fall_step():

@@ -206,7 +206,8 @@ The model has two parts:
 - a **context encoder**: map CNN tokens, state, latent, history and 12
   fault tokens with leg and joint-type embeddings, through a transformer;
 - a **plan decoder**: 50 query tokens built from each step's command and
-  commanded pose, cross-attending to the context.
+  commanded pose, cross-attending to the context. Self-attention over the
+  steps is causal, as in ZLIK: a step never sees later commands.
 
 A planner runs the encoder once per cycle (once per fault for a safety
 filter) and the decoder once per candidate plan.

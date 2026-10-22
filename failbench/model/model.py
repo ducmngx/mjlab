@@ -18,7 +18,9 @@ once per planning cycle, once per fault for a safety filter) and a plan
 decoder (one pass per candidate plan), so a planner scoring many plans
 pays for the encoder once. The decoder is non-autoregressive: one query
 token per step built from that step's command and commanded pose, as in
-ZLIK's future-action queries (Pokhrel et al., arXiv:2602.12385).
+ZLIK's future-action queries (Pokhrel et al., arXiv:2602.12385). As in
+ZLIK, decoder self-attention is causal: a step sees the plan up to itself,
+never commands that come later.
 """
 
 from __future__ import annotations
@@ -170,6 +172,11 @@ class ImpactModel(nn.Module):
       ),
       cfg.decoder_layers,
     )
+    self.register_buffer(
+      "causal_mask",
+      nn.Transformer.generate_square_subsequent_mask(cfg.num_steps),
+      persistent=False,
+    )
     self.head_norm = nn.LayerNorm(d)
     # drift mean (3), drift log-variance (3), dv (3), hazard, collision, offmap
     self.step_head = nn.Linear(d, 12)
@@ -216,7 +223,12 @@ class ImpactModel(nn.Module):
     plan = torch.cat(
       [self.norm("cmd_seq", cmd_seq), self.norm("cmd_path", cmd_path)], dim=-1
     )
-    h = self.decoder(self.plan_in(plan) + self.step_pos, memory)
+    h = self.decoder(
+      self.plan_in(plan) + self.step_pos,
+      memory,
+      tgt_mask=self.causal_mask,
+      tgt_is_causal=True,
+    )
     h = self.head_norm(h)
     out = self.step_head(h)
     lo, hi = self.cfg.logvar_range
