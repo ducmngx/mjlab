@@ -66,6 +66,9 @@ Added
   model (plain MLP actor, standard PPO), the control for what HIM
   contributes. FailBench data generation accepts it (``TASK`` in
   ``generate.sbatch``); its HIM-only inputs are zeros.
+- ``failbench/scripts/evaluate.py`` and ``cluster/evaluate.sbatch``: score a
+  trained impact model on val, the unseen-terrain split and the held-out
+  fault, with fall and contact calibration and fall timing.
 
 Changed
 ^^^^^^^

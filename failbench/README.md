@@ -51,6 +51,8 @@ dataset.py                 torch Dataset: noisy LiDAR map, contact grids
 | `model/losses.py` | losses and metrics |
 | `scripts/train.py` | training (clean map, then LiDAR map) |
 | `cluster/train.sbatch` | Hopper training job, W&B |
+| `scripts/evaluate.py` | held-out evaluation: drift, coverage, fall and contact AUROC and calibration, fall timing, per terrain |
+| `cluster/evaluate.sbatch` | Hopper evaluation job |
 | `mppi/` | the MPPI planner: sampler, obstacle sweep, cost, model wrappers (plain torch, no simulator) |
 | `scripts/run_mppi.py` | run MPPI in closed loop in sim, with only what the robot would have |
 | `scripts/play_mppi.py` | replay an MPPI run as a video, with the plan and its prediction drawn in |
