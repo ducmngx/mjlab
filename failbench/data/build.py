@@ -171,8 +171,16 @@ class BuildConfig:
   """``safe``'s fall is at most this long before the robot is down."""
   fuse_back_s: tuple[float, ...] = (0.5, 1.0, 1.5)
   history_s: float = 2.0
-  held_out: tuple[str, ...] = ("RL_calf_joint:LOCK",)
-  """``joint:FAMILY`` pairs held out as test_fault."""
+  held_out: tuple[str, ...] = (
+    "RL_calf_joint:LOCK",
+    "FL_calf_joint:LOCK",
+    "FR_thigh_joint:WEAK",
+    "RR_hip_joint:WEAK",
+  )
+  """``joint:FAMILY`` pairs held out as test_fault, one per leg: two seized
+  calves (the locks that fell most) and two weak or limp joints, one a hip
+  that throws the robot sideways. One pair gave too few falls to tell
+  models apart."""
   val_seed_mod: int = 1
   test_seed_mod: int = 0
   """Terrain seeds with ``seed % 10`` equal to these go to val / test_terrain."""

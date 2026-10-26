@@ -160,7 +160,7 @@ Each covers 5 s at 10 Hz (50 bins).
 |---|---|
 | val | terrain seeds ending in 1 |
 | test_terrain | terrain seeds ending in 0 |
-| test_fault | a locked `RL_calf_joint`, never trained on |
+| test_fault | four joint and fault pairs never trained on: locked `RL_calf_joint` and `FL_calf_joint`, weak or limp `FR_thigh_joint` and `RR_hip_joint` |
 
 ## Sensor realism
 

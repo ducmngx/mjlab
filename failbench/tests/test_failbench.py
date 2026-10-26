@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 import torch
 from failbench.commands import GoalVelocityCommand
-from failbench.data.build import SPLITS, BuildConfig, fall_step, no_return_step
+from failbench.data.build import (
+  SPLITS,
+  BuildConfig,
+  _split,
+  fall_step,
+  no_return_step,
+)
 from failbench.data.dataset import FailBenchDataset
 from failbench.faults import (
   FAULT_TERM,
@@ -437,3 +443,29 @@ def test_the_latent_head_starts_at_the_scale_of_its_target():
   std = torch.full((16,), 2e-3)
   _, terms = impact_loss(model(batch), batch, LossWeights(), 10, latent_std=std)
   assert terms["latent"] < 10
+
+
+def test_the_held_out_faults_go_to_test_fault_on_every_terrain_seed():
+  joints = [
+    f"{leg}_{p}_joint"
+    for leg in ("FL", "FR", "RL", "RR")
+    for p in ("hip", "thigh", "calf")
+  ]
+  cases = [
+    ("RL_calf_joint", "LOCK", True),
+    ("FL_calf_joint", "LOCK", True),
+    ("FR_thigh_joint", "WEAK", True),
+    ("RR_hip_joint", "WEAK", True),
+    ("RR_hip_joint", "LOCK", False),
+    ("FR_hip_joint", "WEAK", False),
+  ]
+  params = np.tile(np.array(NOMINAL, np.float32), (len(cases), 12, 1))
+  family = np.zeros(len(cases), np.int64)
+  for i, (joint, fam, _) in enumerate(cases):
+    j = joints.index(joint)
+    family[i] = FaultFamily[fam]
+    params[i, j] = (1.0, 1.0) if fam == "LOCK" else (0.0, 0.0)
+  cfg = BuildConfig(raw=(), output_dir="")
+  for seed in (2, 10, 11):  # train, test_terrain and val seeds
+    split = _split(seed, family, params, joints, cfg)
+    assert [s == 3 for s in split] == [held for *_, held in cases]
