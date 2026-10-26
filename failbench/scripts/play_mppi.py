@@ -114,7 +114,10 @@ def main():
     if family == "WEAK":
       what += f" torque x{params[joint, TORQUE]:.2f}"
   fault_t = int(log["fault_step"][b]) * dt
-  goal = log["goal_w"][b]
+  waypoints = (
+    log["waypoints_w"][b] if "waypoints_w" in log.files else log["goal_w"][b : b + 1]
+  )
+  goal = waypoints[-1]
   down = fallen(torch.as_tensor(dense["tilt"]), torch.as_tensor(dense["base_height"]))
   ever_down = np.maximum.accumulate(down.numpy())
 
@@ -142,6 +145,14 @@ def main():
     renderer.update_scene(data, cam)
     scene = renderer.scene
     ground = pos[t, 2] - dense["base_height"][t]
+    for wp in waypoints[:-1]:  # intermediate waypoints: short pillars
+      _add(
+        scene,
+        mujoco.mjtGeom.mjGEOM_CYLINDER,
+        (0.06, 0.15, 0),
+        (wp[0], wp[1], ground + 0.15),
+        _GREEN,
+      )
     _add(
       scene,
       mujoco.mjtGeom.mjGEOM_CYLINDER,

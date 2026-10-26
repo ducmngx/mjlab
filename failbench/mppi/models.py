@@ -8,8 +8,9 @@ and returns, per plan and step:
 - ``drift``, ``drift_std`` ``[n, k, T, 3]``: predicted pose minus
   ``cmd_path`` (x, y, yaw), and its per-axis spread;
 - ``p_fallen`` ``[n, k, T]``: P(fallen by the end of the step);
-- ``p_collision`` ``[n, k, T]``: P(trunk or head contact in the step);
-- with ``contact_maps=True``, ``contact`` ``[n, k, S, H, W]``: P(a non-foot
+- models with contact heads only (phase 1, the stub): ``p_collision``
+  ``[n, k, T]``, P(trunk or head contact in the step), and with
+  ``contact_maps=True``, ``contact`` ``[n, k, S, H, W]``: P(a non-foot
   body part touches each map cell during each second of the plan) on the
   model's map grid. Costly over many plans; MPPI asks for it on the chosen
   plan only, to show it.
@@ -23,7 +24,7 @@ a trained ``ImpactModel`` checkpoint.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 import torch
 
@@ -94,11 +95,7 @@ class ImpactDynamics:
   @classmethod
   def from_checkpoint(cls, path: str | Path, device, amp: bool = True):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    # JSON-style lists back to the config's tuples.
-    saved: dict[str, Any] = {
-      k: tuple(v) if isinstance(v, list) else v for k, v in ckpt["model_cfg"].items()
-    }
-    cfg = ImpactModelCfg(**saved)
+    cfg = ImpactModelCfg.from_saved(ckpt["model_cfg"])
     model = ImpactModel(cfg, ckpt["stats"]).to(device)
     model.load_state_dict(ckpt["model"])
     return cls(model, ckpt["train_cfg"]["map_mode"], amp)
@@ -123,8 +120,9 @@ class ImpactDynamics:
       "drift": pred["drift"],
       "drift_std": torch.exp(0.5 * pred["drift_logvar"]),
       "p_fallen": pred["p_fallen"],
-      "p_collision": torch.sigmoid(pred["collision_logit"]),
     }
-    if contact_maps:
+    if "collision_logit" in pred:
+      out["p_collision"] = torch.sigmoid(pred["collision_logit"])
+    if "contact_logit" in pred:
       out["contact"] = torch.sigmoid(pred["contact_logit"])
     return out

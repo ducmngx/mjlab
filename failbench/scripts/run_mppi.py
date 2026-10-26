@@ -57,7 +57,7 @@ from heat_bench.envs_mjlab.joint_fault_injection import (
 )
 from heat_bench.scripts.policy_loading import load_runner
 
-from failbench.commands import GoalVelocityCommand
+from failbench.commands import GOAL_TERM, GoalVelocityCommand
 from failbench.data.build import _yaw_rotate_quat, fallen, lidar_known
 from failbench.env_cfg import (
   DEFAULT_TASK,
@@ -75,27 +75,36 @@ from failbench.faults import (
   faulted_joint,
   inject_kinodynamic_fault,
 )
+from failbench.goals import sample_goal
 from failbench.mppi.costmap import distance_field, obstacle_cells
 from failbench.mppi.inputs import HistoryBuffer, crop_center
 from failbench.mppi.models import DynamicsModel, ImpactDynamics, ZeroDriftModel
 from failbench.mppi.planner import Mppi, MppiCfg
 from failbench.scripts.generate import policy_estimates
 from failbench.sensing import LidarCfg, NoiseCfg, corrupt_map
+from failbench.severity import DROP_SEVERITY, geom_severity
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.sensor import RayCastSensor
+from mjlab.sensor.raycast_sensor import RayCastData
 from mjlab.utils.lab_api.math import wrap_to_pi
 from mjlab.utils.torch import configure_torch_backends
 
 MPPI_MAP_SENSOR = "mppi_map"
 CLOSE_CALL_M = 0.3
+FELL_OFF_M = 0.35
+"""On ``cliff``, the trunk this far below its starting height has gone over
+the ledge (the corridor is flat; the pit is 0.6 m down)."""
 """A trunk centre this close to an obstacle (about 0.1 m of body clearance
 beside the trunk) counts as a close call."""
 FAMILIES = {
-  "mixture": None,
-  "nominal": (1.0, 0.0, 0.0),
-  "lock": (0.0, 1.0, 0.0),
-  "weak": (0.0, 0.0, 1.0),
+  "mixture": FaultMixture(),
+  "nominal": FaultMixture(probs=(1.0, 0.0, 0.0)),
+  "lock": FaultMixture(probs=(0.0, 1.0, 0.0)),
+  "weak": FaultMixture(probs=(0.0, 0.0, 1.0)),
+  "free": FaultMixture(probs=(0.0, 0.0, 1.0), limp_prob=1.0),
 }
+"""Fault mixture per ``--family``; ``free`` is WEAK at zero torque only (a
+limp joint, heat_bench's FREE)."""
 
 
 @dataclass(frozen=True)
@@ -124,7 +133,7 @@ class RunMppiConfig:
   num_envs: int = 16
   duration_s: float = 30.0
   fault_time_s: tuple[float, float] = (4.0, 8.0)
-  family: Literal["mixture", "nominal", "lock", "weak"] = "mixture"
+  family: Literal["mixture", "nominal", "lock", "weak", "free"] = "mixture"
   start_s: float = 2.5
   """MPPI takes over from the goal follower (history and fused poses full)."""
   map_cells: int = 160
@@ -142,6 +151,9 @@ class RunMppiConfig:
   odom_yaw_std: float = 0.005
   """Odometry heading random walk (rad per sqrt(s))."""
   arrive_radius: float = 0.5
+  waypoint_radius: float = 1.0
+  """On waypoint terrains (``l_course``, ``doors``), move on to the next waypoint
+  within this distance of the current one (or once past it)."""
   mppi: MppiCfg = field(default_factory=MppiCfg)
   lidar: LidarCfg = field(default_factory=LidarCfg)
   noise: NoiseCfg = field(default_factory=NoiseCfg)
@@ -150,6 +162,25 @@ class RunMppiConfig:
   lidar_chunk: int = 4
   device: str | None = None
   seed: int = 0
+
+
+def _touched_severity(
+  touch: torch.Tensor,
+  contact_w: torch.Tensor,
+  rays: RayCastData,
+  geom_sev: torch.Tensor,
+  reach_m: float = 0.08,
+) -> torch.Tensor:
+  """Worst severity per env ``[n]`` of what its touching contacts
+  (``touch [n, N]`` at ``contact_w [n, N, 3]``) are on: the most severe
+  geom the map's rays hit within ``reach_m`` (xy) of each contact."""
+  out = torch.zeros(touch.shape[0], device=touch.device)
+  sev = geom_sev[rays.hit_geom_id.long()]  # [n, R]
+  for b in touch.any(-1).nonzero()[:, 0].tolist():
+    pts = contact_w[b, touch[b], :2]
+    near = torch.cdist(pts, rays.hit_pos_w[b, :, :2]) < reach_m  # [M, R]
+    out[b] = torch.where(near, sev[b], 0.0).amax()
+  return out
 
 
 def _yaw_quat_mul(quat: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
@@ -175,8 +206,7 @@ def run(cfg: RunMppiConfig) -> dict:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
   torch.manual_seed(cfg.seed)
-  probs = FAMILIES[cfg.family]
-  mixture = FaultMixture() if probs is None else FaultMixture(probs=probs)
+  mixture = FAMILIES[cfg.family]
   env_cfg = failbench_env_cfg(
     cfg.task,
     cfg.terrain,
@@ -207,8 +237,11 @@ def run(cfg: RunMppiConfig) -> dict:
   fault = env.event_manager.get_term_cfg(FAULT_TERM).func
   assert isinstance(fault, inject_kinodynamic_fault)
   command = env.command_manager.get_term("twist")
+  goal_term = env.event_manager.get_term_cfg(GOAL_TERM).func
+  assert isinstance(goal_term, sample_goal)
   assert isinstance(command, GoalVelocityCommand)
   elev = env.scene[MPPI_MAP_SENSOR]
+  geom_sev = geom_severity(env.sim.mj_model, device=device)
   assert isinstance(elev, RayCastSensor)
   sensor = env.scene[FAULT_CONTACT_SENSOR]
   cells = cfg.map_cells
@@ -216,6 +249,9 @@ def run(cfg: RunMppiConfig) -> dict:
   geom_part = [body_group(body_part(g)) for g in sensor.primary_names]
   slot_trunk = torch.tensor(
     [g in TRUNK_GROUPS for g in geom_part], device=device
+  ).repeat_interleave(sensor.cfg.num_slots)
+  slot_body = torch.tensor(
+    [g != "foot" for g in geom_part], device=device
   ).repeat_interleave(sensor.cfg.num_slots)
 
   planner = Mppi(cfg.mppi, model, n, device)
@@ -257,6 +293,7 @@ def run(cfg: RunMppiConfig) -> dict:
       "pred_yaw_w": (T,),
       "pred_p_fallen": (T,),
       "pred_p_collision": (T,),
+      "p_fall_soon": (),
       "drift_end": (3,),
       "origin_w": (4,),
       "p_fallen": (),
@@ -306,6 +343,11 @@ def run(cfg: RunMppiConfig) -> dict:
   down = torch.zeros(n, dtype=torch.bool, device=device)
   t_reach = torch.full((n,), float("nan"), device=device)
   collided = torch.zeros(n, dtype=torch.bool, device=device)
+  fell_off = torch.zeros(n, dtype=torch.bool, device=device)
+  incident = torch.zeros(n, device=device)
+  """Worst severity a non-foot body part has touched (or a drop's, gone
+  over one) from MPPI's start until arrival."""
+  start_z = torch.full((n,), float("nan"), device=device)
   plan_time = []
 
   obs, _ = wrapped.reset()
@@ -327,13 +369,27 @@ def run(cfg: RunMppiConfig) -> dict:
 
     z = elev.data.hit_pos_w[..., 2] - pos[:, 2:3]
     height = torch.where(elev.data.distances < 0, float("nan"), z).view(n, cells, cells)
+    severity = geom_sev[elev.data.hit_geom_id.long()].view(n, cells, cells)
     base_height = -height[:, mid, mid].flatten(1).nanmedian(dim=-1).values
     tilt = tilt_angle(data.projected_gravity_b)
-    _, _, _, force_w, valid = contacts_in_base_frame(sensor, robot)
+    _, _, contact_w, force_w, valid = contacts_in_base_frame(sensor, robot)
     trunk_hit = (valid & slot_trunk & (force_w.norm(dim=-1) >= 1.0)).any(-1)
     started = t >= cfg.start_s
     down |= fallen(tilt, base_height) & started
     collided |= trunk_hit & started & ~reached
+    if i == 0:
+      start_z = pos[:, 2].clone()
+    if cfg.terrain == "cliff":
+      fell_off |= (pos[:, 2] < start_z - FELL_OFF_M) & started & ~reached
+      down |= fell_off
+      incident = torch.where(fell_off, incident.clamp(min=DROP_SEVERITY), incident)
+    touch = (
+      valid & slot_body & (force_w.norm(dim=-1) >= 1.0) & (started & ~reached)[:, None]
+    )
+    if touch.any():
+      incident = torch.maximum(
+        incident, _touched_severity(touch, contact_w, elev.data, geom_sev)
+      )
 
     state = torch.cat(
       [
@@ -366,8 +422,10 @@ def run(cfg: RunMppiConfig) -> dict:
       continue
 
     est_yaw = heading(est_quat)
+    goal_term.advance(est_pos[:, :2], cfg.waypoint_radius)
     goal = _to_yaw_frame_2d(command.goal_w[:, :2], est_pos[:, :2], est_yaw)
-    newly = (~reached & (goal.norm(dim=-1) < cfg.arrive_radius)).nonzero()[:, 0]
+    near = goal_term.final & (goal.norm(dim=-1) < cfg.arrive_radius)
+    newly = (~reached & near).nonzero()[:, 0]
     reached[newly] = True
     t_reach[newly] = t
     stopped = reached | down
@@ -451,8 +509,25 @@ def run(cfg: RunMppiConfig) -> dict:
       alt_told = torch.zeros_like(fault.faulted) if cfg.fault_aware else fault.faulted
       alt_params = torch.where(alt_told[:, None, None], fault.params, nominal)
       alt_inputs = inputs | {"fault": encode_fault(alt_params)}
+    route = None
+    if goal_term.waypoints.shape[1] > 1:
+      # The waypoint after the current one (itself at the last), so plans
+      # are scored on the remaining route, corner then goal.
+      nxt = (goal_term.index + 1).clamp(max=goal_term.waypoints.shape[1] - 1)
+      route_w = goal_term.waypoints[torch.arange(n, device=device), nxt, :2]
+      route = _to_yaw_frame_2d(route_w, est_pos[:, :2], est_yaw)
+    planner.track(est_pos[:, :2], replan_k * cfg.mppi.sampler.step_s)
     out = planner.step(
-      inputs, plan_h, plan_known, MAP_RESOLUTION, goal, bearing, alt_inputs
+      inputs,
+      plan_h,
+      plan_known,
+      MAP_RESOLUTION,
+      goal,
+      bearing,
+      alt_inputs,
+      route,
+      exposed=~told,  # The fault risk prices faults still to come.
+      severity=severity,
     )
     if explain_now:
       e, m = out["explain"], (step // r) // every
@@ -503,6 +578,7 @@ def run(cfg: RunMppiConfig) -> dict:
       "pred_yaw_w": wrap_to_pi(out["pred_path"][..., 2] + yaw[:, None]),
       "pred_p_fallen": out["pred_p_fallen"],
       "pred_p_collision": out["pred_p_collision"],
+      "p_fall_soon": out["p_fall_soon"],
       "drift_end": out["pred_path"][:, -1] - out["path"][:, -1],
       "origin_w": torch.cat([pos, yaw[:, None]], -1),
       "true_pred_w": _to_world(out["path"] + true_pred["drift"][:, 0], pos, yaw),
@@ -517,9 +593,10 @@ def run(cfg: RunMppiConfig) -> dict:
         np.nan,
       )
     on = active.cpu().numpy()
-    probs = (out["pred_contact"][active].clamp(0, 1) * 255).round().byte()
-    contact[on, c] = probs.cpu().numpy()
-    contact_height[on, c] = crop_center(height[active], MAP_CELLS).cpu().numpy()
+    if "pred_contact" in out:
+      probs = (out["pred_contact"][active].clamp(0, 1) * 255).round().byte()
+      contact[on, c] = probs.cpu().numpy()
+      contact_height[on, c] = crop_center(height[active], MAP_CELLS).cpu().numpy()
     for k, v in out.items():
       if k.startswith(("cost_", "probe_")):
         arr = cost_logs.setdefault(k, np.full((n, num_cycles), np.nan, np.float32))
@@ -544,6 +621,8 @@ def run(cfg: RunMppiConfig) -> dict:
       "time_to_goal_s": None if torch.isnan(t_reach[b]) else float(t_reach[b]),
       "fell": bool(down[b]),
       "trunk_contact": bool(collided[b]),
+      "fell_off": bool(fell_off[b]),
+      "incident_severity": float(incident[b]),
       "min_clearance_m": float(np.nanmin(after_fault[b]))
       if np.isfinite(after_fault[b]).any()
       else None,
@@ -553,9 +632,15 @@ def run(cfg: RunMppiConfig) -> dict:
   summary: dict[str, dict | float | None] = {}
   outcome = {
     k: v.cpu().numpy()
-    for k, v in (("reached", reached), ("fell", down), ("trunk_contact", collided))
+    for k, v in (
+      ("reached", reached),
+      ("fell", down),
+      ("trunk_contact", collided),
+      ("fell_off", fell_off),
+    )
   }
   t_goal = t_reach.cpu().numpy()
+  incident_np = incident.cpu().numpy()
   with np.errstate(all="ignore"):
     min_clear = np.nanmin(np.where(np.isfinite(after_fault), after_fault, np.inf), 1)
   min_clear[~np.isfinite(min_clear)] = np.nan
@@ -572,6 +657,7 @@ def run(cfg: RunMppiConfig) -> dict:
       if np.isfinite(min_clear[sel]).any()
       else None,
       "close_calls": float((min_clear[sel] < CLOSE_CALL_M).mean()),
+      "mean_incident_severity": float(incident_np[sel].mean()),
     }
   summary["plan_ms_mean"] = 1e3 * float(np.mean(plan_time)) if plan_time else None
 
@@ -595,6 +681,7 @@ def run(cfg: RunMppiConfig) -> dict:
     **{f"explain_{k}": v for k, v in ex.items()},
     fault_aware=np.array(cfg.fault_aware),
     goal_w=command.goal_w.cpu().numpy(),
+    waypoints_w=goal_term.waypoints.cpu().numpy(),
     fault_params=fault.params.cpu().numpy(),
     fault_family=fam,
     fault_step=fault.fault_step.cpu().numpy(),

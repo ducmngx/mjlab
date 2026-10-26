@@ -9,9 +9,12 @@ state, HIM's latent, the last 2 s, and the known fault) and a 5 s plan
   footprint along ``cmd_path + drift +- k sigma`` over the map, so obstacle
   avoidance is geometric and works on layouts never trained on;
 - the velocity deviation ``dv``, an auxiliary target;
-- the fall hazard (``P(fallen by t)`` is monotone by construction);
-- trunk or head contact (``collision``) and a contact landing off the map;
-- body-contact maps, one 64x64 map per second of the plan.
+- the fall hazard (``P(fallen by t)`` is monotone by construction), from
+  which how soon a fall comes (P(fall within 1 s), the time to fall) is read;
+- with ``contact_heads`` (phase 1's model), also trunk or head contact
+  (``collision``), a contact landing off the map, and body-contact maps, one
+  64x64 map per second of the plan. The planner sweeps the drift over the
+  map instead, so v2 drops them.
 
 The model splits into a context encoder (map, state, history, fault; run
 once per planning cycle, once per fault for a safety filter) and a plan
@@ -26,6 +29,7 @@ never commands that come later.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -51,6 +55,15 @@ class ImpactModelCfg:
   history_dim: int = 36
   fault_params: int = 2
   logvar_range: tuple[float, float] = (-10.0, 4.0)
+  contact_heads: bool = False
+  """Also predict collision, off-map contact and contact maps (phase 1)."""
+
+  @classmethod
+  def from_saved(cls, saved: dict) -> ImpactModelCfg:
+    """A checkpoint's config; ones saved before ``contact_heads`` had them."""
+    kw: dict[str, Any] = {"contact_heads": True}
+    kw |= {k: tuple(v) if isinstance(v, list) else v for k, v in saved.items()}
+    return cls(**kw)
 
 
 class Normalizer(nn.Module):
@@ -178,9 +191,10 @@ class ImpactModel(nn.Module):
       persistent=False,
     )
     self.head_norm = nn.LayerNorm(d)
-    # drift mean (3), drift log-variance (3), dv (3), hazard, collision, offmap
-    self.step_head = nn.Linear(d, 12)
-    self.contacts = ContactDecoder(d)
+    # drift mean (3), drift log-variance (3), dv (3), hazard; then with
+    # contact_heads, collision and offmap.
+    self.step_head = nn.Linear(d, 12 if cfg.contact_heads else 10)
+    self.contacts = ContactDecoder(d) if cfg.contact_heads else None
 
   def encode(self, batch: dict[str, torch.Tensor]) -> Context:
     n = self.norm
@@ -217,7 +231,8 @@ class ImpactModel(nn.Module):
     contact_maps: bool = True,
   ) -> dict[str, torch.Tensor]:
     """Predictions for plans ``cmd_seq`` / ``cmd_path [B, T, 3]``. ``ctx``
-    may have batch 1 to score many plans against one context."""
+    may have batch 1 to score many plans against one context. ``contact_maps``
+    only applies with ``contact_heads``."""
     b = cmd_seq.shape[0]
     memory = ctx.memory.expand(b, -1, -1)
     plan = torch.cat(
@@ -241,9 +256,11 @@ class ImpactModel(nn.Module):
       "dv": out[..., 6:9],
       "hazard_logit": hazard,
       "p_fallen": 1 - log_up.exp(),
-      "collision_logit": out[..., 10],
-      "offmap_logit": out[..., 11],
     }
+    if self.contacts is None:
+      return pred
+    pred["collision_logit"] = out[..., 10]
+    pred["offmap_logit"] = out[..., 11]
     if contact_maps:
       k = self.cfg.steps_per_map
       tokens = h.reshape(b, self.cfg.num_steps // k, k, -1).mean(dim=2)

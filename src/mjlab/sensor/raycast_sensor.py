@@ -347,6 +347,9 @@ class RayCastData:
   frame_quat_w: torch.Tensor
   """[B, F, 4] All frame orientations (w, x, y, z)."""
 
+  hit_geom_id: torch.Tensor
+  """[B, N] Id of the geom each ray hit. -1 if no hit."""
+
 
 @dataclass
 class RayCastSensorCfg(SensorCfg):
@@ -460,6 +463,7 @@ class RayCastSensor(Sensor[RayCastData]):
     self._distances: torch.Tensor | None = None
     self._normals_w: torch.Tensor | None = None
     self._hit_pos_w: torch.Tensor | None = None
+    self._hit_geom_id: torch.Tensor | None = None
     self._pos_w: torch.Tensor | None = None
     self._quat_w: torch.Tensor | None = None
     self._frame_pos_w: torch.Tensor | None = None
@@ -553,6 +557,9 @@ class RayCastSensor(Sensor[RayCastData]):
     self._distances = torch.zeros(num_envs, self._num_rays, device=device)
     self._normals_w = torch.zeros(num_envs, self._num_rays, 3, device=device)
     self._hit_pos_w = torch.zeros(num_envs, self._num_rays, 3, device=device)
+    self._hit_geom_id = torch.full(
+      (num_envs, self._num_rays), -1, dtype=torch.long, device=device
+    )
     self._pos_w = torch.zeros(num_envs, 3, device=device)
     self._quat_w = torch.zeros(num_envs, 4, device=device)
     self._frame_pos_w = torch.zeros(num_envs, F, 3, device=device)
@@ -576,7 +583,7 @@ class RayCastSensor(Sensor[RayCastData]):
         "sim.sense() calls."
       )
     assert self._distances is not None and self._normals_w is not None
-    assert self._hit_pos_w is not None
+    assert self._hit_pos_w is not None and self._hit_geom_id is not None
     assert self._pos_w is not None and self._quat_w is not None
     assert self._frame_pos_w is not None and self._frame_quat_w is not None
     return RayCastData(
@@ -587,6 +594,7 @@ class RayCastSensor(Sensor[RayCastData]):
       quat_w=self._quat_w,
       frame_pos_w=self._frame_pos_w,
       frame_quat_w=self._frame_quat_w,
+      hit_geom_id=self._hit_geom_id,
     )
 
   @property
@@ -782,6 +790,7 @@ class RayCastSensor(Sensor[RayCastData]):
     F = self._num_frames
 
     assert self._ray_dist is not None and self._ray_normal is not None
+    assert self._ray_geomid is not None
     distances = wp.to_torch(self._ray_dist)
     normals_w = wp.to_torch(self._ray_normal).view(B, self._num_rays, 3)
     distances.masked_fill_(distances > self.cfg.max_distance, -1.0)
@@ -797,6 +806,8 @@ class RayCastSensor(Sensor[RayCastData]):
     # Zero out normals for misses.
     normals_w.masked_fill_(~hit_mask.unsqueeze(-1), 0.0)
     self._distances = distances
+    geom_id = wp.to_torch(self._ray_geomid)
+    self._hit_geom_id = torch.where(hit_mask, geom_id, -1)
     self._normals_w = normals_w
 
     # All frames: [B, F, 3] / [B, F, 4].

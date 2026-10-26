@@ -15,6 +15,11 @@ control step ``s`` with ``r`` control steps per bin, bin ``k`` covers steps
   start pose, so ``pose - cmd_path`` is the drift from the plan.
 - ``upright[k]``: no fall yet (``fallen``: tilt over ``fall_tilt_deg`` or
   the trunk under ``fall_height_m`` above the ground) at the end of the bin.
+- ``safe[k]``: not yet past the point of no return (``no_return_step``):
+  the last moment the robot was still as upright as it walked before the
+  fault, after which it went down for good. Earlier than ``upright``'s fall
+  by however long the fall takes, so a fall predictor trained on it warns
+  while there is still time to act.
 - ``collision[k]``: the trunk or head touched terrain or an obstacle in the
   bin (walls on the course, a step edge) whether or not the robot fell.
 - contacts: non-foot contacts in the bin on the start map grid, as CSR rows
@@ -61,6 +66,31 @@ FALL_HEIGHT_M = 0.15
 """Trunk height above the ground (nominal 0.30) below which it is down."""
 
 
+def no_return_step(
+  tilt: torch.Tensor,
+  base_height: torch.Tensor,
+  fall_step: torch.Tensor,
+  fault_step: int,
+  tilt_margin_deg: float,
+  height_margin_m: float,
+  ref_steps: int,
+) -> torch.Tensor:
+  """``[n]`` first step from which the robot never again walks as upright
+  as it did before the fault (tilt within ``tilt_margin_deg`` of its worst
+  over the ``ref_steps`` before it, trunk within ``height_margin_m`` of its
+  lowest), until its fall at ``fall_step`` (``[n]``, ``T`` for none: then
+  ``T`` too). Relative to the robot's own pre-fault walk, so a trunk pitched
+  on a stair flight isn't counted. At the fault step if it never was."""
+  t = torch.arange(tilt.shape[1], device=tilt.device)
+  ref = slice(fault_step - ref_steps, fault_step)
+  tilt_ok = tilt[:, ref].amax(1, keepdim=True) + math.radians(tilt_margin_deg)
+  height_ok = base_height[:, ref].amin(1, keepdim=True) - height_margin_m
+  ok = (tilt <= tilt_ok) & (base_height >= height_ok)
+  ok &= (t >= fault_step) & (t < fall_step[:, None])
+  last_ok = torch.where(ok, t, fault_step - 1).amax(1)
+  return torch.where(fall_step < tilt.shape[1], last_ok + 1, fall_step)
+
+
 def fallen(
   tilt: torch.Tensor,
   base_height: torch.Tensor,
@@ -81,6 +111,10 @@ class BuildConfig:
   target_hz: float = 10.0
   fall_tilt_deg: float = FALL_TILT_DEG
   fall_height_m: float = FALL_HEIGHT_M
+  no_return_tilt_margin_deg: float = 15.0
+  no_return_height_margin_m: float = 0.06
+  """``safe``: how far past its pre-fault walk the robot may tip or sink and
+  still count as upright (``no_return_step``)."""
   fuse_back_s: tuple[float, ...] = (0.5, 1.0, 1.5)
   history_s: float = 2.0
   held_out: tuple[str, ...] = ("RL_calf_joint:LOCK",)
@@ -154,6 +188,15 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
   t_ar = torch.arange(num_t, device=device)
   post = t_ar[None, :] >= pre
   fall_step = torch.where(fallen_t & post, t_ar, num_t).min(dim=1).values  # [n]
+  nr_step = no_return_step(
+    tilt,
+    base_height,
+    fall_step,
+    pre,
+    cfg.no_return_tilt_margin_deg,
+    cfg.no_return_height_margin_m,
+    round(1.0 / step_dt),
+  )
 
   maps = torch.as_tensor(raw["map"][idx].astype(np.float32), device=device)
   params = raw["fault_params"][idx]
@@ -206,6 +249,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     put("base_height", base_height[:, ends])
     put("collision", trunk[:, steps].any(dim=-1))
     put("upright", ends[None, :] < fall_step[:, None])
+    put("safe", ends[None, :] < nr_step[:, None])
     put("valid", valid_t[:, ends])
     put("fallen_at_start", fall_step <= s)
     put("offset_s", torch.full((n,), snap * step_dt, device=device))
@@ -281,6 +325,8 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     "splits": list(SPLITS),
     "fall_tilt_deg": cfg.fall_tilt_deg,
     "fall_height_m": cfg.fall_height_m,
+    "no_return_tilt_margin_deg": cfg.no_return_tilt_margin_deg,
+    "no_return_height_margin_m": cfg.no_return_height_margin_m,
     "fuse_back_s": list(cfg.fuse_back_s),
   }
   (shard / "meta.json").write_text(json.dumps(meta, indent=2))

@@ -167,6 +167,7 @@ def test_terrain_normal_from_sensors():
     quat_w=torch.zeros(B, 4),
     frame_pos_w=torch.zeros(B, 1, 3),
     frame_quat_w=torch.zeros(B, 1, 4),
+    hit_geom_id=torch.zeros(B, 100, dtype=torch.long),
   )
   type(raycast_sensor).data = PropertyMock(return_value=raycast_data)
 

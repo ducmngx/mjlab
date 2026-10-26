@@ -12,6 +12,15 @@ path over the elevation map.
   neighbourhood's median. With the training map noise (2 cm per cell) this
   flags a 0.14 m staircase in about 4% of maps and a 0.2 m crate in 99%.
   Unknown cells (NaN) are never obstacles.
+- ``drop_cells``: a cell is a drop (a ledge's foot, where a robot that goes
+  over falls) if, within ``drop_reach_m``, ground at the robot's own level
+  (within ``drop_level_m`` of the floor under the map's centre) stands more
+  than ``drop_m`` above it: more than two stair risers, so stairs down
+  aren't drops. Taking only ground at the robot's level keeps wall and
+  crate tops out, which the LiDAR often sees with the floor beside them
+  hidden. The rim itself is already an obstacle (it stands above the foot).
+  The foot of a ledge is often hidden from the LiDAR too, so this needs the
+  floor below to have been seen.
 - ``distance_field``: distance (m) from each cell to the nearest obstacle,
   capped at ``max_dist_m``, by chamfer propagation over 8-neighbours
   (within about 8% of Euclidean; cheap on a GPU and on a Jetson).
@@ -23,6 +32,12 @@ path over the elevation map.
   Returns how far
   each circle reaches into an obstacle and whether its centre is on an
   unknown cell. Off the map counts as free and unknown.
+
+- ``hit_prob``: the chance a footprint touches an obstacle at each step,
+  for a predicted pose with Gaussian spread: per circle,
+  ``Phi((radius - clearance) / spread)`` with the same spread as ``sweep``'s
+  inflation (over ``k_sigma``), the largest over circles. Far from anything
+  it is 0, so open ground carries no risk.
 
 Maps are robot-centred and yaw-aligned with the plan's start frame, on the
 grid of ``failbench/sensing.cell_centres`` (row = y).
@@ -46,6 +61,9 @@ class FootprintCfg:
   k_sigma: float = 2.0
   wall_jump_m: float = 0.18
   max_dist_m: float = 1.5
+  drop_m: float = 0.45
+  drop_reach_m: float = 0.3
+  drop_level_m: float = 0.2
   """Distances are known up to this; an inflated circle is capped to it, so
   a very uncertain plan in open ground isn't charged for walls that aren't
   there."""
@@ -61,6 +79,27 @@ def obstacle_cells(height: torch.Tensor, wall_jump_m: float) -> torch.Tensor:
   """``height [B, H, W]`` (NaN unknown) -> obstacle mask ``[B, H, W]``."""
   med = median3(height)
   return _jumps(med, wall_jump_m) | ((height - med) > wall_jump_m)
+
+
+def _pool(h: torch.Tensor, r: int, op: str) -> torch.Tensor:
+  """Max (``op="max"``) or min over ``(2r+1)^2`` windows of ``[B, H, W]``;
+  unknown cells (NaN) are skipped, and an all-unknown window is NaN."""
+  sign = 1.0 if op == "max" else -1.0
+  x = (sign * h).nan_to_num(-torch.inf)[:, None]
+  out = F.max_pool2d(x, 2 * r + 1, 1, r)[:, 0]
+  return torch.where(out.isinf(), float("nan"), sign * out)
+
+
+def drop_cells(height: torch.Tensor, cfg: "FootprintCfg", resolution: float):
+  """``height [B, H, W]`` (NaN unknown), centred on the robot -> drop mask
+  ``[B, H, W]``."""
+  med = median3(height)
+  h, w = med.shape[-2:]
+  r = round(cfg.drop_reach_m / resolution)
+  floor = med[:, h // 2 - r : h // 2 + r + 1, w // 2 - r : w // 2 + r + 1]
+  floor = floor.flatten(1).nanmedian(-1).values[:, None, None]
+  level = torch.where((med - floor).abs() < cfg.drop_level_m, med, float("nan"))
+  return (_pool(level, r, "max") - med) > cfg.drop_m  # NaN compares False.
 
 
 def _jumps(h: torch.Tensor, wall_jump_m: float) -> torch.Tensor:
@@ -127,3 +166,27 @@ def sweep(
   )
   reach = (cfg.radius + grow).clamp(max=cfg.max_dist_m)
   return F.relu(reach - clear), unknown
+
+
+def hit_prob(
+  dist: torch.Tensor,
+  pose: torch.Tensor,
+  std: torch.Tensor,
+  resolution: float,
+  cfg: FootprintCfg,
+  radius: float | None = None,
+  min_std: float = 0.02,
+) -> torch.Tensor:
+  """P(the footprint along ``pose [B, K, T, 3]``, spread ``std``, touches an
+  obstacle of ``dist [B, H, W]``) per step ``[B, K, T]``; ``radius``
+  overrides the circles' (e.g. a robot lying down)."""
+  ox = torch.tensor(cfg.circles_x, device=pose.device)
+  yaw = pose[..., 2:3]
+  centres = pose[..., None, :2] + ox[:, None] * torch.stack(
+    [torch.cos(yaw), torch.sin(yaw)], dim=-1
+  )
+  clear = cfg.max_dist_m - _sample(cfg.max_dist_m - dist, centres, resolution)
+  spread = std[..., :2].norm(dim=-1, keepdim=True) + ox.abs() * std[..., 2:3]
+  r = cfg.radius if radius is None else radius
+  z = (r - clear) / spread.clamp(min=min_std)
+  return torch.special.ndtr(z).amax(-1)

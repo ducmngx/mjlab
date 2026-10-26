@@ -8,8 +8,9 @@ Shards are memory-mapped. Each item is a dict of tensors:
 - ``state`` (33), ``state_true_vel`` (3), ``him_latent`` (16), ``history``
   ``[20, 36]``, ``cmd_seq`` ``[T, 3]``, ``fault`` (24);
 - targets ``dv`` / ``pose`` / ``cmd_path`` ``[T, 3]``, ``upright`` / ``collision`` /
-  ``valid`` / ``contact_offmap`` ``[T]``, and ``contact`` ``[T, H, W]`` rasterised from
-  the CSR rows;
+  ``valid`` / ``contact_offmap`` ``[T]``, ``safe`` ``[T]`` (shards built
+  with point-of-no-return labels), and with ``contacts`` ``contact``
+  ``[T, H, W]`` rasterised from the CSR rows;
 - labels ``fault_family``, ``plan_hold``, ``terrain_id``, ``offset_s``.
 """
 
@@ -56,10 +57,14 @@ class FailBenchDataset(Dataset):
     map_mode: MapMode = "fused",
     noise: NoiseCfg | None = None,
     drop_fallen_at_start: bool = True,
+    contacts: bool = True,
     seed: int | None = None,
   ):
     """``noise`` defaults to ``NoiseCfg()``. ``seed`` fixes each item's map
-    noise (for val/test); ``None`` draws fresh noise every time."""
+    noise (for val/test); ``None`` draws fresh noise every time. ``contacts``
+    rasterises the contact maps (only a model with contact heads needs
+    them)."""
+    self.contacts = contacts
     self.map_mode = map_mode
     self.noise = noise or NoiseCfg()
     self.seed = seed
@@ -90,7 +95,8 @@ class FailBenchDataset(Dataset):
   def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
     s, row = (int(x) for x in self.index[index])
     a = self.shards[s]
-    item = {k: torch.from_numpy(np.array(a[k][row])) for k in _PER_SAMPLE}
+    keys = (*_PER_SAMPLE, "safe") if "safe" in a else _PER_SAMPLE
+    item = {k: torch.from_numpy(np.array(a[k][row])) for k in keys}
     item["terrain_id"] = torch.tensor(self.metas[s]["terrain_id"])
 
     height = torch.from_numpy(a["map_clean"][row].astype(np.float32))
@@ -104,6 +110,8 @@ class FailBenchDataset(Dataset):
         gen = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
       item["map"] = corrupt_map(height, known, self.noise, gen)
 
+    if not self.contacts:
+      return item
     lo, hi = int(a["contact_ptr"][row]), int(a["contact_ptr"][row + 1])
     contact = torch.zeros(self.num_bins, self.cells, self.cells, dtype=torch.bool)
     if hi > lo:

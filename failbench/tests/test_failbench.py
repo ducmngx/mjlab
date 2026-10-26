@@ -4,11 +4,12 @@ import json
 import math
 import os
 
+import mujoco
 import numpy as np
 import pytest
 import torch
 from failbench.commands import GoalVelocityCommand
-from failbench.data.build import SPLITS
+from failbench.data.build import SPLITS, no_return_step
 from failbench.data.dataset import FailBenchDataset
 from failbench.faults import (
   FAULT_TERM,
@@ -21,10 +22,17 @@ from failbench.faults import (
   faulted_joint,
   sample_fault_params,
 )
-from failbench.model.losses import LossWeights, hazard_nll, impact_loss
+from failbench.goals import sample_goal
+from failbench.model.losses import (
+  LossWeights,
+  hazard_nll,
+  impact_loss,
+  impact_metrics,
+)
 from failbench.model.model import ImpactModel, ImpactModelCfg
 from failbench.plans import PlanCfg, SegmentPlan
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
+from failbench.severity import DEFAULT_SEVERITY, SEVERITY, geom_severity
 
 
 def get_test_device() -> str:
@@ -150,7 +158,9 @@ def _unit_stats() -> dict:
 
 def test_impact_model_shapes_and_plan_batching():
   torch.manual_seed(0)
-  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  cfg = ImpactModelCfg(
+    d_model=32, context_layers=1, decoder_layers=1, contact_heads=True
+  )
   model = ImpactModel(cfg, _unit_stats()).eval()
   batch = _fake_batch()
   pred = model(batch)
@@ -293,3 +303,60 @@ def test_fault_writes_and_plan_starts_in_real_env():
   assert (command.plan.pose[:, :2] != robot.data.root_link_pos_w[:, :2]).any()
   assert math.isfinite(robot.data.joint_pos.sum().item())
   env.close()
+
+
+def test_a_waypoint_passed_outside_its_radius_still_counts():
+  term = sample_goal.__new__(sample_goal)
+  term.start = torch.zeros(1, 3)
+  term.waypoints = torch.tensor([[[2.0, 0.0, 0.0], [2.0, 3.0, 0.0]]])
+  term.index = torch.zeros(1, dtype=torch.long)
+  term.goal_w = term.waypoints[:, 0]
+  term.advance(torch.tensor([[1.5, 0.8]]), radius=0.4)  # Beside, not past.
+  assert term.index[0] == 0
+  term.advance(torch.tensor([[2.1, 0.8]]), radius=0.4)  # Past, 0.8 m off.
+  assert term.index[0] == 1 and bool(term.final[0])
+  term.advance(torch.tensor([[5.0, 5.0]]), radius=0.4)  # The last one stays.
+  assert term.index[0] == 1
+
+
+def test_geom_names_map_to_severity():
+  spec = mujoco.MjSpec()
+  for name in ("course_glass_3", "course_wall_7", "course_floor_0", ""):
+    spec.worldbody.add_geom(name=name, size=(0.1, 0.1, 0.1))
+  sev = geom_severity(spec.compile()).tolist()
+  assert sev == [SEVERITY["glass"], SEVERITY["wall"], 0.0, DEFAULT_SEVERITY, 0.0]
+
+
+def test_v2_model_drops_the_contact_heads_and_learns_the_no_return_label():
+  torch.manual_seed(0)
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  model = ImpactModel(cfg, _unit_stats())
+  batch = _fake_batch()
+  batch["safe"] = batch["upright"].clone()
+  batch["safe"][0, 12:] = False  # Past the point of no return in step 12.
+  pred = model(batch)
+  assert {"collision_logit", "offmap_logit", "contact_logit"}.isdisjoint(pred)
+  total, terms = impact_loss(pred, batch, LossWeights(fall_pos=5.0), 10, "safe")
+  assert set(terms) == {"drift", "dv", "fall"}
+  total.backward()  # One training step's gradient flows.
+  m = impact_metrics(pred, batch, fall_label="safe")
+  assert m["fell"].tolist() == [True, False, False]
+  assert m["fell_soon"].tolist() == [False, False, False]  # Step 12 > 1 s.
+  # A phase 1 config (saved before contact_heads) still has them.
+  assert ImpactModelCfg.from_saved({"d_model": 32}).contact_heads
+
+
+def test_no_return_is_when_the_robot_leaves_its_walk_for_good():
+  t = 200
+  tilt = torch.full((3, t), 0.1)
+  height = torch.full((3, t), 0.30)
+  # 0: wobbles at 120 (recovers), tips from 150, on the ground at 170.
+  tilt[0, 120:125] = 0.6
+  tilt[0, 150:] = torch.linspace(0.5, 1.4, t - 150)
+  # 1: sinks from 130 and stays low, never "fallen" by tilt, down at 160.
+  height[1, 130:] = 0.2
+  height[1, 160:] = 0.1
+  # 2: never falls.
+  fall = torch.tensor([170, 160, t])
+  nr = no_return_step(tilt, height, fall, 100, 15.0, 0.06, 50)
+  assert nr.tolist() == [150, 130, t]

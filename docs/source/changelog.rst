@@ -8,6 +8,8 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- ``RayCastData.hit_geom_id``: the id of the geom each ray hit (-1 for a
+  miss), so ray-cast maps can be labelled by what they hit.
 - ``heat_bench``, a standalone benchmark package for passively measuring
   thermal accumulation and battery energy usage of existing trained
   locomotion policies on rough terrain. Adds a batched 14-node lumped

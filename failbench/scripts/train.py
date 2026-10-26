@@ -18,6 +18,7 @@ import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import torch
 import tyro
@@ -60,6 +61,9 @@ class TrainConfig:
   wandb_project: str = "failbench"
   run_name: str | None = None
   log_every: int = 50
+  fall_label: Literal["upright", "safe"] = "upright"
+  """What the fall hazard learns: the fall itself, or the point of no
+  return before it (``safe``, ``failbench/data/build.py``)."""
   model: ImpactModelCfg = field(default_factory=ImpactModelCfg)
   loss: LossWeights = field(default_factory=LossWeights)
 
@@ -85,12 +89,14 @@ def evaluate(
     with torch.autocast("cuda", torch.bfloat16, enabled=cfg.amp and device != "cpu"):
       pred = model(batch)
     pred = {k: v.float() for k, v in pred.items()}
-    total, terms = impact_loss(pred, batch, cfg.loss, cfg.model.steps_per_map)
+    total, terms = impact_loss(
+      pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label
+    )
     b = batch["state"].shape[0]
     n += b
     for k, v in {"total": float(total), **terms}.items():
       losses[k] = losses.get(k, 0.0) + v * b
-    for k, v in impact_metrics(pred, batch).items():
+    for k, v in impact_metrics(pred, batch, fall_label=cfg.fall_label).items():
       pooled.setdefault(k, []).append(v.cpu())
   model.train()
   out = {f"loss/{k}": v / max(n, 1) for k, v in losses.items()}
@@ -111,7 +117,8 @@ def main():
     )
   stats = json.loads(stats_path.read_text())
 
-  train_ds = FailBenchDataset(root, "train", cfg.map_mode)
+  contacts = cfg.model.contact_heads
+  train_ds = FailBenchDataset(root, "train", cfg.map_mode, contacts=contacts)
 
   def loader(ds: FailBenchDataset, train: bool) -> DataLoader:
     return DataLoader(
@@ -125,7 +132,7 @@ def main():
     )
 
   train_dl = loader(train_ds, True)
-  val_ds = FailBenchDataset(root, "val", cfg.map_mode, seed=0)
+  val_ds = FailBenchDataset(root, "val", cfg.map_mode, seed=0, contacts=contacts)
   val_dl = loader(val_ds, False) if len(val_ds) else None
   print(f"[INFO] train {len(train_ds)} samples, val {len(val_ds)}")
 
@@ -177,7 +184,9 @@ def main():
       with torch.autocast("cuda", torch.bfloat16, enabled=cfg.amp and device != "cpu"):
         pred = model(batch)
       pred = {k: v.float() for k, v in pred.items()}
-      total, terms = impact_loss(pred, batch, cfg.loss, cfg.model.steps_per_map)
+      total, terms = impact_loss(
+        pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label
+      )
       opt.zero_grad(set_to_none=True)
       total.backward()
       gn = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)

@@ -21,13 +21,26 @@ from dataclasses import replace
 
 import go2_him.him.tasks  # noqa: F401  (registers the Go2 HIM tasks)
 from heat_bench.envs_mjlab.fault_impact import fault_elevation_sensor_cfg
-from heat_bench.envs_mjlab.go2_eval_env_cfg import use_fault_terrain
+from heat_bench.envs_mjlab.go2_eval_env_cfg import (
+  COURSE_SPAWN_POSE_RANGE,
+  use_fault_terrain,
+)
 from heat_bench.envs_mjlab.joint_fault_injection import fault_contact_sensor_cfg
 
+from failbench.cliff_course import CLIFF_COURSE, CLIFF_COURSE_TERRAIN, cliff_waypoints
 from failbench.commands import GOAL_TERM, GoalVelocityCommandCfg
+from failbench.door_course import DOOR_COURSE, DOOR_COURSE_TERRAIN, door_waypoints
 from failbench.faults import FAULT_TERM, FaultMixture, inject_kinodynamic_fault
 from failbench.goals import GoalMode, sample_goal
+from failbench.l_course import L_CORRIDOR, L_COURSE_TERRAIN, corridor_waypoints
 from failbench.plans import PlanCfg
+from failbench.severity_course import (
+  SEVERITY_COURSE,
+  SEVERITY_COURSE_TERRAIN,
+  SEVERITY_SWAP,
+  SEVERITY_SWAP_TERRAIN,
+  severity_waypoints,
+)
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -82,7 +95,21 @@ GOAL_MODES: dict[str, GoalMode] = {
   "stairs_tall": "pyramid",
   "stairs_up_tall": "pyramid",
   "course": "lane",
+  "l_course": "waypoints",
+  "doors": "waypoints",
+  "cliff": "waypoints",
+  "severity": "waypoints",
+  "severity_swap": "waypoints",
 }
+WAYPOINT_TERRAINS = {
+  "l_course": (L_COURSE_TERRAIN, corridor_waypoints(L_CORRIDOR)),
+  "doors": (DOOR_COURSE_TERRAIN, door_waypoints(DOOR_COURSE)),
+  "cliff": (CLIFF_COURSE_TERRAIN, cliff_waypoints(CLIFF_COURSE)),
+  "severity": (SEVERITY_COURSE_TERRAIN, severity_waypoints(SEVERITY_COURSE)),
+  "severity_swap": (SEVERITY_SWAP_TERRAIN, severity_waypoints(SEVERITY_SWAP)),
+}
+"""Evaluation scenes (no data is generated on them): the generator and the
+waypoints relative to the spawn, the last one the goal."""
 STAIR_FIRE_RADIUS = {
   "stairs": (1.6, 3.2),
   "stairs_up": (1.4, 2.9),
@@ -128,7 +155,16 @@ def failbench_env_cfg(
   # Trials start from rest.
   if "reset_base" in cfg.events:
     cfg.events["reset_base"].params["velocity_range"] = {}
-  if terrain in TALL_STAIR_TERRAINS:
+  if terrain in WAYPOINT_TERRAINS:
+    # One course per difficulty row, the robot at the start facing +x.
+    assert cfg.scene.terrain is not None
+    gen = WAYPOINT_TERRAINS[terrain][0]
+    if terrain_seed is not None:
+      gen = replace(gen, seed=terrain_seed)
+    cfg.scene.terrain.terrain_generator = gen
+    cfg.scene.terrain.max_init_terrain_level = None
+    cfg.events["reset_base"].params["pose_range"] = dict(COURSE_SPAWN_POSE_RANGE)
+  elif terrain in TALL_STAIR_TERRAINS:
     # As use_fault_terrain: fresh layout per seed, spawns on every row.
     assert cfg.scene.terrain is not None
     gen = TALL_STAIR_TERRAINS[terrain]
@@ -157,7 +193,15 @@ def failbench_env_cfg(
   cfg.events[GOAL_TERM] = EventTermCfg(
     func=sample_goal,
     mode="reset",
-    params={"mode": GOAL_MODES[terrain], "asset_cfg": SceneEntityCfg("robot")},
+    params={
+      "mode": GOAL_MODES[terrain],
+      "asset_cfg": SceneEntityCfg("robot"),
+      **(
+        {"waypoints": WAYPOINT_TERRAINS[terrain][1].tolist()}
+        if terrain in WAYPOINT_TERRAINS
+        else {}
+      ),
+    },
   )
   fault_params: dict = {
     "fault_time_s": tuple(fault_time_s),

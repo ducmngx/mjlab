@@ -78,6 +78,7 @@ def _make_env_and_reward(
       quat_w=torch.zeros(B, 4),
       frame_pos_w=torch.zeros(B, 1, 3),
       frame_quat_w=torch.zeros(B, 1, 4),
+      hit_geom_id=torch.zeros(B, N, dtype=torch.long),
     )
     type(raycast_sensor).data = PropertyMock(return_value=raycast_data)
     for name in terrain_sensor_names:

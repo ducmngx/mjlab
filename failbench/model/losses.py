@@ -5,11 +5,12 @@
   sweep uses, so it is trained, not optional.
 - dv: Huber over upright, valid steps (auxiliary).
 - fall: discrete-time hazard likelihood: ``log(1 - h)`` for every step
-  before the fall, ``log h`` on the step it happens, nothing after
-  (``upright`` is absorbing).
-- collision, offmap: BCE per valid step, positives up-weighted.
-- contact maps: per map (``steps_per_map`` steps), "any non-foot contact in
-  the cell", focal BCE plus soft Dice.
+  before the fall, ``log h`` on the step it happens (up-weighted by
+  ``fall_pos``: falls are rare), nothing after (the label, ``upright`` or
+  the point of no return ``safe``, is absorbing).
+- with a contact-head model: collision, offmap: BCE per valid step,
+  positives up-weighted; contact maps: per map (``steps_per_map`` steps),
+  "any non-foot contact in the cell", focal BCE plus soft Dice.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ class LossWeights:
   drift: float = 1.0
   dv: float = 0.5
   fall: float = 1.0
+  fall_pos: float = 1.0
+  """Weight on the log-likelihood of the step a fall happens."""
   collision: float = 0.5
   offmap: float = 0.1
   contact: float = 1.0
@@ -56,12 +59,18 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 def hazard_nll(
-  hazard_logit: torch.Tensor, upright: torch.Tensor, valid: torch.Tensor
+  hazard_logit: torch.Tensor,
+  upright: torch.Tensor,
+  valid: torch.Tensor,
+  fall_pos: float = 1.0,
 ) -> torch.Tensor:
-  """Negative log-likelihood of when (if) each sample falls."""
+  """Negative log-likelihood of when (if) each sample falls; the fall step's
+  term weighted ``fall_pos``."""
   up = upright.bool()
   falls_here = ~up & torch.cat([torch.ones_like(up[:, :1]), up[:, :-1]], dim=1)
-  ll = torch.where(falls_here, F.logsigmoid(hazard_logit), F.logsigmoid(-hazard_logit))
+  ll = torch.where(
+    falls_here, fall_pos * F.logsigmoid(hazard_logit), F.logsigmoid(-hazard_logit)
+  )
   at_risk = (up | falls_here) & valid.bool()
   return -_masked_mean(ll, at_risk)
 
@@ -88,7 +97,10 @@ def impact_loss(
   batch: dict[str, torch.Tensor],
   w: LossWeights,
   steps_per_map: int,
+  fall_label: str = "upright",
 ) -> tuple[torch.Tensor, dict[str, float]]:
+  """``fall_label``: the batch key the hazard learns (``upright``, or
+  ``safe`` for the point of no return)."""
   valid = batch["valid"].bool()
   up = batch["upright"].bool() & valid
   target = drift_target(batch)
@@ -97,10 +109,12 @@ def impact_loss(
   terms = {
     "drift": _masked_mean(nll, up),
     "dv": _masked_mean(F.huber_loss(pred["dv"], batch["dv"], reduction="none"), up),
-    "fall": hazard_nll(pred["hazard_logit"], batch["upright"], valid),
+    "fall": hazard_nll(pred["hazard_logit"], batch[fall_label], valid, w.fall_pos),
   }
   pw = torch.tensor(w.pos_weight, device=valid.device)
   for name, key in (("collision", "collision"), ("offmap", "contact_offmap")):
+    if f"{name}_logit" not in pred:
+      continue
     bce = F.binary_cross_entropy_with_logits(
       pred[f"{name}_logit"], batch[key].float(), pos_weight=pw, reduction="none"
     )
@@ -128,18 +142,28 @@ def auroc(score: torch.Tensor, label: torch.Tensor) -> float:
 
 @torch.no_grad()
 def impact_metrics(
-  pred: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], step_s: float = 0.1
+  pred: dict[str, torch.Tensor],
+  batch: dict[str, torch.Tensor],
+  step_s: float = 0.1,
+  fall_label: str = "upright",
+  soon_s: float = 1.0,
 ) -> dict[str, torch.Tensor]:
   """Per-sample quantities to pool over an eval set (concatenate, then
-  ``summarize_metrics``)."""
+  ``summarize_metrics``). Falls are by ``fall_label``; ``fell_soon`` /
+  ``p_fell_soon``: within ``soon_s``."""
   up = batch["upright"].bool() & batch["valid"].bool()
   err = (pred["drift"][..., :2] - drift_target(batch)[..., :2]).norm(dim=-1)
-  out = {"fell": ~batch["upright"].bool().all(dim=1)}
+  fall_up = batch[fall_label].bool()
+  out = {"fell": ~fall_up.all(dim=1)}
   if "fault_family" in batch:
     out["family"] = batch["fault_family"].long()
   out["p_fell"] = pred["p_fallen"][:, -1]
-  out["collided"] = (batch["collision"].bool() & batch["valid"].bool()).any(dim=1)
-  out["p_collided"] = torch.sigmoid(pred["collision_logit"]).amax(dim=1)
+  k_soon = round(soon_s / step_s) - 1
+  out["fell_soon"] = ~fall_up[:, k_soon]
+  out["p_fell_soon"] = pred["p_fallen"][:, k_soon]
+  if "collision_logit" in pred:
+    out["collided"] = (batch["collision"].bool() & batch["valid"].bool()).any(dim=1)
+    out["p_collided"] = torch.sigmoid(pred["collision_logit"]).amax(dim=1)
   for s in (1, 3, 5):
     k = round(s / step_s) - 1
     out[f"drift_err_{s}s"] = torch.where(up[:, k], err[:, k], float("nan"))
@@ -161,8 +185,10 @@ def summarize_metrics(m: dict[str, torch.Tensor]) -> dict[str, float]:
   def pool(sel: torch.Tensor, prefix: str) -> dict[str, float]:
     out = {
       f"{prefix}fall_auroc": auroc(m["p_fell"][sel], m["fell"][sel]),
-      f"{prefix}collision_auroc": auroc(m["p_collided"][sel], m["collided"][sel]),
+      f"{prefix}fall_soon_auroc": auroc(m["p_fell_soon"][sel], m["fell_soon"][sel]),
     }
+    if "p_collided" in m:
+      out[f"{prefix}collision_auroc"] = auroc(m["p_collided"][sel], m["collided"][sel])
     for k, v in m.items():
       if k.startswith(("drift_err", "zero_err", "cover2s")):
         out[f"{prefix}{k}"] = float(torch.nanmean(v[sel].float()))

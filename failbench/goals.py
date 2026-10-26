@@ -11,6 +11,10 @@ env's goal (``goal_w``) by terrain kind (``GoalMode``):
   direction.
 - ``lane`` (course): the lane end, ``lane_goal_x`` m down the lane from the
   spawn origin.
+- ``waypoints`` (``l_course``, ``doors``): points relative to the spawn
+  origin (corner or doorways, then the goal). ``goal_w`` is the current
+  one; ``advance`` moves on once the robot is within a radius of it or has
+  passed it, and ``final`` says whether the current one is the last.
 
 For ``pyramid`` and ``free`` the robot is turned to face its goal; on the
 course it keeps the lane-facing spawn jitter.
@@ -29,14 +33,43 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.managers.event_manager import EventTermCfg
 
-GoalMode = Literal["pyramid", "free", "lane"]
+GoalMode = Literal["pyramid", "free", "lane", "waypoints"]
 
 
 class sample_goal:
   def __init__(self, cfg: "EventTermCfg", env: "ManagerBasedRlEnv"):
     asset_cfg: SceneEntityCfg = cfg.params.get("asset_cfg", SceneEntityCfg("robot"))
     self._asset = env.scene[asset_cfg.name]
-    self.goal_w = torch.zeros(env.num_envs, 3, device=env.device)
+    n = env.num_envs
+    self.goal_w = torch.zeros(n, 3, device=env.device)
+    wps = cfg.params.get("waypoints") or [[0.0, 0.0]]
+    self.waypoints = torch.zeros(n, len(wps), 3, device=env.device)
+    """Every waypoint (world), last = the final goal."""
+    self.index = torch.zeros(n, dtype=torch.long, device=env.device)
+    self.start = torch.zeros(n, 3, device=env.device)
+    """Where the first leg starts (the spawn origin)."""
+
+  @property
+  def final(self) -> torch.Tensor:
+    return self.index == self.waypoints.shape[1] - 1
+
+  def advance(self, pos_xy: torch.Tensor, radius: float) -> None:
+    """Move to the next waypoint where ``pos_xy [n, 2]`` is within
+    ``radius`` of the current one, or past it: beyond the line through it
+    square to the leg that leads to it. Without the second test, a robot
+    that goes by just outside the radius (or whose odometry says so) is
+    left with a waypoint behind it."""
+    rows = torch.arange(len(self.index), device=self.index.device)
+    cur = self.goal_w[:, :2]
+    prev = torch.where(
+      (self.index > 0)[:, None],
+      self.waypoints[rows, (self.index - 1).clamp(min=0), :2],
+      self.start[:, :2],
+    )
+    near = (pos_xy - cur).norm(dim=-1) < radius
+    passed = ((pos_xy - cur) * (cur - prev)).sum(-1) > 0
+    self.index = torch.where((near | passed) & ~self.final, self.index + 1, self.index)
+    self.goal_w = self.waypoints[rows, self.index]
 
   def __call__(
     self,
@@ -46,6 +79,7 @@ class sample_goal:
     pyramid_goal_cheb: float = 3.7,
     free_goal_distance: float = 5.0,
     lane_goal_x: float = 13.0,
+    waypoints: list | None = None,
     asset_cfg: SceneEntityCfg | None = None,
   ) -> None:
     del asset_cfg
@@ -57,9 +91,20 @@ class sample_goal:
     adr = self._asset.indexing.free_joint_q_adr
     pose = self._asset.data.data.qpos[env_ids[:, None], adr]
     goal = origin.clone()
+    self.start[env_ids] = origin
+    if mode == "waypoints":
+      assert waypoints is not None
+      rel = torch.tensor(waypoints, dtype=torch.float32, device=dev)  # [K, 2]
+      wp = origin[:, None].repeat(1, len(rel), 1)
+      wp[..., :2] += rel
+      self.waypoints[env_ids] = wp
+      self.index[env_ids] = 0
+      self.goal_w[env_ids] = wp[:, 0]
+      return
     if mode == "lane":
       goal[:, 0] += lane_goal_x
       self.goal_w[env_ids] = goal
+      self.waypoints[env_ids] = goal[:, None]
       return
     phi = (torch.rand(m, device=dev) * 2 - 1) * math.pi
     u = torch.stack([torch.cos(phi), torch.sin(phi)], dim=-1)
@@ -69,6 +114,7 @@ class sample_goal:
     else:
       goal[:, :2] = pose[:, :2] + free_goal_distance * u
     self.goal_w[env_ids] = goal
+    self.waypoints[env_ids] = goal[:, None]
     to_goal = goal[:, :2] - pose[:, :2]
     yaw = torch.atan2(to_goal[:, 1], to_goal[:, 0])
     zero = torch.zeros_like(yaw)
