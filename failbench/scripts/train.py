@@ -78,7 +78,11 @@ def _float(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 @torch.no_grad()
 def evaluate(
-  model: ImpactModel, loader: DataLoader, cfg: TrainConfig, device: str
+  model: ImpactModel,
+  loader: DataLoader,
+  cfg: TrainConfig,
+  device: str,
+  latent_std: torch.Tensor,
 ) -> dict[str, float]:
   model.eval()
   losses: dict[str, float] = {}
@@ -90,7 +94,7 @@ def evaluate(
       pred = model(batch)
     pred = {k: v.float() for k, v in pred.items()}
     total, terms = impact_loss(
-      pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label
+      pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label, latent_std
     )
     b = batch["state"].shape[0]
     n += b
@@ -116,6 +120,7 @@ def main():
       f"No {stats_path}: run `uv run python -m failbench.data.stats --root {root}`."
     )
   stats = json.loads(stats_path.read_text())
+  latent_std = torch.tensor(stats["him_latent"]["std"], device=device)
 
   contacts = cfg.model.contact_heads
   train_ds = FailBenchDataset(root, "train", cfg.map_mode, contacts=contacts)
@@ -185,7 +190,7 @@ def main():
         pred = model(batch)
       pred = {k: v.float() for k, v in pred.items()}
       total, terms = impact_loss(
-        pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label
+        pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label, latent_std
       )
       opt.zero_grad(set_to_none=True)
       total.backward()
@@ -210,7 +215,9 @@ def main():
         )
       if cfg.max_steps and step >= cfg.max_steps:
         break
-    val = evaluate(model, val_dl, cfg, device) if val_dl is not None else None
+    val = (
+      evaluate(model, val_dl, cfg, device, latent_std) if val_dl is not None else None
+    )
     if val is not None:
       log(val, step)
       print(f"[epoch {epoch}] " + " ".join(f"{k} {v:.3f}" for k, v in val.items()))

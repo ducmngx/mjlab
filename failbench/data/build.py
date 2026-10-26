@@ -15,6 +15,9 @@ control step ``s`` with ``r`` control steps per bin, bin ``k`` covers steps
   start pose, so ``pose - cmd_path`` is the drift from the plan.
 - ``upright[k]``: no fall yet (``fallen``: tilt over ``fall_tilt_deg`` or
   the trunk under ``fall_height_m`` above the ground) at the end of the bin.
+- ``latent_future[k]``: HIM's latent at the end of the bin (an auxiliary
+  target: the policy's own sense of how the robot is responding, dense where
+  falls are rare).
 - ``safe[k]``: not yet past the point of no return (``no_return_step``):
   the last moment the robot was still as upright as it walked before the
   fault, after which it went down for good. Earlier than ``upright``'s fall
@@ -32,8 +35,9 @@ head LiDAR could see of it (``known_single`` from this pose,
 ``failbench/sensing.py``), ``state`` (33: HIM's velocity estimate, angular
 velocity, projected gravity, joint positions and velocities), the true
 velocity, the HIM latent, ``history`` (the last ``history_s`` at
-``target_hz``, oldest first, ending at the start: ``state`` plus the
-command, 36 per step), and the encoded fault (24). ``plan_hold``: the
+``target_hz``, oldest first, ending at the start: ``state``, the command and
+HIM's latent, 52 per step; the latent's drift away from the robot's walk
+warns of falls), and the encoded fault (24). ``plan_hold``: the
 post-fault plan holds the fault-time command.
 
 ``split``: 0 train, 1 val, 2 test_terrain (unseen terrain seeds), 3
@@ -74,13 +78,16 @@ def no_return_step(
   tilt_margin_deg: float,
   height_margin_m: float,
   ref_steps: int,
+  max_lead_steps: int,
 ) -> torch.Tensor:
   """``[n]`` first step from which the robot never again walks as upright
   as it did before the fault (tilt within ``tilt_margin_deg`` of its worst
   over the ``ref_steps`` before it, trunk within ``height_margin_m`` of its
   lowest), until its fall at ``fall_step`` (``[n]``, ``T`` for none: then
   ``T`` too). Relative to the robot's own pre-fault walk, so a trunk pitched
-  on a stair flight isn't counted. At the fault step if it never was."""
+  on a stair flight isn't counted. At the fault step if it never was, and
+  never more than ``max_lead_steps`` before the fall: a robot limping on,
+  tilted but stable, isn't already falling."""
   t = torch.arange(tilt.shape[1], device=tilt.device)
   ref = slice(fault_step - ref_steps, fault_step)
   tilt_ok = tilt[:, ref].amax(1, keepdim=True) + math.radians(tilt_margin_deg)
@@ -88,7 +95,8 @@ def no_return_step(
   ok = (tilt <= tilt_ok) & (base_height >= height_ok)
   ok &= (t >= fault_step) & (t < fall_step[:, None])
   last_ok = torch.where(ok, t, fault_step - 1).amax(1)
-  return torch.where(fall_step < tilt.shape[1], last_ok + 1, fall_step)
+  nr = torch.maximum(last_ok + 1, fall_step - max_lead_steps)
+  return torch.where(fall_step < tilt.shape[1], nr, fall_step)
 
 
 def fallen(
@@ -115,6 +123,8 @@ class BuildConfig:
   no_return_height_margin_m: float = 0.06
   """``safe``: how far past its pre-fault walk the robot may tip or sink and
   still count as upright (``no_return_step``)."""
+  no_return_max_lead_s: float = 1.5
+  """``safe``'s fall is at most this long before the robot is down."""
   fuse_back_s: tuple[float, ...] = (0.5, 1.0, 1.5)
   history_s: float = 2.0
   held_out: tuple[str, ...] = ("RL_calf_joint:LOCK",)
@@ -196,6 +206,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     cfg.no_return_tilt_margin_deg,
     cfg.no_return_height_margin_m,
     round(1.0 / step_dt),
+    round(cfg.no_return_max_lead_s / step_dt),
   )
 
   maps = torch.as_tensor(raw["map"][idx].astype(np.float32), device=device)
@@ -244,7 +255,11 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     put("pose", torch.cat([p[..., :2], yaw[..., None]], dim=-1))
     put("cmd_path", _integrate(cmd[:, s : s + r * nb], step_dt)[:, r - 1 :: r])
     hist = s - r * torch.arange(num_hist - 1, -1, -1, device=device)
-    put("history", torch.cat([state_all[:, hist], cmd[:, hist]], dim=-1))
+    put(
+      "history",
+      torch.cat([state_all[:, hist], cmd[:, hist], latent[:, hist]], dim=-1),
+    )
+    put("latent_future", latent[:, ends].half())
     put("tilt", tilt[:, ends])
     put("base_height", base_height[:, ends])
     put("collision", trunk[:, steps].any(dim=-1))
@@ -327,6 +342,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     "fall_height_m": cfg.fall_height_m,
     "no_return_tilt_margin_deg": cfg.no_return_tilt_margin_deg,
     "no_return_height_margin_m": cfg.no_return_height_margin_m,
+    "no_return_max_lead_s": cfg.no_return_max_lead_s,
     "fuse_back_s": list(cfg.fuse_back_s),
   }
   (shard / "meta.json").write_text(json.dumps(meta, indent=2))

@@ -11,6 +11,8 @@ state, HIM's latent, the last 2 s, and the known fault) and a 5 s plan
 - the velocity deviation ``dv``, an auxiliary target;
 - the fall hazard (``P(fallen by t)`` is monotone by construction), from
   which how soon a fall comes (P(fall within 1 s), the time to fall) is read;
+- with ``latent_head``, HIM's latent (auxiliary: how the policy itself sees
+  the robot responding, a dense signal tied to falls);
 - with ``contact_heads`` (phase 1's model), also trunk or head contact
   (``collision``), a contact landing off the map, and body-contact maps, one
   64x64 map per second of the plan. The planner sweeps the drift over the
@@ -52,16 +54,20 @@ class ImpactModelCfg:
   state_dim: int = 33
   latent_dim: int = 16
   history_steps: int = 20
-  history_dim: int = 36
+  history_dim: int = 52
+  """Per history step: state (33), command (3) and HIM's latent (16); 36
+  without the latent (phase 1, and reads the first 36 of newer shards)."""
   fault_params: int = 2
   logvar_range: tuple[float, float] = (-10.0, 4.0)
   contact_heads: bool = False
   """Also predict collision, off-map contact and contact maps (phase 1)."""
+  latent_head: bool = True
+  """Also predict HIM's latent per step (``latent_future``, auxiliary)."""
 
   @classmethod
   def from_saved(cls, saved: dict) -> ImpactModelCfg:
     """A checkpoint's config; ones saved before ``contact_heads`` had them."""
-    kw: dict[str, Any] = {"contact_heads": True}
+    kw: dict[str, Any] = {"contact_heads": True, "latent_head": False}
     kw |= {k: tuple(v) if isinstance(v, list) else v for k, v in saved.items()}
     return cls(**kw)
 
@@ -193,7 +199,9 @@ class ImpactModel(nn.Module):
     self.head_norm = nn.LayerNorm(d)
     # drift mean (3), drift log-variance (3), dv (3), hazard; then with
     # contact_heads, collision and offmap.
-    self.step_head = nn.Linear(d, 12 if cfg.contact_heads else 10)
+    self.step_head = nn.Linear(
+      d, 10 + 2 * cfg.contact_heads + cfg.latent_dim * cfg.latent_head
+    )
     self.contacts = ContactDecoder(d) if cfg.contact_heads else None
 
   def encode(self, batch: dict[str, torch.Tensor]) -> Context:
@@ -215,7 +223,8 @@ class ImpactModel(nn.Module):
       map_tok,
       self.state_in(n("state", batch["state"]))[:, None],
       self.latent_in(n("him_latent", batch["him_latent"]))[:, None],
-      self.history_in(n("history", batch["history"])) + self.history_pos,
+      self.history_in(n("history", batch["history"][..., : self.cfg.history_dim]))
+      + self.history_pos,
       fault_tok,
     ]
     tokens = torch.cat(
@@ -257,6 +266,9 @@ class ImpactModel(nn.Module):
       "hazard_logit": hazard,
       "p_fallen": 1 - log_up.exp(),
     }
+    if self.cfg.latent_head:
+      at = 10 + 2 * self.cfg.contact_heads
+      pred["latent"] = out[..., at : at + self.cfg.latent_dim]
     if self.contacts is None:
       return pred
     pred["collision_logit"] = out[..., 10]

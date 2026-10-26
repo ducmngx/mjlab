@@ -130,7 +130,8 @@ def _fake_batch(b: int = 3) -> dict[str, torch.Tensor]:
     ),
     "state": torch.randn(b, 33),
     "him_latent": torch.randn(b, 16),
-    "history": torch.randn(b, 20, 36),
+    "history": torch.randn(b, 20, 52),
+    "latent_future": torch.randn(b, t, 16),
     "fault": torch.tensor(NOMINAL).repeat(b, 12),
     "cmd_seq": torch.rand(b, t, 3),
     "cmd_path": torch.cumsum(torch.rand(b, t, 3) * 0.1, dim=1),
@@ -148,7 +149,7 @@ def _unit_stats() -> dict:
   dims = {
     "state": 33,
     "him_latent": 16,
-    "history": 36,
+    "history": 52,
     "cmd_seq": 3,
     "cmd_path": 3,
     "map": 1,
@@ -336,14 +337,22 @@ def test_v2_model_drops_the_contact_heads_and_learns_the_no_return_label():
   batch["safe"][0, 12:] = False  # Past the point of no return in step 12.
   pred = model(batch)
   assert {"collision_logit", "offmap_logit", "contact_logit"}.isdisjoint(pred)
+  assert pred["latent"].shape == (3, 50, 16)
   total, terms = impact_loss(pred, batch, LossWeights(fall_pos=5.0), 10, "safe")
-  assert set(terms) == {"drift", "dv", "fall"}
+  assert set(terms) == {"drift", "dv", "fall", "latent"}
+  # Weight 0 drops the latent target (the ablation).
+  _, terms0 = impact_loss(pred, batch, LossWeights(latent=0.0), 10, "safe")
+  assert "latent" not in terms0
   total.backward()  # One training step's gradient flows.
   m = impact_metrics(pred, batch, fall_label="safe")
   assert m["fell"].tolist() == [True, False, False]
   assert m["fell_soon"].tolist() == [False, False, False]  # Step 12 > 1 s.
-  # A phase 1 config (saved before contact_heads) still has them.
-  assert ImpactModelCfg.from_saved({"d_model": 32}).contact_heads
+  # A phase 1 config (saved before contact_heads) still has them, no latent
+  # head, and reads the first 36 of a newer shard's history.
+  old = ImpactModelCfg.from_saved({"d_model": 32, "history_dim": 36})
+  assert old.contact_heads and not old.latent_head
+  stats = _unit_stats() | {"history": {"mean": [0.0] * 36, "std": [1.0] * 36}}
+  assert ImpactModel(old, stats)(batch)["drift"].shape == (3, 50, 3)
 
 
 def test_no_return_is_when_the_robot_leaves_its_walk_for_good():
@@ -358,5 +367,9 @@ def test_no_return_is_when_the_robot_leaves_its_walk_for_good():
   height[1, 160:] = 0.1
   # 2: never falls.
   fall = torch.tensor([170, 160, t])
-  nr = no_return_step(tilt, height, fall, 100, 15.0, 0.06, 50)
+  nr = no_return_step(tilt, height, fall, 100, 15.0, 0.06, 50, 75)
   assert nr.tolist() == [150, 130, t]
+  # Capped: limping on tilted for long isn't falling yet (1 down at 160 is
+  # no earlier than 160 - 20).
+  nr = no_return_step(tilt, height, fall, 100, 15.0, 0.06, 50, 20)
+  assert nr.tolist() == [150, 140, t]

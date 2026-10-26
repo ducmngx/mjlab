@@ -256,7 +256,12 @@ def run(cfg: RunMppiConfig) -> dict:
 
   planner = Mppi(cfg.mppi, model, n, device)
   r = planner.substeps
-  hist = HistoryBuffer(n, round(cfg.history_s / cfg.mppi.sampler.step_s), 36, device)
+  # What a history step holds is the model's: state and command, then HIM's
+  # latent for models trained with it.
+  hist_dim = model.model.cfg.history_dim if isinstance(model, ImpactDynamics) else 36
+  hist = HistoryBuffer(
+    n, round(cfg.history_s / cfg.mppi.sampler.step_s), hist_dim, device
+  )
   back = [round(b / step_dt) for b in cfg.fuse_back_s]
   ring_len = max(back) + 1
   ring_pos = torch.zeros(n, ring_len, 3, device=device)
@@ -417,7 +422,7 @@ def run(cfg: RunMppiConfig) -> dict:
 
     if step % r:
       continue
-    hist.push(torch.cat([state, command.command], dim=-1))
+    hist.push(torch.cat([state, command.command, latent], dim=-1)[:, :hist_dim])
     if t < cfg.start_s:
       continue
 

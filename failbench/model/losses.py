@@ -4,6 +4,9 @@
   valid steps; the variance is what a planner's ``+- k sigma`` footprint
   sweep uses, so it is trained, not optional.
 - dv: Huber over upright, valid steps (auxiliary).
+- latent: squared error of HIM's predicted latent over upright, valid steps,
+  per dimension in units of its dataset spread (``latent_std``, from
+  ``stats.json``; auxiliary, 0 weight turns it off for an ablation).
 - fall: discrete-time hazard likelihood: ``log(1 - h)`` for every step
   before the fall, ``log h`` on the step it happens (up-weighted by
   ``fall_pos``: falls are rare), nothing after (the label, ``upright`` or
@@ -28,6 +31,7 @@ from mjlab.utils.lab_api.math import wrap_to_pi
 class LossWeights:
   drift: float = 1.0
   dv: float = 0.5
+  latent: float = 0.2
   fall: float = 1.0
   fall_pos: float = 1.0
   """Weight on the log-likelihood of the step a fall happens."""
@@ -98,9 +102,12 @@ def impact_loss(
   w: LossWeights,
   steps_per_map: int,
   fall_label: str = "upright",
+  latent_std: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
   """``fall_label``: the batch key the hazard learns (``upright``, or
-  ``safe`` for the point of no return)."""
+  ``safe`` for the point of no return). ``latent_std`` ``[16]``: the latent
+  target's scale; without it, the batch's own (only for tests: it shifts
+  with what the batch holds)."""
   valid = batch["valid"].bool()
   up = batch["upright"].bool() & valid
   target = drift_target(batch)
@@ -111,6 +118,11 @@ def impact_loss(
     "dv": _masked_mean(F.huber_loss(pred["dv"], batch["dv"], reduction="none"), up),
     "fall": hazard_nll(pred["hazard_logit"], batch[fall_label], valid, w.fall_pos),
   }
+  if "latent" in pred and "latent_future" in batch and w.latent > 0:
+    tgt = batch["latent_future"].float()
+    scale = tgt.flatten(0, 1).std(0) if latent_std is None else latent_std
+    scale = scale.clamp(min=1e-3)
+    terms["latent"] = _masked_mean(((pred["latent"] - tgt) / scale).square(), up)
   pw = torch.tensor(w.pos_weight, device=valid.device)
   for name, key in (("collision", "collision"), ("offmap", "contact_offmap")):
     if f"{name}_logit" not in pred:

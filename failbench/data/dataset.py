@@ -6,10 +6,11 @@ Shards are memory-mapped. Each item is a dict of tensors:
   known mask (``map_mode``: ``fused`` / ``single`` visibility with
   ``corrupt_map`` noise, or ``clean``: every cell, no noise);
 - ``state`` (33), ``state_true_vel`` (3), ``him_latent`` (16), ``history``
-  ``[20, 36]``, ``cmd_seq`` ``[T, 3]``, ``fault`` (24);
+  ``[20, 52]`` (``[20, 36]`` before the latent), ``cmd_seq`` ``[T, 3]``, ``fault`` (24);
 - targets ``dv`` / ``pose`` / ``cmd_path`` ``[T, 3]``, ``upright`` / ``collision`` /
-  ``valid`` / ``contact_offmap`` ``[T]``, ``safe`` ``[T]`` (shards built
-  with point-of-no-return labels), and with ``contacts`` ``contact``
+  ``valid`` / ``contact_offmap`` ``[T]``, ``safe`` ``[T]`` and
+  ``latent_future`` ``[T, 16]`` (shards built with them), and with
+  ``contacts`` ``contact``
   ``[T, H, W]`` rasterised from the CSR rows;
 - labels ``fault_family``, ``plan_hold``, ``terrain_id``, ``offset_s``.
 """
@@ -47,6 +48,10 @@ _PER_SAMPLE = (
   "plan_hold",
   "offset_s",
 )
+
+
+_OPTIONAL = ("safe", "latent_future")
+"""Targets only shards built since they were added have."""
 
 
 class FailBenchDataset(Dataset):
@@ -95,7 +100,7 @@ class FailBenchDataset(Dataset):
   def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
     s, row = (int(x) for x in self.index[index])
     a = self.shards[s]
-    keys = (*_PER_SAMPLE, "safe") if "safe" in a else _PER_SAMPLE
+    keys = (*_PER_SAMPLE, *(k for k in _OPTIONAL if k in a))
     item = {k: torch.from_numpy(np.array(a[k][row])) for k in keys}
     item["terrain_id"] = torch.tensor(self.metas[s]["terrain_id"])
 
