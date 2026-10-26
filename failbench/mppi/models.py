@@ -6,7 +6,9 @@ robots (``state``, ``him_latent``, ``history``, ``fault``, ``map``; see
 and returns, per plan and step:
 
 - ``drift``, ``drift_std`` ``[n, k, T, 3]``: predicted pose minus
-  ``cmd_path`` (x, y, yaw), and its per-axis spread;
+  ``cmd_path`` (x, y, yaw), and its per-axis standard deviation (for an
+  ``ImpactModel`` along and across the step's commanded heading; a sweep
+  uses only the xy norm, the same in any frame);
 - ``p_fallen`` ``[n, k, T]``: P(fallen by the end of the step);
 - models with contact heads only (phase 1, the stub): ``p_collision``
   ``[n, k, T]``, P(trunk or head contact in the step), and with
@@ -118,7 +120,7 @@ class ImpactDynamics:
     pred = {key: v.float().unflatten(0, (n, k)) for key, v in pred.items()}
     out = {
       "drift": pred["drift"],
-      "drift_std": torch.exp(0.5 * pred["drift_logvar"]),
+      "drift_std": pred["drift_std"],
       "p_fallen": pred["p_fallen"],
     }
     if "collision_logit" in pred:

@@ -18,7 +18,8 @@ family and terrain:
   until the robot is really on the ground (``upright``, whatever the
   label), the share of falls warned. Comparable across models trained on
   either label;
-- all of it per fault group (healthy, locked, weak, limp: torque 0).
+- all of it, with drift error and 2 sigma coverage, per fault group
+  (healthy, locked, weak, limp: torque 0).
 
 Writes ``<output_dir>/eval.json`` and ``reliability.png``. The map the model
 sees follows its training (``train_cfg.map_mode``) unless ``map_mode`` is
@@ -163,6 +164,8 @@ def evaluate_split(
         m["p_fell_soon"].numpy()[sel], e["fall_t"][sel], cfg.false_alarm
       ),
     }
+    for k in ("drift_err_1s", "drift_err_5s", "cover2s_1s", "cover2s_3s", "cover2s_5s"):
+      r[k] = float(np.nanmean(m[k].numpy()[sel]))
     return r
 
   out |= falls(np.ones(len(e["group"]), bool))

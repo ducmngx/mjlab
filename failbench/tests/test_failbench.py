@@ -29,7 +29,7 @@ from failbench.model.losses import (
   impact_loss,
   impact_metrics,
 )
-from failbench.model.model import ImpactModel, ImpactModelCfg
+from failbench.model.model import ImpactModel, ImpactModelCfg, rotate_xy
 from failbench.plans import PlanCfg, SegmentPlan
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
 from failbench.severity import DEFAULT_SEVERITY, SEVERITY, geom_severity
@@ -373,3 +373,31 @@ def test_no_return_is_when_the_robot_leaves_its_walk_for_good():
   # no earlier than 160 - 20).
   nr = no_return_step(tilt, height, fall, 100, 15.0, 0.06, 50, 20)
   assert nr.tolist() == [150, 140, t]
+
+
+def test_drift_is_spread_in_the_path_frame_with_heavy_tails():
+  torch.manual_seed(0)
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  stats = _unit_stats() | {"history": {"mean": [0.0] * 52, "std": [1e-4] * 52}}
+  model = ImpactModel(cfg, stats)
+  # The floor no longer squashes HIM's tiny latent spread.
+  one_spread = model.norm("history", torch.full((52,), 1e-4))
+  assert torch.allclose(one_spread, torch.ones(52))
+  batch = _fake_batch()
+  batch["cmd_path"][..., 2] = 0.7  # Heading 0.7 rad off the start frame.
+  pred = model(batch)
+  assert torch.allclose(
+    pred["drift"], rotate_xy(pred["drift_local"], pred["drift_yaw"])
+  )
+  assert torch.allclose(pred["drift_yaw"], batch["cmd_path"][..., 2])
+  # A throw 20 spreads off costs far less under the Student-t than a
+  # Gaussian: one rare big throw doesn't drag the spread of the rest.
+  far = dict(batch, pose=batch["cmd_path"] + 20 * pred["drift_std"].detach())
+  far["pose"] = far["pose"] + pred["drift"].detach()
+  w = LossWeights(latent=0.0)
+  gauss = impact_loss(pred, far, w, 10, drift_nu=0.0)[1]["drift"]
+  student = impact_loss(pred, far, w, 10, drift_nu=4.0)[1]["drift"]
+  assert student < gauss / 10
+  # Phase 1: start frame, Gaussian, the old floor.
+  old = ImpactModelCfg.from_saved({})
+  assert (old.drift_frame, old.drift_nu, old.norm_min_std) == ("start", 0.0, 1e-3)

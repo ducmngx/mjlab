@@ -4,10 +4,17 @@ Given what the robot knows at the start of a plan (the LiDAR map, its
 state, HIM's latent, the last 2 s, and the known fault) and a 5 s plan
 (``cmd_seq``, 50 steps of 0.1 s), it predicts per step:
 
-- drift from the plan's commanded path, ``pose - cmd_path`` (x, y, yaw), as
-  a Gaussian (mean and log-variance): the planner sweeps the robot's
-  footprint along ``cmd_path + drift +- k sigma`` over the map, so obstacle
-  avoidance is geometric and works on layouts never trained on;
+- drift from the plan's commanded path, ``pose - cmd_path`` (x, y, yaw): the
+  planner sweeps the robot's footprint along ``cmd_path + drift +- k sigma``
+  over the map, so obstacle avoidance is geometric and works on layouts
+  never trained on. Its spread is per axis of the step's own path frame
+  (``drift_frame="path"``: along and across the commanded heading, where a
+  turn no longer correlates the axes), and the likelihood is a Student-t
+  with ``drift_nu`` degrees of freedom so rare large throws widen the tails
+  instead of squeezing the middle (0: Gaussian, phase 1). ``drift`` comes
+  back in the start frame; ``drift_std`` is the per-axis standard deviation
+  in the path frame (``drift_yaw`` rotates it); a sweep only uses its xy
+  norm, the same in either frame;
 - the velocity deviation ``dv``, an auxiliary target;
 - the fall hazard (``P(fallen by t)`` is monotone by construction), from
   which how soon a fall comes (P(fall within 1 s), the time to fall) is read;
@@ -59,6 +66,15 @@ class ImpactModelCfg:
   without the latent (phase 1, and reads the first 36 of newer shards)."""
   fault_params: int = 2
   logvar_range: tuple[float, float] = (-10.0, 4.0)
+  drift_frame: str = "path"
+  """``path``: drift spread per axis of the commanded heading at each step;
+  ``start``: of the start frame (phase 1)."""
+  drift_nu: float = 4.0
+  """Student-t degrees of freedom of the drift likelihood (> 2); 0 for a
+  Gaussian (phase 1)."""
+  norm_min_std: float = 1e-6
+  """Input normalisation floor; HIM's latent moves by about 1e-3 per
+  dimension, which phase 1's 1e-3 floor squashed."""
   contact_heads: bool = False
   """Also predict collision, off-map contact and contact maps (phase 1)."""
   latent_head: bool = True
@@ -67,19 +83,38 @@ class ImpactModelCfg:
   @classmethod
   def from_saved(cls, saved: dict) -> ImpactModelCfg:
     """A checkpoint's config; ones saved before ``contact_heads`` had them."""
-    kw: dict[str, Any] = {"contact_heads": True, "latent_head": False}
+    kw: dict[str, Any] = {
+      "contact_heads": True,
+      "latent_head": False,
+      "drift_frame": "start",
+      "drift_nu": 0.0,
+      "norm_min_std": 1e-3,
+    }
     kw |= {k: tuple(v) if isinstance(v, list) else v for k, v in saved.items()}
     return cls(**kw)
+
+
+def rotate_xy(v: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+  """``v [..., 3]`` (x, y, yaw) with its xy rotated by ``yaw [...]``."""
+  c, s = torch.cos(yaw), torch.sin(yaw)
+  x, y = v[..., 0], v[..., 1]
+  return torch.stack([c * x - s * y, s * x + c * y, v[..., 2]], dim=-1)
 
 
 class Normalizer(nn.Module):
   """Fixed per-channel ``(x - mean) / std`` from ``stats.json``."""
 
-  def __init__(self, stats: dict[str, dict[str, list[float]]], keys: list[str]):
+  def __init__(
+    self,
+    stats: dict[str, dict[str, list[float]]],
+    keys: list[str],
+    min_std: float = 1e-3,
+  ):
     super().__init__()
     for k in keys:
       self.register_buffer(f"{k}_mean", torch.tensor(stats[k]["mean"]))
-      self.register_buffer(f"{k}_std", torch.tensor(stats[k]["std"]).clamp(min=1e-3))
+      std = torch.tensor(stats[k]["std"]).clamp(min=min_std)
+      self.register_buffer(f"{k}_std", std)
 
   def forward(self, key: str, x: torch.Tensor) -> torch.Tensor:
     return (x - getattr(self, f"{key}_mean")) / getattr(self, f"{key}_std")
@@ -148,10 +183,14 @@ class Context:
 class ImpactModel(nn.Module):
   def __init__(self, cfg: ImpactModelCfg, stats: dict):
     super().__init__()
+    if 0 < cfg.drift_nu <= 2:
+      raise ValueError("drift_nu must be over 2 (a finite variance) or 0.")
     self.cfg = cfg
     d = cfg.d_model
     self.norm = Normalizer(
-      stats, ["state", "him_latent", "history", "cmd_seq", "cmd_path", "map"]
+      stats,
+      ["state", "him_latent", "history", "cmd_seq", "cmd_path", "map"],
+      cfg.norm_min_std,
     )
     self.map_encoder = MapEncoder(d)
     grid = cfg.map_cells // 8
@@ -259,9 +298,16 @@ class ImpactModel(nn.Module):
     hazard = out[..., 9]
     # P(upright at t) = prod (1 - sigmoid(hazard)) up to t.
     log_up = torch.cumsum(nn.functional.logsigmoid(-hazard), dim=1)
+    logvar = out[..., 3:6].clamp(lo, hi)
+    yaw = cmd_path[..., 2] if self.cfg.drift_frame == "path" else 0 * cmd_path[..., 2]
+    nu = self.cfg.drift_nu
+    t_var = nu / (nu - 2) if nu > 0 else 1.0  # A Student-t's variance per scale^2.
     pred = {
-      "drift": out[..., 0:3],
-      "drift_logvar": out[..., 3:6].clamp(lo, hi),
+      "drift": rotate_xy(out[..., 0:3], yaw),
+      "drift_local": out[..., 0:3],
+      "drift_logvar": logvar,
+      "drift_std": torch.exp(0.5 * logvar) * t_var**0.5,
+      "drift_yaw": yaw,
       "dv": out[..., 6:9],
       "hazard_logit": hazard,
       "p_fallen": 1 - log_up.exp(),

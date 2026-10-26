@@ -94,7 +94,13 @@ def evaluate(
       pred = model(batch)
     pred = {k: v.float() for k, v in pred.items()}
     total, terms = impact_loss(
-      pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label, latent_std
+      pred,
+      batch,
+      cfg.loss,
+      cfg.model.steps_per_map,
+      cfg.fall_label,
+      latent_std,
+      cfg.model.drift_nu,
     )
     b = batch["state"].shape[0]
     n += b
@@ -190,7 +196,13 @@ def main():
         pred = model(batch)
       pred = {k: v.float() for k, v in pred.items()}
       total, terms = impact_loss(
-        pred, batch, cfg.loss, cfg.model.steps_per_map, cfg.fall_label, latent_std
+        pred,
+        batch,
+        cfg.loss,
+        cfg.model.steps_per_map,
+        cfg.fall_label,
+        latent_std,
+        cfg.model.drift_nu,
       )
       opt.zero_grad(set_to_none=True)
       total.backward()

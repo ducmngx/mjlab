@@ -1,8 +1,10 @@
 """Losses and metrics for ``ImpactModel`` on ``FailBenchDataset`` batches.
 
-- drift: Gaussian NLL of ``pose - cmd_path`` (yaw wrapped) over upright,
-  valid steps; the variance is what a planner's ``+- k sigma`` footprint
-  sweep uses, so it is trained, not optional.
+- drift: NLL of ``pose - cmd_path`` (yaw wrapped) over upright, valid
+  steps, in the model's drift frame (``pred["drift_yaw"]``: the path frame,
+  or the start frame), Gaussian or Student-t (``drift_nu``); the spread is
+  what a planner's ``+- k sigma`` footprint sweep uses, so it is trained,
+  not optional.
 - dv: Huber over upright, valid steps (auxiliary).
 - latent: squared error of HIM's predicted latent over upright, valid steps,
   per dimension in units of its dataset spread (``latent_std``, from
@@ -24,6 +26,7 @@ import torch
 from torch.nn import functional as F
 
 from failbench.faults import FaultFamily
+from failbench.model.model import rotate_xy
 from mjlab.utils.lab_api.math import wrap_to_pi
 
 
@@ -46,6 +49,13 @@ class LossWeights:
 def drift_target(batch: dict[str, torch.Tensor]) -> torch.Tensor:
   d = batch["pose"] - batch["cmd_path"]
   return torch.cat([d[..., :2], wrap_to_pi(d[..., 2:])], dim=-1)
+
+
+def local_target(
+  pred: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
+) -> torch.Tensor:
+  """The drift target in the model's drift frame (``pred["drift_yaw"]``)."""
+  return rotate_xy(drift_target(batch), -pred["drift_yaw"])
 
 
 def contact_target(batch: dict[str, torch.Tensor], steps_per_map: int) -> torch.Tensor:
@@ -103,16 +113,20 @@ def impact_loss(
   steps_per_map: int,
   fall_label: str = "upright",
   latent_std: torch.Tensor | None = None,
+  drift_nu: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
   """``fall_label``: the batch key the hazard learns (``upright``, or
   ``safe`` for the point of no return). ``latent_std`` ``[16]``: the latent
   target's scale; without it, the batch's own (only for tests: it shifts
-  with what the batch holds)."""
+  with what the batch holds). ``drift_nu``: the model's (0: Gaussian)."""
   valid = batch["valid"].bool()
   up = batch["upright"].bool() & valid
-  target = drift_target(batch)
   logvar = pred["drift_logvar"]
-  nll = 0.5 * ((target - pred["drift"]) ** 2 * torch.exp(-logvar) + logvar)
+  z2 = (local_target(pred, batch) - pred["drift_local"]) ** 2 * torch.exp(-logvar)
+  if drift_nu > 0:
+    nll = 0.5 * logvar + 0.5 * (drift_nu + 1) * torch.log1p(z2 / drift_nu)
+  else:
+    nll = 0.5 * (z2 + logvar)
   terms = {
     "drift": _masked_mean(nll, up),
     "dv": _masked_mean(F.huber_loss(pred["dv"], batch["dv"], reduction="none"), up),
@@ -121,7 +135,7 @@ def impact_loss(
   if "latent" in pred and "latent_future" in batch and w.latent > 0:
     tgt = batch["latent_future"].float()
     scale = tgt.flatten(0, 1).std(0) if latent_std is None else latent_std
-    scale = scale.clamp(min=1e-3)
+    scale = scale.clamp(min=1e-6)
     terms["latent"] = _masked_mean(((pred["latent"] - tgt) / scale).square(), up)
   pw = torch.tensor(w.pos_weight, device=valid.device)
   for name, key in (("collision", "collision"), ("offmap", "contact_offmap")):
@@ -181,11 +195,11 @@ def impact_metrics(
     out[f"drift_err_{s}s"] = torch.where(up[:, k], err[:, k], float("nan"))
     zero = drift_target(batch)[:, k, :2].norm(dim=-1)
     out[f"zero_err_{s}s"] = torch.where(up[:, k], zero, float("nan"))
-    # Fraction of true drifts inside the predicted 2-sigma ellipse (axis).
-    sigma = torch.exp(0.5 * pred["drift_logvar"][:, k, :2])
-    inside = (
-      (drift_target(batch)[:, k, :2] - pred["drift"][:, k, :2]).abs() <= 2 * sigma
-    ).all(dim=-1)
+    # Fraction of true drifts inside the predicted +-2 sigma box (the model's
+    # drift frame).
+    sigma = pred["drift_std"][:, k, :2]
+    off = local_target(pred, batch)[:, k, :2] - pred["drift_local"][:, k, :2]
+    inside = (off.abs() <= 2 * sigma).all(dim=-1)
     out[f"cover2s_{s}s"] = torch.where(up[:, k], inside.float(), float("nan"))
   return out
 
