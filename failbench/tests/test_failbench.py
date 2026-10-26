@@ -423,3 +423,17 @@ def test_a_fall_is_down_for_good_with_the_trunk_on_the_ground():
   assert falls.tolist() == [t, t, 140, t]
   loose = BuildConfig(raw=(), output_dir="", fall_needs_contact=False)
   assert fall_step(tilt, height, contact, 100, loose, 25).tolist() == [t, t, 140, 140]
+
+
+def test_the_latent_head_starts_at_the_scale_of_its_target():
+  # HIM's latent moves by about 2e-3; an untrained head must not start
+  # hundreds of spreads off, or the latent loss swamps the rest.
+  torch.manual_seed(0)
+  stats = _unit_stats() | {"him_latent": {"mean": [0.01] * 16, "std": [2e-3] * 16}}
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  model = ImpactModel(cfg, stats)
+  batch = _fake_batch()
+  batch["latent_future"] = 0.01 + 2e-3 * torch.randn(3, 50, 16)
+  std = torch.full((16,), 2e-3)
+  _, terms = impact_loss(model(batch), batch, LossWeights(), 10, latent_std=std)
+  assert terms["latent"] < 10

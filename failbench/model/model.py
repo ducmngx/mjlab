@@ -314,7 +314,10 @@ class ImpactModel(nn.Module):
     }
     if self.cfg.latent_head:
       at = 10 + 2 * self.cfg.contact_heads
-      pred["latent"] = out[..., at : at + self.cfg.latent_dim]
+      # Predicted in normalised units (an output of order 1 at the start),
+      # returned in the latent's own.
+      z = out[..., at : at + self.cfg.latent_dim]
+      pred["latent"] = z * self.norm.him_latent_std + self.norm.him_latent_mean
     if self.contacts is None:
       return pred
     pred["collision_logit"] = out[..., 10]
