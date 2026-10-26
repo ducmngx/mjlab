@@ -281,3 +281,28 @@ def test_a_nearer_hit_costs_more_when_discounted():
   heavy = _wall_costs(1.0, CostWeights(discount_per_s=0.7, fault_risk=5.0))
   assert torch.isclose(heavy["fault_risk"], 5 * near["fault_risk"])
   assert torch.equal(heavy["obstacle"], near["obstacle"])
+
+
+def test_fault_risk_prices_only_the_named_faults():
+  cfg = MppiCfg(fault_risk=FaultRiskCfg(p=0.2, mode_share=(3.0, 1.0)))
+  branches, prior = Mppi(cfg, _Thrown(), 1, "cpu")._branches(12, "cpu")
+  params = branches.view(-1, 12, 2)
+  assert len(branches) == 8 and torch.isclose(prior.sum(), torch.tensor(0.2))
+  # Front hips go limp (torque 0); the limp branches share 3/4 of p.
+  assert params[0, 0, 0] == 0 and params[1, 3, 0] == 0
+  assert torch.allclose(prior[:4], torch.tensor(0.15 / 4))
+  limp_only = MppiCfg(fault_risk=FaultRiskCfg(p=0.2, modes=("free",)))
+  branches, prior = Mppi(limp_only, _Thrown(), 1, "cpu")._branches(12, "cpu")
+  assert len(branches) == 4 and torch.allclose(prior, torch.tensor(0.05))
+
+
+def test_fault_risk_reports_each_branch():
+  h = torch.zeros(1, 160, 160)
+  h[:, :66] = -0.6  # A ledge 0.7 m to the right.
+  _, out = _side(_Thrown(), h, p=0.1, cycles=2)
+  names = Mppi(MppiCfg(fault_risk=FaultRiskCfg(modes=("free",))), _Thrown(), 1, "cpu")
+  assert out["risk_branch"].shape == (1, 4)
+  assert names.branch_names()[0] == "FL_hip_joint:free"
+  # FL hip (even joint) is thrown right, onto the ledge; FR hip left.
+  assert out["risk_branch"][0, 0] > 0 and out["risk_branch"][0, 1] == 0
+  assert out["risk_thrown"].shape[:3] == (1, 6, 4)

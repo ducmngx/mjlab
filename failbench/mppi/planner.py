@@ -47,11 +47,11 @@ plans' predicted paths.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 
-from failbench.faults import LOCK, NOMINAL, TORQUE, encode_fault
+from failbench.faults import JOINT_NAMES, LOCK, NOMINAL, TORQUE, encode_fault
 from failbench.mppi.costmap import (
   FootprintCfg,
   distance_field,
@@ -101,14 +101,36 @@ class CostWeights:
   hit in 1 s costs more than the same hit in 5 s. 1 weighs every step alike."""
 
 
+VULNERABLE_FAULTS = (
+  "FL_hip_joint:free",
+  "FR_hip_joint:free",
+  "RL_thigh_joint:free",
+  "RR_thigh_joint:free",
+  "FL_calf_joint:lock",
+  "FR_calf_joint:lock",
+  "RL_thigh_joint:lock",
+  "RR_thigh_joint:lock",
+)
+"""Each leg's worst limp and worst seized joint in the data (from the fault
+time, by falls within 5 s, then by throw): limp front hips fell 56-58% of
+the time, front calves seizing 14-32%. Rear seizures barely fall (1-2%) so
+the rear pick is the one that throws furthest, the thigh (1.2-1.4 m by
+5 s); RR's limp hip and thigh are close (28% vs 30%), thigh kept for
+symmetry. Weak (partial torque) faults fell at most 4% and aren't priced."""
+
+
 @dataclass(frozen=True)
 class FaultRiskCfg:
   p: float = 0.0
   """Probability a fault fires during the plan, split over the branches
-  (``mode_share``, then evenly over joints) and spread evenly over the
-  firing points; 0 turns the term off."""
+  (``mode_share``, then evenly over each mode's joints) and spread evenly
+  over the firing points; 0 turns the term off."""
+  faults: tuple[str, ...] | None = VULNERABLE_FAULTS
+  """Branches as ``joint:mode`` pairs, a joint going limp (``free``,
+  torque 0) or seizing (``lock``); None: every joint in each of
+  ``modes``."""
   modes: tuple[str, ...] = ("free", "lock")
-  """Branches: each joint going limp (torque 0) and/or seizing."""
+  """The modes priced; ``faults`` in other modes are skipped."""
   mode_share: tuple[float, ...] | None = None
   """Each mode's share of ``p`` (normalised); None: equal."""
   fire_s: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
@@ -191,60 +213,95 @@ class Mppi:
     self.plan = torch.cat([self.plan[:, 1:], self.plan[:, -1:]], dim=1)
     return self.plan[:, 0]
 
-  def _branches(self, num_joints: int, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encoded single-joint faults ``[B, J * 2]``, ``FaultRiskCfg.modes``
-    over every joint, and their priors ``[B]`` (summing to ``p``)."""
+  def _pairs(self, num_joints: int) -> list[tuple[int, str]]:
+    """The fault branches as (joint index, mode)."""
     fr = self.cfg.fault_risk
-    share = torch.tensor(fr.mode_share or [1.0] * len(fr.modes), device=device)
+    if fr.faults is None:
+      pairs = [(j, m) for m in fr.modes for j in range(num_joints)]
+    else:
+      if num_joints != len(JOINT_NAMES):
+        raise ValueError(f"Named faults need the {len(JOINT_NAMES)} Go2 joints.")
+      split = [f.split(":") for f in fr.faults]
+      pairs = [(JOINT_NAMES.index(j), m) for j, m in split if m in fr.modes]
+    for _, mode in pairs:
+      if mode not in ("free", "lock"):
+        raise ValueError(f"Unknown fault mode {mode!r}.")
+    return pairs
+
+  def branch_names(self, num_joints: int = len(JOINT_NAMES)) -> list[str]:
+    """``joint:mode`` per fault branch, in ``risk_branch`` order."""
+    names = JOINT_NAMES if num_joints == len(JOINT_NAMES) else range(num_joints)
+    return [f"{names[j]}:{m}" for j, m in self._pairs(num_joints)]
+
+  def _branches(self, num_joints: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encoded single-joint faults ``[B, J * 2]`` (``FaultRiskCfg.faults``
+    in ``modes``) and their priors ``[B]`` (summing to ``p``)."""
+    fr = self.cfg.fault_risk
+    share = fr.mode_share or [1.0] * len(fr.modes)
     if len(share) != len(fr.modes):
       raise ValueError("mode_share needs one share per mode.")
-    prior = (fr.p * share / share.sum()).repeat_interleave(num_joints) / num_joints
-    params = []
-    for mode in fr.modes:
-      p = torch.tensor(NOMINAL, device=device).repeat(num_joints, num_joints, 1)
-      j = torch.arange(num_joints, device=device)
-      if mode == "free":
-        p[j, j, TORQUE] = 0.0
-      elif mode == "lock":
-        p[j, j, LOCK] = 1.0
-      else:
-        raise ValueError(f"Unknown fault mode {mode!r}.")
-      params.append(p)
-    return encode_fault(torch.cat(params)), prior
+    pairs = self._pairs(num_joints)
+    per_mode = {m: sum(pm == m for _, pm in pairs) for m in fr.modes}
+    total = sum(share[i] for i, m in enumerate(fr.modes) if per_mode[m])
+    prior = [fr.p * share[fr.modes.index(m)] / total / per_mode[m] for _, m in pairs]
+    params = torch.tensor(NOMINAL, device=device).repeat(len(pairs), num_joints, 1)
+    for b, (j, mode) in enumerate(pairs):
+      params[b, j, TORQUE if mode == "free" else LOCK] = 0.0 if mode == "free" else 1.0
+    return encode_fault(params), torch.tensor(prior, device=device)
 
-  def _fault_risk(
-    self,
-    inputs: dict[str, torch.Tensor],
-    plans: torch.Tensor,
-    pose: torch.Tensor,
-    fields: list[tuple[float, torch.Tensor]],
-    resolution: float,
-  ) -> torch.Tensor:
-    """Expected severity of a fault's throw per plan ``[n, k]``: over
-    branches (by prior) and firing points (mean), over ``fields`` (severity,
-    distance field), severity times P(touch or fall onto)."""
+  def _throws(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Each fault branch fired now, the robot holding each ``hold_vx``:
+    ``thrown`` path ``[n, V, B, Tp, 3]`` (robot frame), its ``std`` and
+    ``p_fall``, and the branches' ``prior [B]``. One model call per cycle,
+    shared by every plan."""
     c, fr = self.cfg, self.cfg.fault_risk
-    n, k = pose.shape[:2]
     s = c.sampler
-    if not fields:
-      return pose.new_zeros(n, k)
-    branches, prior = self._branches(inputs["fault"].shape[-1] // 2, pose.device)
+    n = inputs["fault"].shape[0]
+    device = inputs["fault"].device
+    branches, prior = self._branches(inputs["fault"].shape[-1] // 2, device)
     nb = len(branches)
-    vxs = torch.tensor(fr.hold_vx, device=pose.device)
+    vxs = torch.tensor(fr.hold_vx, device=device)
     nv = len(vxs)
     # Each branch, fired now, the robot holding each speed: [n, V, B] rows.
     rep = {key: v.repeat_interleave(nv * nb, dim=0) for key, v in inputs.items()}
     rep["fault"] = branches.repeat(n * nv, 1).to(inputs["fault"].dtype)
-    held = torch.zeros(n, nv, nb, 1, s.steps, 3, device=pose.device)
+    held = torch.zeros(n, nv, nb, 1, s.steps, 3, device=device)
     held[..., 0] = vxs[None, :, None, None, None]
     held = held.flatten(0, 2)
     throw = self.model.predict(rep, held, self._path(held))
     tp = round(fr.post_s / s.step_s)
     # Drift is off the held command's own path; the throw is both.
     thrown = (self._path(held) + throw["drift"])[:, 0, :tp]
-    d = thrown.unflatten(0, (n, nv, nb))  # [n, V, B, Tp, 3]
-    sd = throw["drift_std"][:, 0, :tp].unflatten(0, (n, nv, nb))
-    fall = throw["p_fallen"][:, 0, :tp].unflatten(0, (n, nv, nb))
+    return {
+      "thrown": thrown.unflatten(0, (n, nv, nb)),
+      "std": throw["drift_std"][:, 0, :tp].unflatten(0, (n, nv, nb)),
+      "p_fall": throw["p_fallen"][:, 0, :tp].unflatten(0, (n, nv, nb)),
+      "prior": prior,
+    }
+
+  def _fault_risk(
+    self,
+    throws: dict[str, torch.Tensor],
+    plans: torch.Tensor,
+    pose: torch.Tensor,
+    fields: list[tuple[float, torch.Tensor]],
+    resolution: float,
+    per_branch: bool = False,
+  ) -> torch.Tensor | dict[str, torch.Tensor]:
+    """Expected severity of a fault's throw per plan ``[n, k]``: over
+    branches (by prior) and firing points (mean), over ``fields`` (severity,
+    distance field), severity times P(touch or fall onto). ``per_branch``:
+    instead each branch's share ``cost [n, k, B]`` (prior-weighted; they sum
+    to the total) and the throws ``placed`` at the firing points
+    ``[n, k, F, B, Tp, 3]`` (map frame) with their ``std`` and ``p_fall``."""
+    c, fr = self.cfg, self.cfg.fault_risk
+    n, k = pose.shape[:2]
+    s = c.sampler
+    prior = throws["prior"]
+    nb = len(prior)
+    vxs = torch.tensor(fr.hold_vx, device=pose.device)
+    d, sd, fall = throws["thrown"], throws["std"], throws["p_fall"]
+    tp = d.shape[-2]
     # Placed at each firing point's pose on every plan, from the held speed
     # nearest the plan's there.
     at = torch.tensor([round(t / s.step_s) - 1 for t in fr.fire_s], device=pose.device)
@@ -279,6 +336,8 @@ class Mppi:
       )
       hit = torch.maximum(touch, onto).view(n, k, nf, nb, tp)
       cost = cost + severity * (disc * hit).amax(-1)
+    if per_branch:
+      return {"cost": cost.mean(2) * prior, "placed": placed, "std": sd, "p_fall": fall}
     return cost.mean(2) @ prior
 
   def _risk_fields(
@@ -367,10 +426,14 @@ class Mppi:
       * ((self.still_s - c.idle_after_s) / c.idle_ramp_s).clamp(0, 1)[:, None]
       * (1 - pose[..., :2].norm(dim=-1).amax(-1) / c.idle_move_m).clamp(min=0),
     }
+    throws = None
     if c.fault_risk.p > 0:
-      risk = w.fault_risk * self._fault_risk(
-        inputs, plans, pose, risk_fields or [], resolution
-      )
+      if risk_fields:
+        throws = self._throws(inputs)
+        risk = self._fault_risk(throws, plans, pose, risk_fields, resolution)
+        risk = w.fault_risk * cast(torch.Tensor, risk)
+      else:
+        risk = pose.new_zeros(pose.shape[:2])
       if exposed is not None:
         risk = risk * exposed[:, None]
       terms["fault_risk"] = risk
@@ -392,6 +455,7 @@ class Mppi:
       "cost": cost,
       "weight": weight,
       "plan": deadband((weight[..., None, None] * plans).sum(1), c.zero_below),
+      "throws": throws,
     }
 
   @torch.no_grad()
@@ -496,6 +560,20 @@ class Mppi:
     }
     if "contact" in mine_pred:
       out["pred_contact"] = mine_pred["contact"][:, 0]
+    if sc["throws"] is not None and risk_fields:
+      # What each fault branch would do to the plan being run, for logs.
+      mine_pose = mine_path + mine_pred["drift"]
+      br = self._fault_risk(
+        sc["throws"], mine, mine_pose, risk_fields, resolution, per_branch=True
+      )
+      br = cast(dict[str, torch.Tensor], br)
+      scale = c.weights.fault_risk
+      if exposed is not None:
+        scale = scale * exposed[:, None]
+      out["risk_branch"] = scale * br["cost"][:, 0]
+      out["risk_thrown"] = br["placed"][:, 0]
+      out["risk_thrown_std"] = br["std"][:, 0]
+      out["risk_p_fall"] = br["p_fall"][:, 0]
     if explain_inputs is not None:
       alt = self.score(
         explain_inputs,

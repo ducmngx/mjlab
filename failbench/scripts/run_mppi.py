@@ -79,7 +79,7 @@ from failbench.goals import sample_goal
 from failbench.mppi.costmap import distance_field, obstacle_cells
 from failbench.mppi.inputs import HistoryBuffer, crop_center
 from failbench.mppi.models import DynamicsModel, ImpactDynamics, ZeroDriftModel
-from failbench.mppi.planner import Mppi, MppiCfg
+from failbench.mppi.planner import VULNERABLE_FAULTS, Mppi, MppiCfg
 from failbench.scripts.generate import policy_estimates
 from failbench.sensing import LidarCfg, NoiseCfg, corrupt_map
 from failbench.severity import DROP_SEVERITY, geom_severity
@@ -102,9 +102,11 @@ FAMILIES = {
   "lock": FaultMixture(probs=(0.0, 1.0, 0.0)),
   "weak": FaultMixture(probs=(0.0, 0.0, 1.0)),
   "free": FaultMixture(probs=(0.0, 0.0, 1.0), limp_prob=1.0),
+  "priced": FaultMixture(pairs=VULNERABLE_FAULTS),
 }
 """Fault mixture per ``--family``; ``free`` is WEAK at zero torque only (a
-limp joint, heat_bench's FREE)."""
+limp joint, heat_bench's FREE); ``priced`` is one of the fault-risk
+planner's default faults (``VULNERABLE_FAULTS``), uniformly."""
 
 
 @dataclass(frozen=True)
@@ -133,7 +135,7 @@ class RunMppiConfig:
   num_envs: int = 16
   duration_s: float = 30.0
   fault_time_s: tuple[float, float] = (4.0, 8.0)
-  family: Literal["mixture", "nominal", "lock", "weak", "free"] = "mixture"
+  family: Literal["mixture", "nominal", "lock", "weak", "free", "priced"] = "mixture"
   start_s: float = 2.5
   """MPPI takes over from the goal follower (history and fused poses full)."""
   map_cells: int = 160
@@ -319,6 +321,8 @@ def run(cfg: RunMppiConfig) -> dict:
   num_maps = num_cycles // every + 1 if every else 0
   maps = np.full((n, num_maps, cells, cells), np.nan, np.float16)
   obstacles = np.zeros((n, num_maps, cells, cells), bool)
+  map_severity = np.zeros((n, num_maps, cells, cells), np.uint8)
+  risk_log: dict[str, np.ndarray] = {}
   ex: dict[str, np.ndarray] = {}
   if cfg.explain:
     K, sub = cfg.mppi.sampler.num_plans, T // 5
@@ -568,6 +572,7 @@ def run(cfg: RunMppiConfig) -> dict:
     if every and (step // r) % every == 0:
       m = (step // r) // every
       maps[:, m] = plan_h.cpu().numpy()
+      map_severity[:, m] = severity.clamp(0, 255).round().byte().cpu().numpy()
       obstacles[:, m] = (
         obstacle_cells(plan_h, cfg.mppi.footprint.wall_jump_m).cpu().numpy()
       )
@@ -598,6 +603,20 @@ def run(cfg: RunMppiConfig) -> dict:
         np.nan,
       )
     on = active.cpu().numpy()
+    if "risk_branch" in out:
+      # Each fault branch's share of the run plan's fault risk, and where
+      # it would throw the robot from each firing point (world frame).
+      thrown = out["risk_thrown"]  # [n, F, B, Tp, 3]
+      thrown_w = _to_world(thrown.flatten(1, 3), pos, yaw).view(*thrown.shape[:-1], 2)
+      for k, v in {
+        "risk_branch": out["risk_branch"],
+        "risk_thrown_w": thrown_w,
+        "risk_thrown_std": out["risk_thrown_std"][..., :2].amax(-1),
+        "risk_p_fall": out["risk_p_fall"][..., -1],
+      }.items():
+        if k not in risk_log:
+          risk_log[k] = np.full((n, num_cycles, *v.shape[1:]), np.nan, np.float16)
+        risk_log[k][on, c] = v[active].cpu().numpy()
     if "pred_contact" in out:
       probs = (out["pred_contact"][active].clamp(0, 1) * 255).round().byte()
       contact[on, c] = probs.cpu().numpy()
@@ -672,6 +691,7 @@ def run(cfg: RunMppiConfig) -> dict:
     **{f"dense_{k}": v for k, v in log.items()},
     **{f"cycle_{k}": v for k, v in cyc.items()},
     **{f"cycle_{k}": v for k, v in cost_logs.items()},
+    **{f"cycle_{k}": v for k, v in risk_log.items()},
   }
   np.savez_compressed(
     out_path.parent / f"{out_path.name}.npz",
@@ -679,12 +699,14 @@ def run(cfg: RunMppiConfig) -> dict:
     **arrays,
     map_height=maps,
     map_obstacle=obstacles,
+    map_severity=map_severity,
     cycle_clearance=clearance,
     contact_prob=contact,
     contact_height=contact_height,
     map_every=np.array(every),
     **{f"explain_{k}": v for k, v in ex.items()},
     fault_aware=np.array(cfg.fault_aware),
+    risk_faults=np.array(planner.branch_names() if risk_log else []),
     goal_w=command.goal_w.cpu().numpy(),
     waypoints_w=goal_term.waypoints.cpu().numpy(),
     fault_params=fault.params.cpu().numpy(),

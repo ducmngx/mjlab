@@ -38,6 +38,13 @@ NOMINAL = (1.0, 0.0)
 
 FAULT_TERM = "kinodynamic_fault"
 
+JOINT_NAMES = tuple(
+  f"{leg}_{joint}_joint"
+  for leg in ("FL", "FR", "RL", "RR")
+  for joint in ("hip", "thigh", "calf")
+)
+"""The Go2's joints in the robot's (and the data's) order, three per leg."""
+
 
 class FaultFamily(IntEnum):
   NOMINAL = 0
@@ -58,6 +65,10 @@ class FaultMixture:
   """Uniform torque scale for WEAK."""
   limp_prob: float = 0.25
   """WEAK: probability the torque is exactly 0 (fully limp)."""
+  pairs: tuple[str, ...] | None = None
+  """Instead of the families: one of these ``joint:mode`` faults per env,
+  uniformly (``free`` = limp, ``lock`` = seized), as the planner's
+  ``FaultRiskCfg.faults``."""
 
 
 def _uniform(shape, lo: float, hi: float, device) -> torch.Tensor:
@@ -69,6 +80,16 @@ def sample_fault_params(
 ) -> tuple[torch.Tensor, torch.Tensor]:
   """Fault parameters ``[n, num_joints, 2]`` and family ``[n]`` per env."""
   params = torch.tensor(NOMINAL, device=device).repeat(n, num_joints, 1)
+  if mix.pairs is not None:
+    split = [f.split(":") for f in mix.pairs]
+    joints = torch.tensor([JOINT_NAMES.index(j) for j, _ in split], device=device)
+    locked = torch.tensor([m == "lock" for _, m in split], device=device)
+    pick = torch.randint(len(split), (n,), device=device)
+    rows, j, lock = torch.arange(n, device=device), joints[pick], locked[pick]
+    params[rows, j, LOCK] = lock.float()
+    params[rows, j, TORQUE] = torch.where(lock, 1.0, 0.0)
+    family = torch.where(lock, FaultFamily.LOCK, FaultFamily.WEAK)
+    return params, family
   probs = torch.tensor(mix.probs, device=device)
   family = torch.multinomial(probs / probs.sum(), n, replacement=True)
   joint = torch.randint(num_joints, (n,), device=device)

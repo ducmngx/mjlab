@@ -19,6 +19,7 @@ from failbench.data.build import (
 from failbench.data.dataset import FailBenchDataset
 from failbench.faults import (
   FAULT_TERM,
+  JOINT_NAMES,
   LOCK,
   NOMINAL,
   TORQUE,
@@ -471,3 +472,15 @@ def test_the_held_out_faults_go_to_test_fault_on_every_terrain_seed():
   for seed in (2, 10, 11):  # train, test_terrain and val seeds
     split = _split(seed, family, params, joints, cfg)
     assert [s == 3 for s in split] == [held for *_, held in cases]
+
+
+def test_priced_faults_draw_only_the_named_pairs():
+  pairs = ("FR_hip_joint:free", "RL_thigh_joint:lock")
+  params, family = sample_fault_params(400, 12, FaultMixture(pairs=pairs), "cpu")
+  joint = faulted_joint(params)
+  limp = params[torch.arange(400), joint, TORQUE] == 0
+  locked = params[torch.arange(400), joint, LOCK] == 1
+  assert set(joint.tolist()) == {JOINT_NAMES.index("FR_hip_joint"), 7}
+  assert (limp == (joint == 3)).all() and (locked == (joint == 7)).all()
+  assert (family[joint == 7] == FaultFamily.LOCK).all()
+  assert 150 < int(limp.sum()) < 250

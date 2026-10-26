@@ -13,6 +13,8 @@
 #   SAMPLES_DIR  output under FAILBENCH_ROOT, default samples_v2 (the
 #                originals in samples/ are kept)
 #   SEED         $SLURM_ARRAY_TASK_ID, else 0
+#   EXTRA        extra build.py arguments, e.g. "--held-out" (no pairs held
+#                out: every fault in train, for the planner's model)
 #
 # Afterwards, compute the normalisation stats once (CPU is fine):
 #
@@ -48,6 +50,7 @@ if [ ${#raw[@]} -eq 0 ]; then
   echo "[failbench] no raw shards for ${TERRAIN} seed ${SEED}" >&2
   exit 1
 fi
+# shellcheck disable=SC2086
 uv run python -m failbench.data.build --raw "${raw[@]}" \
-  --output-dir "$FAILBENCH_ROOT/$SAMPLES_DIR"
+  --output-dir "$FAILBENCH_ROOT/$SAMPLES_DIR" ${EXTRA:-}
 echo "[failbench] $(date) done"

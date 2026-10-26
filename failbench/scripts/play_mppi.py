@@ -17,7 +17,12 @@ joint angles. Drawn into the scene:
   ghost trunk);
 - where the model predicts a non-foot body part touches the ground over
   the plan's 5 s (magenta cells, more opaque = likelier);
-- the faulted joint once the fault fires (red = locked, blue = weak).
+- the faulted joint once the fault fires (red = locked, blue = weak);
+- with a fault-risk planner (``--mppi.fault-risk.p`` > 0), while the robot
+  is healthy: where each priced fault would throw it if it fired at points
+  along the plan (one colour per fault, warm = limp, cool = seized; the
+  ``risk_fire`` point drawn bold with its 2 sigma ring), and a panel with
+  each fault's share of the plan's fault risk and P(fall) once fired.
 
 The caption gives the time, the fault, the command, the plan's predicted
 drift at 5 s, P(fall in 5 s), highest P(trunk contact) and cost terms.
@@ -39,6 +44,7 @@ from PIL import Image, ImageDraw
 from failbench.data.build import fallen
 from failbench.env_cfg import failbench_env_cfg
 from failbench.faults import LOCK, TORQUE, FaultFamily, faulted_joint
+from failbench.mppi.planner import FaultRiskCfg
 from failbench.scripts.play_trial import _BLUE, _GREEN, _ORANGE, _RED, _add, _line, _yaw
 from mjlab.envs import ManagerBasedRlEnv
 
@@ -58,12 +64,27 @@ class PlayMppiConfig:
   azimuth_offset_deg: float = 140.0
   frame_every: int = 2
   """Render every n-th control step."""
+  look_ahead_m: float = 0.0
+  """Aim the camera this far ahead of the trunk along its heading."""
   risk_full: float = 0.3
   """Risk at which the predicted path is drawn fully red."""
   contact_min: float = 0.15
   """Contact probability below which a cell isn't drawn."""
   max_contact_cells: int = 1500
+  risk_fire: int = 1
+  """Firing point (index into ``fire_s``) whose throws are drawn bold."""
   device: str = "cpu"
+
+
+# Fault-risk branches: warm for a limp joint, cool for a seized one.
+_LIMP = ((0.95, 0.3, 0.1), (1.0, 0.65, 0.0), (0.85, 0.1, 0.45), (0.95, 0.85, 0.2))
+_SEIZED = ((0.1, 0.45, 0.95), (0.0, 0.75, 0.75), (0.45, 0.3, 0.95), (0.3, 0.8, 0.3))
+
+
+def _branch_colours(names: list[str]) -> list[tuple[float, float, float]]:
+  limp = iter(_LIMP * 3)
+  seized = iter(_SEIZED * 3)
+  return [next(limp) if n.endswith(":free") else next(seized) for n in names]
 
 
 def main():
@@ -102,6 +123,8 @@ def main():
   contact_prob = log["contact_prob"][b] if "contact_prob" in log.files else None
   contact_height = log["contact_height"][b] if "contact_prob" in log.files else None
   cells = 0 if contact_prob is None else contact_prob.shape[-1]
+  risk_names = [str(n) for n in log["risk_faults"]] if "risk_faults" in log else []
+  risk_rgb = _branch_colours(risk_names)
   res = 0.05
   dt = float(log["step_dt"])
   pos, quat = dense["base_pos_w"], dense["base_quat_w"]
@@ -120,6 +143,7 @@ def main():
   goal = waypoints[-1]
   down = fallen(torch.as_tensor(dense["tilt"]), torch.as_tensor(dense["base_height"]))
   ever_down = np.maximum.accumulate(down.numpy())
+  cfg_fire_s = list(FaultRiskCfg().fire_s)
 
   cam = mujoco.MjvCamera()
   cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -138,7 +162,10 @@ def main():
     data.qpos[base_adr + 3 : base_adr + 7] = quat[t]
     data.qpos[q_adr] = dense["joint_pos"][t]
     mujoco.mj_forward(model, data)
-    lookat += 0.05 * (pos[t] - lookat)
+    ahead = cfg.look_ahead_m * np.array(
+      [math.cos(_yaw(quat[t])), math.sin(_yaw(quat[t])), 0]
+    )
+    lookat += 0.05 * (pos[t] + ahead - lookat)
     if t % cfg.frame_every:
       continue
     cam.lookat[:] = lookat
@@ -251,6 +278,32 @@ def main():
           (p[0], p[1], z),
           (1.0, 0.6, 0.0, 0.35),
         )
+    risky = (
+      planned
+      and risk_names
+      and not dense["faulted"][t]
+      and not np.isnan(float(cyc["risk_branch"][c, 0]))
+    )
+    if risky:
+      z = ground + 0.06
+      thrown = cyc["risk_thrown_w"][c].astype(np.float32)  # [F, B, Tp, 2]
+      for f in range(thrown.shape[0]):
+        bold = f == cfg.risk_fire
+        for i, rgb in enumerate(risk_rgb):
+          pts = thrown[f, i]
+          pts = np.concatenate([pts, np.full((len(pts), 1), z)], -1)
+          rgba = (*rgb, 0.95 if bold else 0.3)
+          for a, e in zip(pts[:-1:2], pts[2::2], strict=False):
+            _line(scene, a, e, 0.012 if bold else 0.005, rgba)
+          if bold:
+            r = 2 * float(cyc["risk_thrown_std"][c, f, i, -1])
+            _add(
+              scene,
+              mujoco.mjtGeom.mjGEOM_CYLINDER,
+              (max(r, 0.02), 0.004, 0),
+              (*pts[-1, :2], z),
+              (*rgb, 0.1),
+            )
     if dense["faulted"][t] and joint >= 0:
       rgba = _RED if params[joint, LOCK] > 0.5 else _BLUE
       _add(
@@ -307,6 +360,30 @@ def main():
       hot = i == 1 and dense["faulted"][t] and joint >= 0
       fill = (255, 90, 90) if hot else (255, 255, 255)
       draw.text((16, 14 + 18 * i), line, fill=fill)
+    if risky:
+      share = cyc["risk_branch"][c].astype(np.float32)
+      fall = cyc["risk_p_fall"][c, cfg.risk_fire].astype(np.float32)
+      x0, y0 = w - 350, 8
+      draw.rectangle((x0, y0, w - 8, y0 + 34 + 18 * len(risk_names)), fill=(0, 0, 0))
+      fire_s = cfg_fire_s[cfg.risk_fire] if cfg.risk_fire < len(cfg_fire_s) else 0
+      draw.text(
+        (x0 + 8, y0 + 6),
+        f"fault risk {share.sum():.2f} (bold: fired at {fire_s:g} s)",
+        fill=(255, 255, 255),
+      )
+      top = max(float(share.max()), 1e-6)
+      for i, (name, rgb) in enumerate(zip(risk_names, risk_rgb, strict=True)):
+        y = y0 + 26 + 18 * i
+        col = tuple(round(255 * v) for v in rgb)
+        draw.rectangle((x0 + 8, y + 3, x0 + 18, y + 13), fill=col)
+        joint_, mode = name.split(":")
+        label = (
+          f"{joint_.removesuffix('_joint')} {'limp' if mode == 'free' else 'lock'}"
+        )
+        draw.text((x0 + 24, y), f"{label:13} P(fall) {fall[i]:.2f}", fill=col)
+        bar = round(70 * float(share[i]) / top)
+        draw.rectangle((x0 + 232, y + 3, x0 + 232 + bar, y + 13), fill=col)
+        draw.text((x0 + 236 + bar, y), f"{share[i]:.2f}", fill=(220, 220, 220))
     frames.append(np.asarray(img))
   renderer.close()
   env.close()
