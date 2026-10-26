@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 from failbench.commands import GoalVelocityCommand
-from failbench.data.build import SPLITS, no_return_step
+from failbench.data.build import SPLITS, BuildConfig, fall_step, no_return_step
 from failbench.data.dataset import FailBenchDataset
 from failbench.faults import (
   FAULT_TERM,
@@ -401,3 +401,25 @@ def test_drift_is_spread_in_the_path_frame_with_heavy_tails():
   # Phase 1: start frame, Gaussian, the old floor.
   old = ImpactModelCfg.from_saved({})
   assert (old.drift_frame, old.drift_nu, old.norm_min_std) == ("start", 0.0, 1e-3)
+
+
+def test_a_fall_is_down_for_good_with_the_trunk_on_the_ground():
+  t = 200
+  tilt = torch.full((4, t), 0.1)
+  height = torch.full((4, t), 0.30)
+  contact = torch.zeros(4, t, dtype=torch.bool)
+  # 0: stumbles over 60 deg with a knock at 120, back upright by 130.
+  tilt[0, 120:126] = 1.2
+  contact[0, 121] = True
+  # 1: trunk read 0.12 m over a stair edge at 120, no contact, walks on.
+  height[1, 120:124] = 0.12
+  # 2: tips over at 140, trunk hits the ground at 150, stays down.
+  tilt[2, 140:] = 1.3
+  contact[2, 150:] = True
+  # 3: like 2 but nothing touches (contact required).
+  tilt[3, 140:] = 1.3
+  cfg = BuildConfig(raw=(), output_dir="")
+  falls = fall_step(tilt, height, contact, 100, cfg, hold_steps=25)
+  assert falls.tolist() == [t, t, 140, t]
+  loose = BuildConfig(raw=(), output_dir="", fall_needs_contact=False)
+  assert fall_step(tilt, height, contact, 100, loose, 25).tolist() == [t, t, 140, 140]

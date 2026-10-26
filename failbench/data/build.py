@@ -13,8 +13,11 @@ control step ``s`` with ``r`` control steps per bin, bin ``k`` covers steps
 - ``pose[k]``: (x, y, yaw) at the end of the bin in the start yaw frame.
 - ``cmd_path[k]``: the same for the commanded twist integrated from the
   start pose, so ``pose - cmd_path`` is the drift from the plan.
-- ``upright[k]``: no fall yet (``fallen``: tilt over ``fall_tilt_deg`` or
-  the trunk under ``fall_height_m`` above the ground) at the end of the bin.
+- ``upright[k]``: no fall yet at the end of the bin (``fall_step``: down,
+  i.e. ``fallen``'s tilt over ``fall_tilt_deg`` or trunk under
+  ``fall_height_m``, with the trunk or head touching the ground and the
+  robot not back upright within ``fall_hold_s``; a stumble the policy
+  recovers, or a trunk height read against a stair edge, isn't a fall).
 - ``latent_future[k]``: HIM's latent at the end of the bin (an auxiliary
   target: the policy's own sense of how the robot is responding, dense where
   falls are rare).
@@ -99,6 +102,41 @@ def no_return_step(
   return torch.where(fall_step < tilt.shape[1], nr, fall_step)
 
 
+def fall_step(
+  tilt: torch.Tensor,
+  base_height: torch.Tensor,
+  trunk_contact: torch.Tensor,
+  from_step: int,
+  cfg: BuildConfig,
+  hold_steps: int,
+) -> torch.Tensor:
+  """``[n]`` first step from ``from_step`` the robot is down (``fallen``)
+  for real: its trunk or head touches the ground within ``hold_steps``
+  either side, and it isn't back upright (tilt under
+  ``fall_recover_tilt_deg``, trunk over ``fall_recover_height_m``) within
+  ``hold_steps`` after. ``T`` if it never falls."""
+  n, num_t = tilt.shape
+  t = torch.arange(num_t, device=tilt.device)
+  down = fallen(tilt, base_height, cfg.fall_tilt_deg, cfg.fall_height_m)
+  back_up = (tilt < math.radians(cfg.fall_recover_tilt_deg)) & (
+    base_height > cfg.fall_recover_height_m
+  )
+
+  def any_in(x: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+    """Whether ``x`` is set anywhere in steps ``t + lo .. t + hi``."""
+    cs = torch.cat(
+      [torch.zeros_like(x[:, :1], dtype=torch.long), x.long().cumsum(1)], 1
+    )
+    a = (t + lo).clamp(0, num_t)
+    b = (t + hi + 1).clamp(0, num_t)
+    return (cs[:, b] - cs[:, a]) > 0
+
+  real = down & (t >= from_step) & ~any_in(back_up, 1, hold_steps)
+  if cfg.fall_needs_contact:
+    real &= any_in(trunk_contact, -hold_steps, hold_steps)
+  return torch.where(real, t, num_t).min(dim=1).values
+
+
 def fallen(
   tilt: torch.Tensor,
   base_height: torch.Tensor,
@@ -119,6 +157,12 @@ class BuildConfig:
   target_hz: float = 10.0
   fall_tilt_deg: float = FALL_TILT_DEG
   fall_height_m: float = FALL_HEIGHT_M
+  fall_hold_s: float = 0.5
+  fall_recover_tilt_deg: float = 30.0
+  fall_recover_height_m: float = 0.22
+  fall_needs_contact: bool = True
+  """``fall_step``: a fall is down, not back upright within ``fall_hold_s``,
+  and (with ``fall_needs_contact``) with trunk or head contact within it."""
   no_return_tilt_margin_deg: float = 15.0
   no_return_height_margin_m: float = 0.06
   """``safe``: how far past its pre-fault walk the robot may tip or sink and
@@ -194,14 +238,13 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
   latent = dense("him_latent")
   valid_t = dense("valid")
   n, num_t = valid_t.shape
-  fallen_t = fallen(tilt, base_height, cfg.fall_tilt_deg, cfg.fall_height_m)
-  t_ar = torch.arange(num_t, device=device)
-  post = t_ar[None, :] >= pre
-  fall_step = torch.where(fallen_t & post, t_ar, num_t).min(dim=1).values  # [n]
+  fall_at = fall_step(
+    tilt, base_height, trunk, pre, cfg, round(cfg.fall_hold_s / step_dt)
+  )  # [n]
   nr_step = no_return_step(
     tilt,
     base_height,
-    fall_step,
+    fall_at,
     pre,
     cfg.no_return_tilt_margin_deg,
     cfg.no_return_height_margin_m,
@@ -263,10 +306,10 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     put("tilt", tilt[:, ends])
     put("base_height", base_height[:, ends])
     put("collision", trunk[:, steps].any(dim=-1))
-    put("upright", ends[None, :] < fall_step[:, None])
+    put("upright", ends[None, :] < fall_at[:, None])
     put("safe", ends[None, :] < nr_step[:, None])
     put("valid", valid_t[:, ends])
-    put("fallen_at_start", fall_step <= s)
+    put("fallen_at_start", fall_at <= s)
     put("offset_s", torch.full((n,), snap * step_dt, device=device))
 
     # Clean map and what the LiDAR saw of it, now and over the fused poses.
@@ -340,6 +383,10 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     "splits": list(SPLITS),
     "fall_tilt_deg": cfg.fall_tilt_deg,
     "fall_height_m": cfg.fall_height_m,
+    "fall_hold_s": cfg.fall_hold_s,
+    "fall_recover_tilt_deg": cfg.fall_recover_tilt_deg,
+    "fall_recover_height_m": cfg.fall_recover_height_m,
+    "fall_needs_contact": cfg.fall_needs_contact,
     "no_return_tilt_margin_deg": cfg.no_return_tilt_margin_deg,
     "no_return_height_margin_m": cfg.no_return_height_margin_m,
     "no_return_max_lead_s": cfg.no_return_max_lead_s,
