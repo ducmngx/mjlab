@@ -47,7 +47,7 @@ plans' predicted paths.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 
@@ -131,6 +131,16 @@ class FaultRiskCfg:
   ``modes``."""
   modes: tuple[str, ...] = ("free", "lock")
   """The modes priced; ``faults`` in other modes are skipped."""
+  measure: Literal["mean", "cvar", "max"] = "mean"
+  """How the outcomes (a fault firing at a point, each with probability
+  prior / F; no fault, probability 1 - p, costs 0) become one cost:
+  ``mean`` the expected severity; ``cvar`` the mean of the worst
+  ``cvar_alpha`` of the probability (1: the mean over everything, ``p``:
+  the mean given a fault happens, toward 0: the worst); ``max`` the worst
+  outcome, however unlikely."""
+  cvar_alpha: float = 0.025
+  """CVaR's tail mass; with ``p`` 0.1 the default is the worst quarter of
+  the fault outcomes."""
   mode_share: tuple[float, ...] | None = None
   """Each mode's share of ``p`` (normalised); None: equal."""
   fire_s: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
@@ -150,6 +160,27 @@ class FaultRiskCfg:
   """Obstacle severity when the planner is given no severity map."""
   drop_severity: float = 50.0
   """Severity of going over a drop (``drop_cells``)."""
+
+
+def risk_weights(
+  cost: torch.Tensor, prob: torch.Tensor, fr: FaultRiskCfg
+) -> torch.Tensor:
+  """Weights over outcomes ``cost [..., O]`` (probabilities ``prob [O]``,
+  summing to ``p``; no fault, the rest, costs 0) whose dot with the costs is
+  ``FaultRiskCfg.measure``: the probabilities (the expectation), the CVaR's
+  tail mass over ``cvar_alpha``, or one-hot on the worst outcome."""
+  if fr.measure == "mean":
+    return prob.expand_as(cost)
+  if fr.measure == "max":
+    return torch.nn.functional.one_hot(cost.argmax(-1), cost.shape[-1]).to(cost)
+  if fr.measure != "cvar":
+    raise ValueError(f"Unknown risk measure {fr.measure!r}.")
+  # Fill the worst cvar_alpha of the probability, worst outcome first.
+  order = cost.argsort(-1, descending=True)
+  q = prob[order]
+  before = q.cumsum(-1) - q
+  taken = (fr.cvar_alpha - before).clamp(min=0).minimum(q)
+  return torch.zeros_like(cost).scatter(-1, order, taken / fr.cvar_alpha)
 
 
 @dataclass(frozen=True)
@@ -336,9 +367,18 @@ class Mppi:
       )
       hit = torch.maximum(touch, onto).view(n, k, nf, nb, tp)
       cost = cost + severity * (disc * hit).amax(-1)
+    # Outcomes (firing point, fault), each as likely as prior / F; the rest
+    # of the probability (no fault) costs nothing.
+    outcome = cost.flatten(2)  # [n, k, F * B]
+    part = risk_weights(outcome, prior.repeat(nf) / nf, fr) * outcome
     if per_branch:
-      return {"cost": cost.mean(2) * prior, "placed": placed, "std": sd, "p_fall": fall}
-    return cost.mean(2) @ prior
+      return {
+        "cost": part.view(n, k, nf, nb).sum(2),
+        "placed": placed,
+        "std": sd,
+        "p_fall": fall,
+      }
+    return part.sum(-1)
 
   def _risk_fields(
     self,

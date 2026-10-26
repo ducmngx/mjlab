@@ -4,9 +4,15 @@
 #
 #   sbatch --array=0-29 failbench/cluster/mppi.sbatch
 #
-# Task i runs course COURSES[i / (2 * SEEDS)], arm (i / SEEDS) % 2 (0: no
-# fault risk, 1: fault risk at RISK_P) and seed i % SEEDS. Both arms of a
-# seed get the same robots, faults and fault times, so they compare pairwise.
+# Task i runs course COURSES[i / (A * SEEDS)], arm ARMS[(i / SEEDS) % A] and
+# seed i % SEEDS, for A arms. Every arm of a seed gets the same robots,
+# faults and fault times, so they compare pairwise. Arms (planners):
+#   none  no fault risk                       -> <course>_p0_s<seed>
+#   avg   expected severity at RISK_P         -> <course>_p<RISK_P>_s<seed>
+#   cvar  CVaR of the worst CVAR_ALPHA        -> <course>_cvar<CVAR_ALPHA>_s<seed>
+#   max   the worst fault outcome             -> <course>_max_s<seed>
+#
+#   sbatch --array=0-29 --export=ALL,ARMS="cvar max" failbench/cluster/mppi.sbatch
 #
 # Settings (environment variables, with defaults):
 #   POLICY    the frozen HIM policy (model.pt; binaries stay out of git),
@@ -16,7 +22,9 @@
 #   COURSES   "severity severity_swap cliff"
 #   SEEDS     5
 #   ENVS      64 robots per run
-#   RISK_P    0.1 (fault-risk prior of the second arm)
+#   ARMS      "none avg"
+#   RISK_P    0.1 (fault-risk prior of avg, cvar and max)
+#   CVAR_ALPHA  0.025
 #   EXTRA     extra run_mppi.py arguments
 #SBATCH --partition=gpuq
 #SBATCH --qos=gpu
@@ -41,14 +49,23 @@ POLICY="${POLICY:-$FAILBENCH_ROOT/policies/go2_him_rough_original_7200/model.pt}
 MODEL="${MODEL:-$FAILBENCH_ROOT/models/failbench_all_ground_20ep/phase1/best.pt}"
 OUT="${OUT:-$FAILBENCH_ROOT/mppi/grid}"
 read -r -a courses <<< "${COURSES:-severity severity_swap cliff}"
+read -r -a arms <<< "${ARMS:-none avg}"
 SEEDS="${SEEDS:-5}"
 i="${SLURM_ARRAY_TASK_ID:-0}"
-course="${courses[$(( i / (2 * SEEDS) ))]}"
-arm=$(( (i / SEEDS) % 2 ))
+course="${courses[$(( i / (${#arms[@]} * SEEDS) ))]}"
+arm="${arms[$(( (i / SEEDS) % ${#arms[@]} ))]}"
 seed=$(( i % SEEDS ))
-p=0
-if [[ "$arm" == 1 ]]; then p="${RISK_P:-0.1}"; fi
-name="${course}_p${p}_s${seed}"
+p="${RISK_P:-0.1}"
+alpha="${CVAR_ALPHA:-0.025}"
+case "$arm" in
+  none) risk=(--mppi.fault-risk.p 0); tag="p0" ;;
+  avg) risk=(--mppi.fault-risk.p "$p"); tag="p$p" ;;
+  cvar) risk=(--mppi.fault-risk.p "$p" --mppi.fault-risk.measure cvar
+              --mppi.fault-risk.cvar-alpha "$alpha"); tag="cvar$alpha" ;;
+  max) risk=(--mppi.fault-risk.p "$p" --mppi.fault-risk.measure max); tag="max" ;;
+  *) echo "[failbench] unknown arm $arm" >&2; exit 1 ;;
+esac
+name="${course}_${tag}_s${seed}"
 
 echo "[failbench] $(date) host=$(hostname) job=${SLURM_JOB_ID:-local} commit=$(git rev-parse --short HEAD)"
 echo "[failbench] $name -> $OUT"
@@ -66,7 +83,7 @@ uv run python -m failbench.scripts.run_mppi \
   --seed "$seed" \
   --map-log-every 0 \
   --mppi.gap-quantile 0.1 \
-  --mppi.fault-risk.p "$p" \
+  "${risk[@]}" \
   --mppi.weights.fault-risk 5 \
   ${EXTRA:-}
 echo "[failbench] $(date) done"

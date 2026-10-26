@@ -1,6 +1,7 @@
 """Tests for the MPPI planner: input parity with the data builder, the
 obstacle sweep and the planner on a synthetic map."""
 
+import pytest
 import torch
 from failbench.data.build import _integrate
 from failbench.faults import NOMINAL
@@ -13,7 +14,13 @@ from failbench.mppi.costmap import (
 )
 from failbench.mppi.inputs import HistoryBuffer, crop_center, integrate_plan
 from failbench.mppi.models import ZeroDriftModel
-from failbench.mppi.planner import CostWeights, FaultRiskCfg, Mppi, MppiCfg
+from failbench.mppi.planner import (
+  CostWeights,
+  FaultRiskCfg,
+  Mppi,
+  MppiCfg,
+  risk_weights,
+)
 from failbench.mppi.sampler import PlanSampler, SamplerCfg
 from failbench.sensing import cell_centres
 
@@ -306,3 +313,41 @@ def test_fault_risk_reports_each_branch():
   # FL hip (even joint) is thrown right, onto the ledge; FR hip left.
   assert out["risk_branch"][0, 0] > 0 and out["risk_branch"][0, 1] == 0
   assert out["risk_thrown"].shape[:3] == (1, 6, 4)
+
+
+def test_risk_measures_span_mean_to_worst():
+  cost = torch.tensor([[4.0, 0.0, 10.0, 1.0]])
+  prob = torch.full((4,), 0.025)  # p = 0.1 over four outcomes.
+
+  def measure(**kw) -> float:
+    fr = FaultRiskCfg(p=0.1, **kw)
+    return float((risk_weights(cost, prob, fr) * cost).sum())
+
+  mean = measure(measure="mean")
+  assert mean == pytest.approx(0.375)
+  # CVaR over everything is the mean; over the fault mass, the mean given
+  # a fault; over the worst outcome's mass or less, the worst.
+  assert measure(measure="cvar", cvar_alpha=1.0) == pytest.approx(mean)
+  assert measure(measure="cvar", cvar_alpha=0.1) == pytest.approx(3.75)
+  assert measure(measure="cvar", cvar_alpha=0.05) == pytest.approx(7.0)
+  assert measure(measure="cvar", cvar_alpha=0.01) == pytest.approx(10.0)
+  assert measure(measure="max") == pytest.approx(10.0)
+
+
+def test_tail_measures_price_the_ledge_more():
+  h = torch.zeros(1, 160, 160)
+  h[:, :66] = -0.6  # A ledge 0.7 m to the right.
+  costs = {}
+  for m in ("mean", "cvar", "max"):
+    torch.manual_seed(0)
+    cfg = MppiCfg(
+      sampler=SamplerCfg(num_plans=16, compile=False),
+      delay_steps=0,
+      fault_risk=FaultRiskCfg(p=0.1, modes=("free",), measure=m),
+    )
+    planner = Mppi(cfg, _Thrown(), 1, "cpu")
+    inputs = {"fault": torch.tensor(NOMINAL).repeat(12)[None]}
+    known = torch.ones_like(h, dtype=torch.bool)
+    out = planner.step(inputs, h, known, RES, torch.tensor([[3.0, 0.0]]))
+    costs[m] = float(out["risk_branch"].sum())
+  assert 0 < costs["mean"] < costs["cvar"] <= costs["max"]
