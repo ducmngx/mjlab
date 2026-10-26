@@ -12,6 +12,7 @@
 #
 # Settings (environment variables, with defaults):
 #   PHASE       1
+#   SAMPLES     the built shards, default $FAILBENCH_ROOT/samples
 #   RUN         failbench_impact (output under $FAILBENCH_ROOT/models/$RUN)
 #   EPOCHS      10 (phase 1), 5 (phase 2)
 #   BATCH       256
@@ -41,7 +42,7 @@ source go2_him/cluster/env.sh
 export PYTHONUNBUFFERED=1
 
 FAILBENCH_ROOT="${FAILBENCH_ROOT:-/scratch/$USER/failbench}"
-SAMPLES="$FAILBENCH_ROOT/samples"
+SAMPLES="${SAMPLES:-$FAILBENCH_ROOT/samples}"
 PHASE="${PHASE:-1}"
 RUN="${RUN:-failbench_impact}"
 BATCH="${BATCH:-256}"
