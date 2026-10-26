@@ -359,6 +359,8 @@ def test_v2_model_drops_the_contact_heads_and_learns_the_no_return_label():
   assert old.contact_heads and not old.latent_head
   stats = _unit_stats() | {"history": {"mean": [0.0] * 36, "std": [1.0] * 36}}
   assert ImpactModel(old, stats)(batch)["drift"].shape == (3, 50, 3)
+  # Trained anew on 52-wide shards' stats, it reads their first 36.
+  assert ImpactModel(old, _unit_stats())(batch)["drift"].shape == (3, 50, 3)
 
 
 def test_no_return_is_when_the_robot_leaves_its_walk_for_good():

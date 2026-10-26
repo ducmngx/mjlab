@@ -187,6 +187,12 @@ class ImpactModel(nn.Module):
       raise ValueError("drift_nu must be over 2 (a finite variance) or 0.")
     self.cfg = cfg
     d = cfg.d_model
+    # A model reading fewer history numbers than the shards hold (36 of 52:
+    # no latent) normalises just those.
+    hist = stats["history"]
+    stats = stats | {
+      "history": {k: hist[k][: cfg.history_dim] for k in ("mean", "std")}
+    }
     self.norm = Normalizer(
       stats,
       ["state", "him_latent", "history", "cmd_seq", "cmd_path", "map"],
