@@ -10,6 +10,8 @@
 #   PHASE       1
 #   RUN         failbench_impact (model under $FAILBENCH_ROOT/models/$RUN)
 #   CHECKPOINT  $FAILBENCH_ROOT/models/$RUN/phase$PHASE/best.pt
+#   SAMPLES     the built shards, default $FAILBENCH_ROOT/samples
+#   OUT         output directory, default eval/ next to the checkpoint
 #   EXTRA       extra evaluate.py arguments, e.g. "--map-mode fused"
 #
 # Writes eval.json and reliability.png next to the checkpoint, in eval/.
@@ -39,7 +41,8 @@ FAILBENCH_ROOT="${FAILBENCH_ROOT:-/scratch/$USER/failbench}"
 PHASE="${PHASE:-1}"
 RUN="${RUN:-failbench_impact}"
 CHECKPOINT="${CHECKPOINT:-$FAILBENCH_ROOT/models/$RUN/phase$PHASE/best.pt}"
-OUT="$(dirname "$CHECKPOINT")/eval"
+SAMPLES="${SAMPLES:-$FAILBENCH_ROOT/samples}"
+OUT="${OUT:-$(dirname "$CHECKPOINT")/eval}"
 
 echo "[failbench] $(date) host=$(hostname) job=${SLURM_JOB_ID:-local} commit=$(git rev-parse --short HEAD)"
 echo "[failbench] evaluating $CHECKPOINT -> $OUT"
@@ -47,7 +50,7 @@ echo "[failbench] evaluating $CHECKPOINT -> $OUT"
 # shellcheck disable=SC2086
 uv run python -m failbench.scripts.evaluate \
   --checkpoint "$CHECKPOINT" \
-  --root "$FAILBENCH_ROOT/samples" \
+  --root "$SAMPLES" \
   --output-dir "$OUT" \
   --num-workers "${SLURM_CPUS_PER_TASK:-8}" \
   ${EXTRA:-}
