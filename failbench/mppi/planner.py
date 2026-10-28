@@ -6,9 +6,10 @@ One cycle (every ``step_s``) for ``n`` robots:
    command term will apply them, and integrate their commanded paths;
 2. predict drift (and its spread), falls and trunk contact for every plan
    with the dynamics model (one encode per robot);
-3. cost each plan: progress to the goal, the footprint sweep of the
-   predicted path ``cmd_path + drift +- k sigma`` over the obstacle map,
-   and over drops (ledges), unknown cells, P(fallen by the end), P(trunk
+3. cost each plan: progress to the goal, the chance the footprint along
+   the predicted path ``cmd_path + drift`` (spread ``sigma``) touches an
+   obstacle on the map (``hit_prob``) and how far its mean reaches in,
+   the same for drops (ledges), unknown cells, P(fallen by the end), P(trunk
    contact), smoothness, the fault risk (below), going
    nowhere once the robot has been still a while, and on the course the
    offset from the lane centre;
@@ -74,11 +75,21 @@ class CostWeights:
   """Per metre from the goal, averaged over the plan."""
   lane: float = 0.5
   """Per m^2 of lateral offset from the lane centre, averaged."""
-  obstacle: float = 20.0
-  """Per metre of footprint penetration, summed over steps and circles."""
-  drop: float = 100.0
-  """Per metre of footprint penetration into a drop (``drop_cells``), as
-  ``obstacle``: going over a ledge is worse than bumping a wall."""
+  obstacle: float = 10.0
+  """On P(the footprint touches an obstacle) along the plan (``hit_prob``,
+  the largest over steps, discounted): a certain hit is worth this many
+  metres of progress. A probability, unlike the summed penetration of a
+  ``k sigma`` box, doesn't charge a slightly uncertain robot near a wall
+  as if the hit were sure, nor once per step it spends there."""
+  obstacle_depth: float = 20.0
+  """Per metre the predicted mean footprint reaches into an obstacle,
+  summed over steps and circles. The probability saturates at 1; this
+  keeps a plan into a wall worse than one that grazes it."""
+  drop: float = 50.0
+  """As ``obstacle`` for going over a drop (``drop_cells``): worse than
+  bumping a wall."""
+  drop_depth: float = 100.0
+  """As ``obstacle_depth`` for drops."""
   unknown: float = 0.2
   """Per footprint circle on an unknown cell, averaged over steps."""
   fall: float = 20.0
@@ -434,13 +445,16 @@ class Mppi:
     path = self._path(plans)
     pred = self.model.predict(inputs, plans, path)
     pose = path + pred["drift"]
-    pen, unknown = sweep(dist, known, pose, pred["drift_std"], resolution, c.footprint)
+    std, fp = pred["drift_std"], c.footprint
+    # The mean footprint's reach into obstacles (no spread), and the chance
+    # the spread one touches them.
+    pen, unknown = sweep(dist, known, pose, torch.zeros_like(std), resolution, fp)
+    hit = hit_prob(dist, pose, std, resolution, fp)
     if drop_dist is None:
-      drop_pen = torch.zeros_like(pen)
+      drop_pen, drop_hit = torch.zeros_like(pen), torch.zeros_like(hit)
     else:
-      drop_pen, _ = sweep(
-        drop_dist, known, pose, pred["drift_std"], resolution, c.footprint
-      )
+      drop_pen, _ = sweep(drop_dist, known, pose, torch.zeros_like(std), resolution, fp)
+      drop_hit = hit_prob(drop_dist, pose, std, resolution, fp)
     to_goal = (pose[..., :2] - goal[:, None, None]).norm(dim=-1)  # [n, k, T]
     if route is not None:
       passed = torch.cummax((to_goal < c.route_switch_m).float(), dim=-1).values > 0
@@ -455,8 +469,10 @@ class Mppi:
     falls = fallen.diff(dim=-1, prepend=torch.zeros_like(fallen[..., :1]))
     terms = {
       "goal": w.goal * to_goal.amin(-1) + w.goal_running * to_goal.mean(-1),
-      "obstacle": w.obstacle * (disc * pen.sum(-1)).sum(-1),
-      "drop": w.drop * (disc * drop_pen.sum(-1)).sum(-1),
+      "obstacle": w.obstacle * (disc * hit).amax(-1),
+      "obstacle_depth": w.obstacle_depth * (disc * pen.sum(-1)).sum(-1),
+      "drop": w.drop * (disc * drop_hit).amax(-1),
+      "drop_depth": w.drop_depth * (disc * drop_pen.sum(-1)).sum(-1),
       "unknown": w.unknown * unknown.float().mean((-1, -2)),
       "fall": w.fall * (disc * falls).sum(-1),
       "collision": w.collision

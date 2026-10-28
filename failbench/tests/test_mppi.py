@@ -144,6 +144,28 @@ def test_mppi_stops_short_of_a_wall_across_the_way():
   assert path[:, 0].max() < 1.5 - 0.22 - 0.2
 
 
+def test_obstacle_cost_is_a_hit_chance_and_a_crash_costs_more_than_a_graze():
+  cfg = MppiCfg(sampler=SamplerCfg(num_plans=64, compile=False), delay_steps=0)
+  w = cfg.weights
+  planner = Mppi(cfg, ZeroDriftModel(), 1, "cpu")
+  h = torch.zeros(1, 160, 160)
+  h[:, :, 110:114] = 0.8  # A wall across the whole map 1.5 m ahead.
+  dist = distance_field(obstacle_cells(h, cfg.footprint.wall_jump_m), RES, 1.5)
+  known = torch.ones_like(h, dtype=torch.bool)
+  # Stand, walk up to the wall (front circle 0.08 m in at 5 s), walk into it.
+  plans = torch.zeros(1, 3, 50, 3)
+  plans[0, 1, :, 0], plans[0, 2, :, 0] = 0.24, 0.5
+  terms = planner.score({}, plans, dist, known, RES, torch.tensor([[0.0, 0.0]]))[
+    "terms"
+  ]
+  hit, depth = terms["obstacle"][0], terms["obstacle_depth"][0]
+  assert hit[0] < 0.01 * w.obstacle and depth[0] == 0
+  # Both moving plans are near-certain hits, which the probability can't
+  # tell apart; the mean footprint's depth does.
+  assert (hit[1:] > 0.5 * w.obstacle).all() and (hit <= w.obstacle).all()
+  assert 0 < depth[1] < depth[2]
+
+
 class _RiskyToMove(ZeroDriftModel):
   """Any plan that walks has a 15% chance of a fall."""
 
