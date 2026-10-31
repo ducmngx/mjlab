@@ -72,7 +72,8 @@ class PlayMppiConfig:
   """Contact probability below which a cell isn't drawn."""
   max_contact_cells: int = 1500
   risk_fire: int = 1
-  """Firing point (index into ``fire_s``) whose throws are drawn bold."""
+  """Firing point (index into ``fire_m``, or ``fire_s``) whose throws are drawn
+  bold."""
   device: str = "cpu"
 
 
@@ -143,7 +144,9 @@ def main():
   goal = waypoints[-1]
   down = fallen(torch.as_tensor(dense["tilt"]), torch.as_tensor(dense["base_height"]))
   ever_down = np.maximum.accumulate(down.numpy())
-  cfg_fire_s = list(FaultRiskCfg().fire_s)
+  fire_cfg = FaultRiskCfg()
+  cfg_fire = list(fire_cfg.fire_m or fire_cfg.fire_s)
+  fire_unit = "m" if fire_cfg.fire_m else "s"
 
   cam = mujoco.MjvCamera()
   cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -365,10 +368,10 @@ def main():
       fall = cyc["risk_p_fall"][c, cfg.risk_fire].astype(np.float32)
       x0, y0 = w - 350, 8
       draw.rectangle((x0, y0, w - 8, y0 + 34 + 18 * len(risk_names)), fill=(0, 0, 0))
-      fire_s = cfg_fire_s[cfg.risk_fire] if cfg.risk_fire < len(cfg_fire_s) else 0
+      fire = cfg_fire[cfg.risk_fire] if cfg.risk_fire < len(cfg_fire) else 0
       draw.text(
         (x0 + 8, y0 + 6),
-        f"fault risk {share.sum():.2f} (bold: fired at {fire_s:g} s)",
+        f"fault risk {share.sum():.2f} (bold: fired at {fire:g} {fire_unit})",
         fill=(255, 255, 255),
       )
       top = max(float(share.max()), 1e-6)

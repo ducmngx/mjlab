@@ -32,7 +32,8 @@ import torch
 from failbench.plans import PlanCfg, SegmentPlan
 
 CRUISE_VX = (0.5, 0.8, 1.1)
-ROUTE_VX = (0.6, 0.9, 1.2)
+ROUTE_VX = (0.3, 0.6, 0.9, 1.2)
+"""The slowest creeps along the route: careful, but not stopped."""
 OFFSET_M = (-0.4, -0.2, 0.2, 0.4)
 STRAFE_VY = 0.25
 FIXED_PLANS = 3 + len(CRUISE_VX) + len(ROUTE_VX) + len(OFFSET_M)

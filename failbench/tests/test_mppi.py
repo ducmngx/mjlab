@@ -167,18 +167,22 @@ def test_obstacle_cost_is_a_hit_chance_and_a_crash_costs_more_than_a_graze():
 
 
 class _RiskyToMove(ZeroDriftModel):
-  """Any plan that walks has a 15% chance of a fall."""
+  """Any plan that walks has a 60% chance of trunk contact."""
 
   def predict(self, inputs, cmd_seq, cmd_path, contact_maps=False):
     out = super().predict(inputs, cmd_seq, cmd_path, contact_maps)
     walks = (cmd_seq[..., :2].norm(dim=-1) > 0.2).any(-1, keepdim=True)
-    out["p_fallen"] = (0.15 * walks.float()).expand_as(out["p_fallen"])
+    out["p_collision"] = (0.6 * walks.float()).expand_as(out["p_fallen"])
     return out
 
 
 def test_idle_cost_gets_a_robot_that_has_stood_too_long_moving():
   torch.manual_seed(0)
-  cfg = MppiCfg(sampler=SamplerCfg(num_plans=128, compile=False), delay_steps=0)
+  cfg = MppiCfg(
+    sampler=SamplerCfg(num_plans=128, compile=False),
+    weights=CostWeights(collision=5.0),
+    delay_steps=0,
+  )
   h = torch.zeros(1, 160, 160)
   known = torch.ones_like(h, dtype=torch.bool)
   goal = torch.tensor([[0.8, 0.0]])
@@ -373,3 +377,74 @@ def test_tail_measures_price_the_ledge_more():
     out = planner.step(inputs, h, known, RES, torch.tensor([[3.0, 0.0]]))
     costs[m] = float(out["risk_branch"].sum())
   assert 0 < costs["mean"] < costs["cvar"] <= costs["max"]
+
+
+class _Falls(ZeroDriftModel):
+  """Every plan falls within its first second."""
+
+  def predict(self, inputs, cmd_seq, cmd_path, contact_maps=False):
+    out = super().predict(inputs, cmd_seq, cmd_path, contact_maps)
+    out["p_fallen"] = (
+      (torch.arange(cmd_seq.shape[2]) >= 10).float().expand_as(out["p_fallen"])
+    )
+    return out
+
+
+def test_a_fall_costs_only_what_it_lands_on():
+  cfg = MppiCfg(sampler=SamplerCfg(num_plans=16, compile=False), delay_steps=0)
+  planner = Mppi(cfg, _Falls(), 1, "cpu")
+  plans = torch.zeros(1, 1, 50, 3)  # Standing, and falling.
+  fp = cfg.footprint
+  fall = {}
+  for name, wall_y in (("open", None), ("glass", 0.3)):
+    h = torch.zeros(1, 160, 160)
+    if wall_y is not None:
+      cy = 80 + round(wall_y / RES)
+      h[:, cy : cy + 3] = 0.8  # Beside the robot, along x.
+    obst = obstacle_cells(h, fp.wall_jump_m)
+    severity = torch.full_like(h, 25.0)
+    sc = planner.score(
+      {},
+      plans,
+      distance_field(obst, RES, fp.max_dist_m),
+      torch.ones_like(h, dtype=torch.bool),
+      RES,
+      torch.tensor([[0.0, 0.0]]),
+      risk_fields=planner._risk_fields(obst, obst & False, severity, RES),
+    )
+    fall[name] = float(sc["terms"]["fall"][0, 0])
+  assert fall["open"] == 0
+  assert fall["glass"] > 0.5 * 25
+
+
+def test_standing_still_pays_the_fault_risk_of_the_ground_ahead():
+  h = torch.zeros(1, 160, 160)
+  h[:, :66, 112:] = -0.6  # A ledge to the right (-y), from 1.6 m ahead on.
+  costs = {}
+  for fire_m in ((0.5, 1.0, 1.5, 2.0, 2.5, 3.0), None):
+    cfg = MppiCfg(
+      sampler=SamplerCfg(num_plans=16, compile=False),
+      fault_risk=FaultRiskCfg(p=0.1, modes=("free",), fire_m=fire_m),
+    )
+    planner = Mppi(cfg, _Thrown(side=-1.0), 1, "cpu")
+    fp = cfg.footprint
+    obst, drops = obstacle_cells(h, fp.wall_jump_m), drop_cells(h, fp, RES)
+    plans = torch.zeros(1, 2, 50, 3)
+    plans[0, 1, :, 0] = 0.3  # Stand, or creep along the ledge.
+    sc = planner.score(
+      {"fault": torch.tensor(NOMINAL).repeat(12)[None]},
+      plans,
+      distance_field(obst, RES, fp.max_dist_m),
+      torch.ones_like(h, dtype=torch.bool),
+      RES,
+      torch.tensor([[6.0, 0.0]]),
+      drop_dist=distance_field(drops, RES, fp.max_dist_m),
+      risk_fields=planner._risk_fields(obst, drops, None, RES),
+    )
+    costs[fire_m is not None] = sc["terms"]["fault_risk"][0]
+  # Faults by the metre: standing only puts the ledge off, at the same risk.
+  per_m = costs[True]
+  assert per_m[1] > 0 and torch.isclose(per_m[0], per_m[1], rtol=0.01)
+  # Faults by the second: standing where nothing is in reach looks safe.
+  per_s = costs[False]
+  assert per_s[0] < 0.05 * per_s[1]
