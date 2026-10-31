@@ -3,6 +3,7 @@
 import json
 import math
 import os
+from dataclasses import replace
 
 import mujoco
 import numpy as np
@@ -320,6 +321,13 @@ def test_fault_writes_and_plan_starts_in_real_env():
   env.close()
 
 
+def _after(seed: int, draws: int) -> torch.Generator:
+  """A generator seeded with ``seed`` that has drawn ``draws`` uniforms."""
+  g = torch.Generator().manual_seed(seed)
+  torch.rand(draws, generator=g)
+  return g
+
+
 def test_prefault_modes_stand_set_off_and_stop_around_the_fault():
   m = {k: i for i, k in enumerate(PREFAULT_MODES)}
   mode = torch.tensor([m["walk"], m["stand"], m["start"], m["slow"], m["stopped"]])
@@ -344,7 +352,8 @@ def test_prefault_modes_stand_set_off_and_stop_around_the_fault():
     ),
     prefault=pc,
   )
-  cmd._env = type("Env", (), {"device": "cpu"})()  # type: ignore[assignment]
+  env = type("Env", (), {"device": "cpu"})()
+  cmd._env = env  # pyright: ignore[reportAttributeAccessIssue]
   n = 2000
   cmd.speed, cmd.lead = torch.zeros(n), torch.zeros(n)
   cmd.mode = torch.zeros(n, dtype=torch.long)
@@ -358,6 +367,17 @@ def test_prefault_modes_stand_set_off_and_stop_around_the_fault():
   slow = cmd.mode == m["slow"]
   assert cmd.speed[slow].max() <= 0.3 and cmd.speed[~slow].min() >= 0.5
   assert not cmd.started.any() and (cmd.vel_command_b == 0).all()
+
+  # All walk (the default) draws only the cruise speeds, as before the modes,
+  # so seeded runs keep their faults.
+  cmd.goal_cfg = replace(cmd.goal_cfg, prefault=PrefaultCfg())
+  torch.manual_seed(1)
+  cmd._resample_command(torch.arange(n))
+  lo, hi = cmd.goal_cfg.speed
+  torch.manual_seed(1)
+  torch.testing.assert_close(cmd.speed, lo + (hi - lo) * torch.rand(n))
+  assert (cmd.mode == 0).all()
+  torch.testing.assert_close(torch.rand(3), torch.rand(3, generator=_after(1, n)))
 
 
 def test_a_waypoint_passed_outside_its_radius_still_counts():

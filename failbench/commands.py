@@ -112,6 +112,15 @@ class GoalVelocityCommand(UniformVelocityCommand):
     def uniform(r: tuple[float, float]) -> torch.Tensor:
       return r[0] + (r[1] - r[0]) * torch.rand(m, device=dev)
 
+    self.started[env_ids] = False
+    self.use_external[env_ids] = False
+    self.vel_command_b[env_ids] = 0.0
+    if not any(pc.mix[1:]):
+      # All walk: the same random draws as before the modes, so seeded runs
+      # (paired MPPI arms) keep their faults and goals.
+      self.mode[env_ids] = 0
+      self.speed[env_ids] = uniform(self.goal_cfg.speed)
+      return
     mix = torch.tensor(pc.mix, device=dev)
     mode = torch.multinomial(mix / mix.sum(), m, replacement=True)
     slow = mode == PREFAULT_MODES.index("slow")
@@ -124,9 +133,6 @@ class GoalVelocityCommand(UniformVelocityCommand):
       uniform(pc.start_lead_s),
       uniform(pc.stop_lead_s),
     )
-    self.started[env_ids] = False
-    self.use_external[env_ids] = False
-    self.vel_command_b[env_ids] = 0.0
 
   @property
   def goal_w(self) -> torch.Tensor:
