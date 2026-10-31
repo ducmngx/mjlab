@@ -19,7 +19,9 @@ family and terrain:
   label), the share of falls warned. Comparable across models trained on
   either label;
 - all of it, with drift error and 2 sigma coverage, per fault group
-  (healthy, locked, weak, limp: torque 0).
+  (healthy, locked, weak, limp: torque 0), per pre-fault mode
+  (``failbench.commands.PREFAULT_MODES``) and per forward speed at the
+  sample's start (``SPEED_BINS``).
 
 Writes ``<output_dir>/eval.json`` and ``reliability.png``. The map the model
 sees follows its training (``train_cfg.map_mode``) unless ``map_mode`` is
@@ -39,6 +41,7 @@ import torch
 import tyro
 from torch.utils.data import DataLoader
 
+from failbench.commands import PREFAULT_MODES
 from failbench.data.build import TERRAINS
 from failbench.data.dataset import FailBenchDataset, MapMode
 from failbench.faults import FaultFamily
@@ -85,6 +88,8 @@ def calibration(p: np.ndarray, y: np.ndarray, bins: int) -> dict:
 
 LEAD_BINS = ((0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0))
 """Time to the ground fall (s) the warned share is reported over."""
+SPEED_BINS = ((-9.0, 0.1), (0.1, 0.3), (0.3, 0.6), (0.6, 9.0))
+"""Forward speed (m/s, true) at the sample's start."""
 GROUPS = ("healthy", "locked", "weak", "limp")
 
 
@@ -123,7 +128,9 @@ def evaluate_split(
   model = dyn.model
   dl = DataLoader(ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers)
   pooled: dict[str, list[torch.Tensor]] = {}
-  extra: dict[str, list[np.ndarray]] = {k: [] for k in ("terrain", "fall_t", "group")}
+  extra: dict[str, list[np.ndarray]] = {
+    k: [] for k in ("terrain", "fall_t", "group", "prefault", "vx")
+  }
   step_s = 0.1
   for batch in dl:
     batch = {k: v.to(device) for k, v in batch.items()}
@@ -143,6 +150,8 @@ def evaluate_split(
     extra["terrain"].append(batch["terrain_id"].cpu().numpy())
     extra["fall_t"].append(fall_t.cpu().numpy())
     extra["group"].append(fault_group(batch["fault"]).cpu().numpy())
+    extra["prefault"].append(batch["prefault_mode"].cpu().numpy())
+    extra["vx"].append(batch["state_true_vel"][:, 0].cpu().numpy())
   m = {k: torch.cat(v) for k, v in pooled.items()}
   e = {k: np.concatenate(v) for k, v in extra.items()}
   out: dict[str, Any] = dict(summarize_metrics(m))
@@ -176,6 +185,16 @@ def evaluate_split(
   out["per_group"] = {
     g: falls(e["group"] == i) for i, g in enumerate(GROUPS) if (e["group"] == i).any()
   }
+  out["per_prefault"] = {
+    name: falls(e["prefault"] == i)
+    for i, name in enumerate(PREFAULT_MODES)
+    if (e["prefault"] == i).sum() >= 20
+  }
+  out["per_speed"] = {}
+  for lo, hi in SPEED_BINS:
+    sel = (e["vx"] >= lo) & (e["vx"] < hi)
+    if sel.sum() >= 20:
+      out["per_speed"][f"{lo:g}-{hi:g}"] = falls(sel)
   per_terrain = {}
   for tid, name in enumerate(TERRAINS):
     sel = torch.as_tensor(e["terrain"] == tid)
@@ -230,6 +249,15 @@ def main():
       f" {r['fall_soon_auroc']:.3f}, ECE {r['fall_soon_calibration']['ece']:.3f});"
       f" warned at {cfg.false_alarm:.0%} false alarms, by time to fall: {warned}"
     )
+    for key in ("per_prefault", "per_speed"):
+      print(
+        f"[INFO]   {key[4:]}: "
+        + ", ".join(
+          f"{k} n {v['samples']} drift 5 s {v['drift_err_5s']:.3f}"
+          f" cover2s {v['cover2s_5s']:.2f}"
+          for k, v in r[key].items()
+        )
+      )
   (out_dir / "eval.json").write_text(json.dumps(results, indent=2))
 
   fig, ax = plt.subplots(1, 2, figsize=(11, 4.6))

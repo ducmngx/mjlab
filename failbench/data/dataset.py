@@ -12,7 +12,8 @@ Shards are memory-mapped. Each item is a dict of tensors:
   ``latent_future`` ``[T, 16]`` (shards built with them), and with
   ``contacts`` ``contact``
   ``[T, H, W]`` rasterised from the CSR rows;
-- labels ``fault_family``, ``plan_hold``, ``terrain_id``, ``offset_s``.
+- labels ``fault_family``, ``plan_hold``, ``terrain_id``, ``offset_s``,
+  ``prefault_mode`` (0, walk, for shards built before the modes).
 """
 
 from __future__ import annotations
@@ -103,6 +104,9 @@ class FailBenchDataset(Dataset):
     keys = (*_PER_SAMPLE, *(k for k in _OPTIONAL if k in a))
     item = {k: torch.from_numpy(np.array(a[k][row])) for k in keys}
     item["terrain_id"] = torch.tensor(self.metas[s]["terrain_id"])
+    item["prefault_mode"] = torch.tensor(
+      int(a["prefault_mode"][row]) if "prefault_mode" in a else 0
+    )
 
     height = torch.from_numpy(a["map_clean"][row].astype(np.float32))
     if self.map_mode == "clean":

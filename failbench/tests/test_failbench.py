@@ -8,7 +8,13 @@ import mujoco
 import numpy as np
 import pytest
 import torch
-from failbench.commands import GoalVelocityCommand
+from failbench.commands import (
+  PREFAULT_MODES,
+  GoalVelocityCommand,
+  GoalVelocityCommandCfg,
+  PrefaultCfg,
+  prefault_still,
+)
 from failbench.data.build import (
   SPLITS,
   BuildConfig,
@@ -312,6 +318,46 @@ def test_fault_writes_and_plan_starts_in_real_env():
   assert (command.plan.pose[:, :2] != robot.data.root_link_pos_w[:, :2]).any()
   assert math.isfinite(robot.data.joint_pos.sum().item())
   env.close()
+
+
+def test_prefault_modes_stand_set_off_and_stop_around_the_fault():
+  m = {k: i for i, k in enumerate(PREFAULT_MODES)}
+  mode = torch.tensor([m["walk"], m["stand"], m["start"], m["slow"], m["stopped"]])
+  lead = torch.full((5,), 1.0)
+  fault_time = torch.full((5,), 4.0)
+
+  def still(t: float) -> list[bool]:
+    return prefault_still(torch.full((5,), t), fault_time, mode, lead, 1.0).tolist()
+
+  assert still(0.5) == [True] * 5  # warm-up
+  assert still(2.0) == [False, True, True, False, False]
+  assert still(3.5) == [False, True, False, False, True]
+
+  # The draws follow the mix, and only slow trials cruise slowly.
+  cmd = GoalVelocityCommand.__new__(GoalVelocityCommand)
+  pc = PrefaultCfg(mix=(1, 1, 1, 1, 1), slow_speed=(0.2, 0.3))
+  cmd.goal_cfg = GoalVelocityCommandCfg(
+    entity_name="robot",
+    resampling_time_range=(1.0, 1.0),
+    ranges=GoalVelocityCommandCfg.Ranges(
+      lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0)
+    ),
+    prefault=pc,
+  )
+  cmd._env = type("Env", (), {"device": "cpu"})()  # type: ignore[assignment]
+  n = 2000
+  cmd.speed, cmd.lead = torch.zeros(n), torch.zeros(n)
+  cmd.mode = torch.zeros(n, dtype=torch.long)
+  cmd.started = torch.ones(n, dtype=torch.bool)
+  cmd.use_external = torch.ones(n, dtype=torch.bool)
+  cmd.vel_command_b = torch.ones(n, 3)
+  torch.manual_seed(0)
+  cmd._resample_command(torch.arange(n))
+  share = torch.bincount(cmd.mode, minlength=5) / n
+  assert (share - 0.2).abs().max() < 0.04
+  slow = cmd.mode == m["slow"]
+  assert cmd.speed[slow].max() <= 0.3 and cmd.speed[~slow].min() >= 0.5
+  assert not cmd.started.any() and (cmd.vel_command_b == 0).all()
 
 
 def test_a_waypoint_passed_outside_its_radius_still_counts():

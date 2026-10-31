@@ -8,6 +8,10 @@ known the moment it fires (no detection), and the command is:
   proportional to the heading error to the goal, and the forward speed (the
   trial's cruise speed) is scaled by the cosine of that error, so the robot
   turns before it walks. It stops within ``arrive_radius`` of the goal.
+  Each trial draws a pre-fault mode (``PrefaultCfg``): it walks so (the
+  default), stands until the fault, sets off shortly before it, walks
+  slowly, or walks and stops shortly before it, so the impact model also
+  sees faults at rest and at low speed, as a planner meets them.
 - From the fault: a segment plan (``failbench.plans.SegmentPlan``) started
   from the follower's command on the fault step (``c0``) and the robot's
   pose then, and open loop from there on: a hold of ``c0``, or a few
@@ -42,6 +46,43 @@ if TYPE_CHECKING:
 GOAL_TERM = "goal"
 
 
+PREFAULT_MODES = ("walk", "stand", "start", "slow", "stopped")
+
+
+@dataclass(frozen=True)
+class PrefaultCfg:
+  """What a trial does before its fault, timed against the fault time (on
+  stairs, whose faults fire by position, the timeout: there ``stopped``
+  mostly faults while walking)."""
+
+  mix: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 0.0)
+  """Share of each of ``PREFAULT_MODES`` (normalised)."""
+  start_lead_s: tuple[float, float] = (0.1, 1.5)
+  """``start``: sets off this long before the fault."""
+  slow_speed: tuple[float, float] = (0.2, 0.5)
+  """``slow``: cruise speed (``zero_below`` zeroes slower commands)."""
+  stop_lead_s: tuple[float, float] = (0.3, 2.0)
+  """``stopped``: stops this long before the fault."""
+
+
+def prefault_still(
+  t: torch.Tensor,
+  fault_time_s: torch.Tensor,
+  mode: torch.Tensor,
+  lead: torch.Tensor,
+  warmup_s: float,
+) -> torch.Tensor:
+  """Whether each trial's follower stands at time ``t`` (s), by its mode
+  (``PREFAULT_MODES``) and ``lead`` (s before ``fault_time_s``)."""
+  to_fault = fault_time_s - t
+  return (
+    (t < warmup_s)
+    | (mode == PREFAULT_MODES.index("stand"))
+    | ((mode == PREFAULT_MODES.index("start")) & (to_fault > lead))
+    | ((mode == PREFAULT_MODES.index("stopped")) & (to_fault <= lead))
+  )
+
+
 class GoalVelocityCommand(UniformVelocityCommand):
   def __init__(self, cfg: GoalVelocityCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
@@ -49,6 +90,10 @@ class GoalVelocityCommand(UniformVelocityCommand):
     n, dev = self.num_envs, self.device
     self.speed = torch.zeros(n, device=dev)
     """Cruise speed of the goal follower."""
+    self.mode = torch.zeros(n, dtype=torch.long, device=dev)
+    """Pre-fault mode, an index into ``PREFAULT_MODES``."""
+    self.lead = torch.zeros(n, device=dev)
+    """``start`` / ``stopped``: seconds before the fault it sets off / stops."""
     self.plan = SegmentPlan(n, cfg.plan, dev)
     self.c0 = torch.zeros(n, 3, device=dev)
     self.started = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -62,8 +107,23 @@ class GoalVelocityCommand(UniformVelocityCommand):
     return torch.cat([torch.where(small, 0.0, cmd[..., :2]), cmd[..., 2:]], dim=-1)
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
-    lo, hi = self.goal_cfg.speed
-    self.speed[env_ids] = lo + (hi - lo) * torch.rand(len(env_ids), device=self.device)
+    pc, m, dev = self.goal_cfg.prefault, len(env_ids), self.device
+
+    def uniform(r: tuple[float, float]) -> torch.Tensor:
+      return r[0] + (r[1] - r[0]) * torch.rand(m, device=dev)
+
+    mix = torch.tensor(pc.mix, device=dev)
+    mode = torch.multinomial(mix / mix.sum(), m, replacement=True)
+    slow = mode == PREFAULT_MODES.index("slow")
+    self.mode[env_ids] = mode
+    self.speed[env_ids] = torch.where(
+      slow, uniform(pc.slow_speed), uniform(self.goal_cfg.speed)
+    )
+    self.lead[env_ids] = torch.where(
+      mode == PREFAULT_MODES.index("start"),
+      uniform(pc.start_lead_s),
+      uniform(pc.stop_lead_s),
+    )
     self.started[env_ids] = False
     self.use_external[env_ids] = False
     self.vel_command_b[env_ids] = 0.0
@@ -93,7 +153,10 @@ class GoalVelocityCommand(UniformVelocityCommand):
     if len(running):
       self.plan.step(running, self._env.step_dt)
     t = self._env.episode_length_buf.float() * self._env.step_dt
-    follow = torch.where((t < self.goal_cfg.warmup_s)[:, None], 0.0, follow)
+    still = prefault_still(
+      t, fault.fault_time_s, self.mode, self.lead, self.goal_cfg.warmup_s
+    )
+    follow = torch.where(still[:, None], 0.0, follow)
     new = (fault.faulted & ~self.started).nonzero().squeeze(-1)
     if len(new):
       self.c0[new] = follow[new]
@@ -127,6 +190,7 @@ class GoalVelocityCommandCfg(UniformVelocityCommandCfg):
   """World heading (rad) of a lane through the goal for lane-following plans
   (the course: 0, lanes run along +x); ``None`` for goal-bearing plans."""
   zero_below: float = 0.2
+  prefault: PrefaultCfg = field(default_factory=PrefaultCfg)
 
   def build(self, env: ManagerBasedRlEnv) -> GoalVelocityCommand:
     return GoalVelocityCommand(self, env)

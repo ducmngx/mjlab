@@ -25,7 +25,7 @@ A shard (``<output_dir>/<prefix>_r<round>.npz``) holds, per trial ``b``:
   (``fault_elevation_sensor_cfg``).
 - ``fault_params`` ``[B, 12, 2]``, ``fault_family``, ``fault_time_s``
   (when it actually fired); ``goal_w``, ``cmd_speed`` (the follower's
-  cruise speed), ``cmd_c0`` (the command on the fault step), ``plan_hold``
+  cruise speed), ``prefault_mode`` (``failbench.commands.PREFAULT_MODES``), ``cmd_c0`` (the command on the fault step), ``plan_hold``
   (the post-fault plan holds ``c0``); terrain tile at the fault.
 - ``contact_*``: one row per non-foot robot-terrain contact (slot and step)
   at or above ``min_contact_force_n``: env, step, part, world position,
@@ -38,7 +38,7 @@ A shard (``<output_dir>/<prefix>_r<round>.npz``) holds, per trial ``b``:
 from __future__ import annotations
 
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -60,7 +60,7 @@ from heat_bench.envs_mjlab.joint_fault_injection import (
 )
 from heat_bench.scripts.policy_loading import load_runner
 
-from failbench.commands import GoalVelocityCommand
+from failbench.commands import GoalVelocityCommand, PrefaultCfg
 from failbench.data.build import fallen
 from failbench.env_cfg import DEFAULT_TASK, failbench_env_cfg
 from failbench.faults import FAULT_PARAMS, FAULT_TERM, inject_kinodynamic_fault
@@ -91,6 +91,9 @@ class GenerateConfig:
   """Logged after the fault: the last snapshot plus the 5 s target window."""
   snapshot_s: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0)
   min_contact_force_n: float = 1.0
+  prefault: PrefaultCfg = field(default_factory=PrefaultCfg)
+  """What trials do before the fault; e.g. ``--prefault.mix 0.2 0.2 0.2 0.2
+  0.2`` also faults robots at rest, setting off, slow and just stopped."""
   prefix: str | None = None
   """Shard name prefix; defaults to '<terrain>_s<seed>'."""
 
@@ -298,6 +301,7 @@ def run_round(
     "fault_time_s": _np(fault.fault_step.float() * step_dt),
     "goal_w": _np(command.goal_w),
     "cmd_speed": _np(command.speed),
+    "prefault_mode": _np(command.mode).astype(np.uint8),
     "cmd_c0": _np(command.c0),
     "plan_hold": _np(command.plan.hold),
     "tile_fault": _np(tile),
@@ -318,7 +322,11 @@ def generate(cfg: GenerateConfig) -> list[Path]:
   if cfg.terrain_seed is not None:
     torch.manual_seed(cfg.terrain_seed)
   env_cfg = failbench_env_cfg(
-    cfg.task, cfg.terrain, cfg.terrain_seed, fault_time_s=cfg.fault_time_s
+    cfg.task,
+    cfg.terrain,
+    cfg.terrain_seed,
+    fault_time_s=cfg.fault_time_s,
+    prefault=cfg.prefault,
   )
   env_cfg.scene.num_envs = cfg.num_envs
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)

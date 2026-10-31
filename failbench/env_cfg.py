@@ -28,7 +28,7 @@ from heat_bench.envs_mjlab.go2_eval_env_cfg import (
 from heat_bench.envs_mjlab.joint_fault_injection import fault_contact_sensor_cfg
 
 from failbench.cliff_course import CLIFF_COURSE, CLIFF_COURSE_TERRAIN, cliff_waypoints
-from failbench.commands import GOAL_TERM, GoalVelocityCommandCfg
+from failbench.commands import GOAL_TERM, GoalVelocityCommandCfg, PrefaultCfg
 from failbench.door_course import DOOR_COURSE, DOOR_COURSE_TERRAIN, door_waypoints
 from failbench.faults import FAULT_TERM, FaultMixture, inject_kinodynamic_fault
 from failbench.goals import GoalMode, sample_goal
@@ -137,9 +137,11 @@ def failbench_env_cfg(
   fault_time_s: tuple[float, float] = (3.0, 5.0),
   plan: PlanCfg | None = None,
   mixture: FaultMixture | None = None,
+  prefault: PrefaultCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """``fault_time_s`` applies to rough and course; stair trials fault by
-  position (``STAIR_FIRE_RADIUS``)."""
+  position (``STAIR_FIRE_RADIUS``). ``prefault``: what trials do before the
+  fault (default: walk)."""
   cfg = load_env_cfg(task, play=True)
   if "actuator_health" in cfg.events:
     raise ValueError("FailBench faults write the force range themselves.")
@@ -228,6 +230,7 @@ def failbench_env_cfg(
       lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0)
     ),
     plan=plan or PlanCfg(),
+    prefault=prefault or PrefaultCfg(),
     # Course lanes run along +x through the goal at the lane end.
     lane_heading=0.0 if GOAL_MODES[terrain] == "lane" else None,
   )

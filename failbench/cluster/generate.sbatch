@@ -18,6 +18,14 @@
 #   NUM_ENVS    4096 trials per round
 #   ROUNDS      4 rounds (one raw shard each)
 #   SEED        $SLURM_ARRAY_TASK_ID, else 0
+#   PREFAULT_MIX  shares of the pre-fault modes walk, stand, start, slow,
+#               stopped (failbench/commands.py), default "1 0 0 0 0"
+#   SAMPLES     built shards, default $FAILBENCH_ROOT/samples
+#
+# The low-speed shards (faults at rest, setting off, slow, just stopped),
+# seeds 60-119:
+#
+#   sbatch --array=60-119 --export=ALL,ROUNDS=1,PREFAULT_MIX="0.2 0.2 0.2 0.2 0.2",SAMPLES=/scratch/$USER/failbench/samples_lowspeed failbench/cluster/generate.sbatch
 #
 # Writes under FAILBENCH_ROOT (default /scratch/$USER/failbench): raw shards
 # to raw/, built sample shards to samples/. Afterwards, compute the
@@ -50,11 +58,13 @@ TASK="${TASK:-Go2-HIM-Rough-Original}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 ROUNDS="${ROUNDS:-4}"
 SEED="${SEED:-${SLURM_ARRAY_TASK_ID:-0}}"
+read -r -a mix <<< "${PREFAULT_MIX:-1 0 0 0 0}"
+SAMPLES="${SAMPLES:-$FAILBENCH_ROOT/samples}"
 TERRAINS=(rough stairs stairs_up course stairs_tall stairs_up_tall)
 TERRAIN="${TERRAIN:-${TERRAINS[$(( (SEED / 10) % 6 ))]}}"
 
 echo "[failbench] $(date) host=$(hostname) job=${SLURM_JOB_ID:-local} commit=$(git rev-parse --short HEAD)"
-echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS -> $FAILBENCH_ROOT"
+echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS prefault=${mix[*]} -> $SAMPLES"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 uv run python -m failbench.scripts.generate \
@@ -64,9 +74,10 @@ uv run python -m failbench.scripts.generate \
   --terrain "$TERRAIN" \
   --terrain-seed "$SEED" \
   --num-envs "$NUM_ENVS" \
-  --rounds "$ROUNDS"
+  --rounds "$ROUNDS" \
+  --prefault.mix "${mix[@]}"
 
 shopt -s nullglob
 raw=("$FAILBENCH_ROOT/raw/${TERRAIN}_s${SEED}_r"*.npz)
-uv run python -m failbench.data.build --raw "${raw[@]}" --output-dir "$FAILBENCH_ROOT/samples"
+uv run python -m failbench.data.build --raw "${raw[@]}" --output-dir "$SAMPLES"
 echo "[failbench] $(date) done"
