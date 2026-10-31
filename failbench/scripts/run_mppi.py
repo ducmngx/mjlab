@@ -22,7 +22,8 @@ full), and from there MPPI drives, re-planning every 0.1 s with a one-cycle
 delay. A planner command takes effect one control step after it is written
 (the command term updates before the observation in
 ``ManagerBasedRlEnv.step``). An env stops (zero command) once it reaches its
-goal or falls.
+goal or falls: tipped over 60 degrees, or down as the data counts a fall
+(``failbench.data.build.FallMonitor``; known 0.5 s after it happens).
 
 Writes ``<output>.npz`` (per-step robot state and per-cycle plans, for
 ``failbench/scripts/play_mppi.py``) and ``<output>.json`` (per-trial and
@@ -58,7 +59,7 @@ from heat_bench.envs_mjlab.joint_fault_injection import (
 from heat_bench.scripts.policy_loading import load_runner
 
 from failbench.commands import GOAL_TERM, GoalVelocityCommand
-from failbench.data.build import _yaw_rotate_quat, fallen, lidar_known
+from failbench.data.build import FallMonitor, _yaw_rotate_quat, lidar_known
 from failbench.env_cfg import (
   DEFAULT_TASK,
   GOAL_MODES,
@@ -350,6 +351,7 @@ def run(cfg: RunMppiConfig) -> dict:
   active = torch.zeros(n, dtype=torch.bool, device=device)
   reached = torch.zeros(n, dtype=torch.bool, device=device)
   down = torch.zeros(n, dtype=torch.bool, device=device)
+  fall = FallMonitor(n, round(0.5 / step_dt), device)
   t_reach = torch.full((n,), float("nan"), device=device)
   collided = torch.zeros(n, dtype=torch.bool, device=device)
   fell_off = torch.zeros(n, dtype=torch.bool, device=device)
@@ -384,7 +386,7 @@ def run(cfg: RunMppiConfig) -> dict:
     _, _, contact_w, force_w, valid = contacts_in_base_frame(sensor, robot)
     trunk_hit = (valid & slot_trunk & (force_w.norm(dim=-1) >= 1.0)).any(-1)
     started = t >= cfg.start_s
-    down |= fallen(tilt, base_height) & started
+    down |= fall.update(tilt, base_height, trunk_hit) & started
     collided |= trunk_hit & started & ~reached
     if i == 0:
       start_z = pos[:, 2].clone()

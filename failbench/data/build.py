@@ -148,6 +148,51 @@ def fallen(
   return (tilt > math.radians(tilt_deg)) | (base_height < height_m)
 
 
+class FallMonitor:
+  """``fall_step``'s rule online, for closed-loop runs: ``update`` once a
+  step returns the envs that are down. A tilt over ``tilt_deg`` counts at
+  once (tipped over); any other ``fallen`` step counts once confirmed
+  ``hold_steps`` later, as in the data: trunk or head contact within
+  ``hold_steps`` either side and not back upright within ``hold_steps``
+  after. So a trunk dip the policy recovers from isn't a fall."""
+
+  def __init__(
+    self,
+    n: int,
+    hold_steps: int,
+    device: torch.device | str,
+    tilt_deg: float = FALL_TILT_DEG,
+    height_m: float = FALL_HEIGHT_M,
+    recover_tilt_deg: float = 30.0,
+    recover_height_m: float = 0.22,
+  ):
+    self.hold = hold_steps
+    self.tilt = math.radians(tilt_deg)
+    self.height = height_m
+    self.recover_tilt = math.radians(recover_tilt_deg)
+    self.recover_height = recover_height_m
+    # Steps t - 2 hold .. t; the candidate is the middle one.
+    self.down = torch.zeros(n, 2 * hold_steps + 1, dtype=torch.bool, device=device)
+    self.up = torch.zeros_like(self.down)
+    self.contact = torch.zeros_like(self.down)
+
+  def update(
+    self, tilt: torch.Tensor, base_height: torch.Tensor, trunk_contact: torch.Tensor
+  ) -> torch.Tensor:
+    def push(buf: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+      return torch.cat([buf[:, 1:], x[:, None]], 1)
+
+    low = (tilt > self.tilt) | (base_height < self.height)
+    self.down = push(self.down, low)
+    self.up = push(
+      self.up, (tilt < self.recover_tilt) & (base_height > self.recover_height)
+    )
+    self.contact = push(self.contact, trunk_contact)
+    h = self.hold
+    confirmed = self.down[:, h] & ~self.up[:, h + 1 :].any(1) & self.contact.any(1)
+    return (tilt > self.tilt) | confirmed
+
+
 @dataclass(frozen=True)
 class BuildConfig:
   raw: tuple[str, ...]

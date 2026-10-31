@@ -12,6 +12,7 @@ from failbench.commands import GoalVelocityCommand
 from failbench.data.build import (
   SPLITS,
   BuildConfig,
+  FallMonitor,
   _split,
   fall_step,
   no_return_step,
@@ -432,6 +433,29 @@ def test_a_fall_is_down_for_good_with_the_trunk_on_the_ground():
   assert falls.tolist() == [t, t, 140, t]
   loose = BuildConfig(raw=(), output_dir="", fall_needs_contact=False)
   assert fall_step(tilt, height, contact, 100, loose, 25).tolist() == [t, t, 140, 140]
+
+
+def test_the_online_fall_counts_a_tip_at_once_and_a_sag_once_it_stays():
+  t, n = 200, 4
+  tilt = torch.full((n, t), 0.1)
+  height = torch.full((n, t), 0.30)
+  contact = torch.zeros(n, t, dtype=torch.bool)
+  # 0: stumbles over 60 deg at 120 and recovers: tipped, counted at once.
+  tilt[0, 120:126] = 1.2
+  # 1: trunk read 0.12 m over a stair edge at 120, no contact, walks on.
+  height[1, 120:124] = 0.12
+  # 2: trunk sinks onto the ground at 140 and stays: confirmed 0.5 s later.
+  height[2, 140:] = 0.12
+  contact[2, 140:] = True
+  # 3: like 2 but back up by 150.
+  height[3, 140:150] = 0.12
+  contact[3, 140:150] = True
+  monitor = FallMonitor(n, hold_steps=25, device="cpu")
+  down = torch.stack(
+    [monitor.update(tilt[:, k], height[:, k], contact[:, k]) for k in range(t)], 1
+  )
+  first = torch.where(down.any(1), down.float().argmax(1), t)
+  assert first.tolist() == [120, t, 165, t]
 
 
 def test_the_latent_head_starts_at_the_scale_of_its_target():
