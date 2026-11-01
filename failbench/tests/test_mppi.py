@@ -448,3 +448,30 @@ def test_standing_still_pays_the_fault_risk_of_the_ground_ahead():
   # Faults by the second: standing where nothing is in reach looks safe.
   per_s = costs[False]
   assert per_s[0] < 0.05 * per_s[1]
+
+
+def test_turning_on_the_spot_does_not_dodge_the_ground_ahead():
+  h = torch.zeros(1, 160, 160)
+  h[:, :66, 112:] = -0.6  # A ledge to the right (-y), from 1.6 m ahead on.
+  cfg = MppiCfg(
+    sampler=SamplerCfg(num_plans=16, compile=False),
+    fault_risk=FaultRiskCfg(p=0.1, modes=("free",)),
+  )
+  planner = Mppi(cfg, _Thrown(side=-1.0), 1, "cpu")
+  fp = cfg.footprint
+  obst, drops = obstacle_cells(h, fp.wall_jump_m), drop_cells(h, fp, RES)
+  plans = torch.zeros(1, 2, 50, 3)
+  plans[0, 1, :, 2] = 0.3  # Stand, or turn left on the spot, away from it.
+  sc = planner.score(
+    {"fault": torch.tensor(NOMINAL).repeat(12)[None]},
+    plans,
+    distance_field(obst, RES, fp.max_dist_m),
+    torch.ones_like(h, dtype=torch.bool),
+    RES,
+    torch.tensor([[6.0, 0.0]]),
+    drop_dist=distance_field(drops, RES, fp.max_dist_m),
+    risk_fields=planner._risk_fields(obst, drops, None, RES),
+  )
+  # The ground still to walk lies toward the goal, whichever way it faces.
+  risk = sc["terms"]["fault_risk"][0]
+  assert risk[0] > 0 and torch.isclose(risk[0], risk[1], rtol=0.01)

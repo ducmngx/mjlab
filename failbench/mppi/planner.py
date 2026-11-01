@@ -19,7 +19,9 @@ One cycle (every ``step_s``) for ``n`` robots:
    points along the plan's predicted path, the robot carrying on at the
    plan's speed (it hasn't noticed yet, and couldn't stop at once if it
    had). The points are the first few metres the robot will walk
-   (``fire_m``), past the plan's end straight on at its last heading, and
+   (``fire_m``), past the plan's end on toward the goal (the ground it
+   still has to walk; along its last heading, a plan that turns on the spot
+   would price open ground instead), and
    the fault chance is per metre: faults come with use, so standing still
    only puts the same stretch off, and a plan that stops pays for the
    ground ahead as one that walks it. Each branch's throw (drift, spread
@@ -68,7 +70,7 @@ from failbench.mppi.costmap import (
 )
 from failbench.mppi.inputs import deadband, integrate_plan
 from failbench.mppi.models import DynamicsModel
-from failbench.mppi.sampler import CRUISE_VX, PlanSampler, SamplerCfg
+from failbench.mppi.sampler import CRUISE_VX, ROUTE_VX, PlanSampler, SamplerCfg
 
 
 @dataclass(frozen=True)
@@ -339,11 +341,12 @@ class Mppi:
     }
 
   def _firing_points(
-    self, plans: torch.Tensor, pose: torch.Tensor
+    self, plans: torch.Tensor, pose: torch.Tensor, goal: torch.Tensor
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Where each fault fires on ``plans [n, k, T, 3]`` (predicted ``pose``):
-    poses ``[n, k, F, 3]``, forward speeds ``[n, k, F]``, seconds ahead
-    ``[n, k, F]`` and each point's chance per unit ``p`` ``[F]``."""
+    """Where each fault fires on ``plans [n, k, T, 3]`` (predicted ``pose``,
+    ``goal [n, 2]``): poses ``[n, k, F, 3]``, forward speeds ``[n, k, F]``,
+    seconds ahead ``[n, k, F]`` and each point's chance per unit ``p``
+    ``[F]``."""
     c, fr = self.cfg, self.cfg.fault_risk
     s = c.sampler
     if fr.fire_m is None:
@@ -358,14 +361,17 @@ class Mppi:
     walked = torch.cat([xy[..., :1, :].norm(dim=-1), xy.diff(dim=-2).norm(dim=-1)], -1)
     walked = walked.cumsum(-1)  # [n, k, T]
     steps = walked.shape[-1]
-    # The first step at or past each mark; past the end, straight on.
+    # The first step at or past each mark; past the end, on toward the goal.
     idx = (walked[..., None, :] < marks[:, None]).sum(-1)  # [n, k, F]
     beyond = idx >= steps
     idx = idx.clamp(max=steps - 1)
     p0 = pose.gather(2, idx[..., None].expand(-1, -1, -1, 3))
     vx = plans[..., 0].gather(2, idx)
     extra = (marks - walked[..., -1:]).clamp(min=0) * beyond  # [n, k, F]
-    yaw = p0[..., 2]
+    to_goal = goal[:, None, None] - p0[..., :2]
+    bearing = torch.atan2(to_goal[..., 1], to_goal[..., 0])
+    yaw = torch.where(beyond, bearing, p0[..., 2])
+    p0 = torch.cat([p0[..., :2], yaw[..., None]], -1)
     p0 = p0 + torch.stack(
       [extra * torch.cos(yaw), extra * torch.sin(yaw), 0 * yaw], dim=-1
     )
@@ -381,6 +387,7 @@ class Mppi:
     pose: torch.Tensor,
     fields: list[tuple[float, torch.Tensor]],
     resolution: float,
+    goal: torch.Tensor,
     per_branch: bool = False,
   ) -> torch.Tensor | dict[str, torch.Tensor]:
     """Expected severity of a fault's throw per plan ``[n, k]``: over
@@ -399,7 +406,7 @@ class Mppi:
     tp = d.shape[-2]
     # Placed at each firing point's pose on every plan, from the held speed
     # nearest the plan's there.
-    p0, vx, fire_at, share = self._firing_points(plans, pose)  # [n, k, F, ...]
+    p0, vx, fire_at, share = self._firing_points(plans, pose, goal)  # [n, k, F, ...]
     near = (vx[..., None] - vxs).abs().argmin(-1)  # [n, k, F]
     rows = torch.arange(n, device=pose.device)[:, None, None]
     d, sd, fall = d[rows, near], sd[rows, near], fall[rows, near]  # [n, k, F, B, ...]
@@ -549,7 +556,7 @@ class Mppi:
     if c.fault_risk.p > 0:
       if risk_fields:
         throws = self._throws(inputs)
-        risk = self._fault_risk(throws, plans, pose, risk_fields, resolution)
+        risk = self._fault_risk(throws, plans, pose, risk_fields, resolution, goal)
         risk = w.fault_risk * cast(torch.Tensor, risk)
       else:
         risk = pose.new_zeros(pose.shape[:2])
@@ -649,13 +656,20 @@ class Mppi:
     mine_pred = self.model.predict(inputs, mine, mine_path, contact_maps=True)
     s_step = c.sampler.step_s
     progress = pose[..., -1, :2] @ torch.tensor([1.0, 0.0], device=pose.device)
+    no_risk = torch.zeros_like(cost)
     probe = {
-      f"cruise{vx}_{name}": v[:, 3 + i]
-      for i, vx in enumerate(CRUISE_VX)
+      f"{plan}_{name}": v[:, i]
+      for i, plan in [
+        (2, "stop"),
+        *((3 + i, f"cruise{vx}") for i, vx in enumerate(CRUISE_VX)),
+        *((3 + len(CRUISE_VX) + i, f"route{vx}") for i, vx in enumerate(ROUTE_VX)),
+      ]
       for name, v in (
         ("cost", cost),
         ("progress", progress),
         ("p_fallen", pred["p_fallen"][..., -1]),
+        ("fault_risk", terms.get("fault_risk", no_risk)),
+        ("goal", terms["goal"]),
       )
     }
     best = weight.argmax(-1)
@@ -682,7 +696,7 @@ class Mppi:
       # What each fault branch would do to the plan being run, for logs.
       mine_pose = mine_path + mine_pred["drift"]
       br = self._fault_risk(
-        sc["throws"], mine, mine_pose, risk_fields, resolution, per_branch=True
+        sc["throws"], mine, mine_pose, risk_fields, resolution, goal, per_branch=True
       )
       br = cast(dict[str, torch.Tensor], br)
       scale = c.weights.fault_risk
