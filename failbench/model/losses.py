@@ -190,8 +190,12 @@ def impact_metrics(
   if "collision_logit" in pred:
     out["collided"] = (batch["collision"].bool() & batch["valid"].bool()).any(dim=1)
     out["p_collided"] = torch.sigmoid(pred["collision_logit"]).amax(dim=1)
-  for s in (1, 3, 5):
+  # At 1, 2, 3 and 5 s after the fault, those inside the window (3 s
+  # samples: 1-3 s).
+  for s in (1, 2, 3, 5):
     k = round(s / step_s) - 1
+    if k >= err.shape[1]:
+      continue
     out[f"drift_err_{s}s"] = torch.where(up[:, k], err[:, k], float("nan"))
     zero = drift_target(batch)[:, k, :2].norm(dim=-1)
     out[f"zero_err_{s}s"] = torch.where(up[:, k], zero, float("nan"))

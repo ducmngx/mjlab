@@ -150,8 +150,8 @@ def test_lane_plans_return_to_the_centre_line():
   assert plan.pose[:, 1].abs().median() < 0.15
 
 
-def _fake_batch(b: int = 3) -> dict[str, torch.Tensor]:
-  t, cells = 50, 64
+def _fake_batch(b: int = 3, t: int = 50) -> dict[str, torch.Tensor]:
+  cells = 64
   upright = torch.ones(b, t, dtype=torch.bool)
   upright[0, 20:] = False  # Sample 0 falls in step 20.
   return {
@@ -476,10 +476,13 @@ def test_a_touch_takes_the_severity_of_what_is_under_it_far_from_the_origin():
 
 def test_geom_names_map_to_severity():
   spec = mujoco.MjSpec()
-  for name in ("course_glass_3", "course_wall_7", "course_floor_0", ""):
+  names = ("course_glass_3", "course_wall_7", "course_floor_0", "", "terrain_12")
+  for name in names:
     spec.worldbody.add_geom(name=name, size=(0.1, 0.1, 0.1))
   sev = geom_severity(spec.compile()).tolist()
-  assert sev == [SEVERITY["glass"], SEVERITY["wall"], 0.0, DEFAULT_SEVERITY, 0.0]
+  # The ground itself (rough tiles, stairs) is no damage to touch.
+  expect = [SEVERITY["glass"], SEVERITY["wall"], 0.0, DEFAULT_SEVERITY, 0.0, 0.0]
+  assert sev == expect
 
 
 @pytest.mark.parametrize(
@@ -760,3 +763,18 @@ def test_samples_keep_what_the_driver_committed_to_and_old_shards_say_none():
   raw = {"plan_source": np.array([0, 1, 2, 3], np.uint8)}
   assert plan_sources(raw, np.array([3, 1])).tolist() == [3, 1]
   assert plan_sources({}, np.array([0, 2])).tolist() == [NO_SOURCE] * 2
+
+
+def test_a_three_second_model_trains_and_is_scored_within_its_window():
+  torch.manual_seed(0)
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1, num_steps=30)
+  model = ImpactModel(cfg, _unit_stats())
+  batch = _fake_batch(t=30)
+  batch["safe"] = batch["upright"].clone()
+  pred = model(batch)
+  assert pred["drift"].shape == (3, 30, 3)
+  total, _ = impact_loss(pred, batch, LossWeights(), 10, "safe")
+  total.backward()
+  m = impact_metrics(pred, batch, fall_label="safe")
+  assert {"drift_err_1s", "drift_err_2s", "drift_err_3s"} <= set(m)
+  assert "drift_err_5s" not in m

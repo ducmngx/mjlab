@@ -21,6 +21,17 @@
 #   PREFAULT_MIX  shares of the pre-fault modes walk, stand, start, slow,
 #               stopped (failbench/commands.py), default "1 0 0 0 0"
 #   SAMPLES     built shards, default $FAILBENCH_ROOT/samples
+#   RAW         raw shards, default $FAILBENCH_ROOT/raw
+#   DRIVER      planner-driven data (failbench/driver.py): nav2, dwb, or mix
+#               (dwb for seeds with SEED % 5 == 4, else nav2); empty (the
+#               default) for the goal follower. Driven data runs a 3.5 s
+#               window, one snapshot at the fault, builds 3 s samples, on
+#               the obstacle-free presets DRIVEN_TERRAINS[(i / 10) % 5]
+#               (rough, stairs, stairs_up, stairs_tall, stairs_up_tall).
+#
+# The planner-driven v3 data (mostly MPPI, some DWB), seeds 0-49:
+#
+#   sbatch --array=0-49 --export=ALL,ROUNDS=1,DRIVER=mix,PREFAULT_MIX="0.6 0.1 0.1 0.1 0.1",RAW=/scratch/$USER/failbench/raw_v3,SAMPLES=/scratch/$USER/failbench/samples_v3 failbench/cluster/generate.sbatch
 #
 # The low-speed shards (faults at rest, setting off, slow, just stopped),
 # seeds 60-119:
@@ -60,24 +71,38 @@ ROUNDS="${ROUNDS:-4}"
 SEED="${SEED:-${SLURM_ARRAY_TASK_ID:-0}}"
 read -r -a mix <<< "${PREFAULT_MIX:-1 0 0 0 0}"
 SAMPLES="${SAMPLES:-$FAILBENCH_ROOT/samples}"
+RAW="${RAW:-$FAILBENCH_ROOT/raw}"
+DRIVER="${DRIVER:-}"
+driven=()
+build=()
+if [ -n "$DRIVER" ]; then
+  if [ "$DRIVER" = mix ]; then
+    DRIVER=$([ $(( SEED % 5 )) -eq 4 ] && echo dwb || echo nav2)
+  fi
+  DRIVEN_TERRAINS=(rough stairs stairs_up stairs_tall stairs_up_tall)
+  TERRAIN="${TERRAIN:-${DRIVEN_TERRAINS[$(( (SEED / 10) % 5 ))]}}"
+  driven=(--horizon-s 3.5 --snapshot-s 0 driver:planner-drive-cfg --driver.planner "$DRIVER")
+  build=(--horizon-s 3.0)
+fi
 TERRAINS=(rough stairs stairs_up course stairs_tall stairs_up_tall)
 TERRAIN="${TERRAIN:-${TERRAINS[$(( (SEED / 10) % 6 ))]}}"
 
 echo "[failbench] $(date) host=$(hostname) job=${SLURM_JOB_ID:-local} commit=$(git rev-parse --short HEAD)"
-echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS prefault=${mix[*]} -> $SAMPLES"
+echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS prefault=${mix[*]} driver=${DRIVER:-none} -> $SAMPLES"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 uv run python -m failbench.scripts.generate \
   --checkpoint-file "$CHECKPOINT" \
   --task "$TASK" \
-  --output-dir "$FAILBENCH_ROOT/raw" \
+  --output-dir "$RAW" \
   --terrain "$TERRAIN" \
   --terrain-seed "$SEED" \
   --num-envs "$NUM_ENVS" \
   --rounds "$ROUNDS" \
-  --prefault.mix "${mix[@]}"
+  --prefault.mix "${mix[@]}" \
+  "${driven[@]}"
 
 shopt -s nullglob
-raw=("$FAILBENCH_ROOT/raw/${TERRAIN}_s${SEED}_r"*.npz)
-uv run python -m failbench.data.build --raw "${raw[@]}" --output-dir "$SAMPLES"
+raw=("$RAW/${TERRAIN}_s${SEED}_r"*.npz)
+uv run python -m failbench.data.build --raw "${raw[@]}" --output-dir "$SAMPLES" "${build[@]}"
 echo "[failbench] $(date) done"

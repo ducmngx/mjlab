@@ -154,6 +154,7 @@ def evaluate_split(
     extra["vx"].append(batch["state_true_vel"][:, 0].cpu().numpy())
   m = {k: torch.cat(v) for k, v in pooled.items()}
   e = {k: np.concatenate(v) for k, v in extra.items()}
+  horizon_s = len(ds[0]["upright"]) * step_s
   out: dict[str, Any] = dict(summarize_metrics(m))
   out["samples"] = len(m["fell"])
   out["fall_label"] = fall_label
@@ -170,11 +171,12 @@ def evaluate_split(
         cfg.bins,
       ),
       "warning": warning_lead(
-        m["p_fell_soon"].numpy()[sel], e["fall_t"][sel], cfg.false_alarm
+        m["p_fell_soon"].numpy()[sel], e["fall_t"][sel], cfg.false_alarm, horizon_s
       ),
     }
-    for k in ("drift_err_1s", "drift_err_5s", "cover2s_1s", "cover2s_3s", "cover2s_5s"):
-      r[k] = float(np.nanmean(m[k].numpy()[sel]))
+    for k in m:
+      if k.startswith(("drift_err_", "cover2s_")):
+        r[k] = float(np.nanmean(m[k].numpy()[sel]))
     return r
 
   out |= falls(np.ones(len(e["group"]), bool))

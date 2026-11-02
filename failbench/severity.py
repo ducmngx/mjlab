@@ -5,8 +5,9 @@ and the other courses); the class is the middle part. ``geom_severity``
 turns the model's geom names into a per-geom severity table, which the
 planning map's ray hits index (``RayCastData.hit_geom_id``) to give each
 obstacle cell the severity of what it is. Unnamed or unlisted geoms (the
-heat_bench course's crates, height-field terrain) get ``default``; floors
-get 0, though only obstacle cells (``failbench/mppi/costmap.py``) are ever
+heat_bench course's crates) get ``default``; floors and the terrain itself
+(``terrain_*``: rough tiles, stairs, slopes) get 0: touching the ground is
+no damage. Only obstacle cells (``failbench/mppi/costmap.py``) are ever
 charged.
 
 Severity is the cost of one incident, in the planner's cost units, the
@@ -50,6 +51,10 @@ def geom_severity(
   (geom id -1), is 0."""
   sev = []
   for g in range(model.ngeom):
-    cls = geom_class(model.geom(g).name)
-    sev.append(table.get(cls, default) if cls is not None else default)
+    name = model.geom(g).name
+    cls = geom_class(name)
+    if name.startswith("terrain"):
+      sev.append(0.0)
+    else:
+      sev.append(table.get(cls, default) if cls is not None else default)
   return torch.tensor([*sev, 0.0], device=device)
