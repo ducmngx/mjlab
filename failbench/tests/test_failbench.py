@@ -5,7 +5,7 @@ import math
 import os
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import mujoco
 import numpy as np
@@ -60,6 +60,7 @@ from failbench.scene_course import (
   PASS_COURSE,
   PASS_SWAP,
 )
+from failbench.scripts.evaluate import EvalConfig, evaluate_split
 from failbench.scripts.run_mppi import _touched_severity
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
 from failbench.severity import DEFAULT_SEVERITY, SEVERITY, geom_severity
@@ -778,3 +779,21 @@ def test_a_three_second_model_trains_and_is_scored_within_its_window():
   m = impact_metrics(pred, batch, fall_label="safe")
   assert {"drift_err_1s", "drift_err_2s", "drift_err_3s"} <= set(m)
   assert "drift_err_5s" not in m
+
+
+def test_a_three_second_model_is_evaluated_per_split_and_terrain():
+  torch.manual_seed(0)
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1, num_steps=30)
+  model = ImpactModel(cfg, _unit_stats()).eval()
+  b = 24  # per_terrain needs 20 samples of a terrain
+  batch = _fake_batch(b, t=30)
+  batch["safe"] = batch["upright"].clone()
+  batch["terrain_id"] = torch.zeros(b, dtype=torch.long)
+  batch["prefault_mode"] = torch.zeros(b, dtype=torch.long)
+  batch["state_true_vel"] = torch.rand(b, 3)
+  samples = cast(Any, [{k: v[i] for k, v in batch.items()} for i in range(b)])
+  dyn = cast(Any, SimpleNamespace(model=model))
+  eval_cfg = EvalConfig(checkpoint="", root="", output_dir="", num_workers=0)
+  r = evaluate_split(dyn, samples, eval_cfg, "cpu", "safe")
+  assert "drift_err_3s" in r and "drift_err_5s" not in r
+  assert set(r["per_terrain"]["rough"]) >= {"drift_err_3s", "zero_err_3s"}

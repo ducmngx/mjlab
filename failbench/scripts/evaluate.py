@@ -4,18 +4,20 @@ For each split (``val``, ``test_terrain``: unseen terrain seeds,
 ``test_fault``: the held-out joint and fault pair), pooled and per fault
 family and terrain:
 
-- drift error at 1, 3 and 5 s against the zero-drift baseline, and the share
-  of true drifts inside the predicted 2 sigma (``impact_metrics``);
-- fall AUROC, by 5 s and within ``soon_s`` (1 s), on the model's own fall
-  label (``train_cfg.fall_label``: the fall, or the point of no return);
-- calibration of P(fall within 5 s) and within ``soon_s`` (and, for a
+- drift error at 1, 2, 3 and 5 s (those within the model's window) against
+  the zero-drift baseline, and the share of true drifts inside the predicted
+  2 sigma (``impact_metrics``);
+- fall AUROC, by the window's end and within ``soon_s`` (1 s), on the model's
+  own fall label (``train_cfg.fall_label``: the fall, or the point of no
+  return);
+- calibration of P(fall within the window) and within ``soon_s`` (and, for a
   contact-head model, of the highest per-step P(trunk contact)): Brier score,
   expected calibration error over ``bins`` equal-width bins, and the bins
   themselves (a reliability diagram);
 - warning lead time, as a monitor would use the model: an alarm when
   P(fall within ``soon_s``) passes the threshold that flags
-  ``false_alarm`` of the samples that don't fall in 5 s; then, by how long
-  until the robot is really on the ground (``upright``, whatever the
+  ``false_alarm`` of the samples that don't fall in the window; then, by how
+  long until the robot is really on the ground (``upright``, whatever the
   label), the share of falls warned. Comparable across models trained on
   either label;
 - all of it, with drift error and 2 sigma coverage, per fault group
@@ -121,6 +123,14 @@ def warning_lead(
   return out
 
 
+def last_horizon(r: dict) -> str:
+  """The longest horizon ``r`` scores drift at, as its key suffix ("3s")."""
+  return max(
+    (k.removeprefix("drift_err_") for k in r if k.startswith("drift_err_")),
+    key=lambda h: float(h.removesuffix("s")),
+  )
+
+
 @torch.no_grad()
 def evaluate_split(
   dyn: ImpactDynamics, ds: FailBenchDataset, cfg: EvalConfig, device, fall_label: str
@@ -205,8 +215,11 @@ def evaluate_split(
     s = {k: v[sel] for k, v in m.items()}
     per_terrain[name] = {
       "samples": int(sel.sum()),
-      "drift_err_5s": float(torch.nanmean(s["drift_err_5s"].float())),
-      "zero_err_5s": float(torch.nanmean(s["zero_err_5s"].float())),
+      **{
+        k: float(torch.nanmean(v.float()))
+        for k, v in s.items()
+        if k.startswith(("drift_err_", "zero_err_"))
+      },
       "fall_auroc": auroc(s["p_fell"], s["fell"]),
     }
   out["per_terrain"] = per_terrain
@@ -235,8 +248,9 @@ def main():
     print(f"[INFO] {split}: {len(ds)} samples")
     r = evaluate_split(dyn, ds, cfg, device, fall_label)
     splits[split] = r
+    h = last_horizon(r)
     fam = " ".join(
-      f"{f.name.lower()} {r.get(f'{f.name.lower()}/drift_err_5s', float('nan')):.2f}"
+      f"{f.name.lower()} {r.get(f'{f.name.lower()}/drift_err_{h}', float('nan')):.2f}"
       for f in FaultFamily
     )
     w = r["warning"]
@@ -245,8 +259,8 @@ def main():
       for lo, hi in LEAD_BINS
     )
     print(
-      f"[INFO] {split}: drift 5 s {r['drift_err_5s']:.3f} m (zero"
-      f" {r['zero_err_5s']:.3f}; {fam}), cover2s {r['cover2s_5s']:.3f}, fall"
+      f"[INFO] {split}: drift {h} {r[f'drift_err_{h}']:.3f} m (zero"
+      f" {r[f'zero_err_{h}']:.3f}; {fam}), cover2s {r[f'cover2s_{h}']:.3f}, fall"
       f" AUROC {r['fall_auroc']:.3f} (within {cfg.soon_s:g} s"
       f" {r['fall_soon_auroc']:.3f}, ECE {r['fall_soon_calibration']['ece']:.3f});"
       f" warned at {cfg.false_alarm:.0%} false alarms, by time to fall: {warned}"
@@ -255,16 +269,19 @@ def main():
       print(
         f"[INFO]   {key[4:]}: "
         + ", ".join(
-          f"{k} n {v['samples']} drift 5 s {v['drift_err_5s']:.3f}"
-          f" cover2s {v['cover2s_5s']:.2f}"
+          f"{k} n {v['samples']} drift {h} {v[f'drift_err_{h}']:.3f}"
+          f" cover2s {v[f'cover2s_{h}']:.2f}"
           for k, v in r[key].items()
         )
       )
   (out_dir / "eval.json").write_text(json.dumps(results, indent=2))
 
+  window = "the window"
+  for r in splits.values():
+    window = f"{float(last_horizon(r).removesuffix('s')):g} s"
   fig, ax = plt.subplots(1, 2, figsize=(11, 4.6))
   for a, key, title in (
-    (ax[0], "fall_calibration", "P(fall within 5 s)"),
+    (ax[0], "fall_calibration", f"P(fall within {window})"),
     (ax[1], "fall_soon_calibration", f"P(fall within {cfg.soon_s:g} s)"),
   ):
     a.plot([0, 1], [0, 1], "--", color="#888888", lw=1)
