@@ -114,15 +114,20 @@ class ImpactDynamics:
         [f.repeat_interleave(k, dim=0) for f in ctx.map_feats] if contact_maps else []
       )
       plans = Context(ctx.memory.repeat_interleave(k, dim=0), feats)
+      fault = (
+        inputs["fault"].repeat_interleave(k, dim=0)
+        if self.model.cfg.fault_in_decoder
+        else None
+      )
       pred = self.model.decode(
-        plans, cmd_seq.flatten(0, 1), cmd_path.flatten(0, 1), contact_maps
+        plans, cmd_seq.flatten(0, 1), cmd_path.flatten(0, 1), contact_maps, fault
       )
     pred = {key: v.float().unflatten(0, (n, k)) for key, v in pred.items()}
-    out = {
-      "drift": pred["drift"],
-      "drift_std": pred["drift_std"],
-      "p_fallen": pred["p_fallen"],
-    }
+    out = {"drift": pred["drift"], "drift_std": pred["drift_std"]}
+    # A model without a fall head (since 2026-11-02) predicts no falls.
+    out["p_fallen"] = pred.get("p_fallen", torch.zeros_like(pred["drift"][..., 0]))
+    if "vel" in pred:
+      out |= {"vel": pred["vel"], "vel_std": pred["vel_std"]}
     if "collision_logit" in pred:
       out["p_collision"] = torch.sigmoid(pred["collision_logit"])
     if "contact_logit" in pred:

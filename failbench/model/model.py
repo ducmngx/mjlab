@@ -1,38 +1,39 @@
-"""The FailBench impact model: how a faulted robot moves under a plan.
+"""The FailBench impact model: how a robot moves under a plan if a fault hits.
 
-Given what the robot knows at the start of a plan (the LiDAR map, its
-state, HIM's latent, the last 2 s, and the known fault) and a 5 s plan
-(``cmd_seq``, 50 steps of 0.1 s), it predicts per step:
+The question it answers: if fault *f* hit right now and the robot, not
+noticing, kept running *this* candidate's commands, where would its body go
+and how fast? An encoder takes the context once per planning cycle: the
+terrain map, the robot's state, HIM's latent and the last 2 s. A decoder
+then takes each candidate (``cmd_seq``, a step of 0.1 s each, and its
+commanded poses ``cmd_path``) together with the imagined fault, and
+predicts per step:
 
 - drift from the plan's commanded path, ``pose - cmd_path`` (x, y, yaw): the
   planner sweeps the robot's footprint along ``cmd_path + drift +- k sigma``
-  over the map, so obstacle avoidance is geometric and works on layouts
-  never trained on. Its spread is per axis of the step's own path frame
-  (``drift_frame="path"``: along and across the commanded heading, where a
-  turn no longer correlates the axes), and the likelihood is a Student-t
-  with ``drift_nu`` degrees of freedom so rare large throws widen the tails
-  instead of squeezing the middle (0: Gaussian, phase 1). ``drift`` comes
-  back in the start frame; ``drift_std`` is the per-axis standard deviation
-  in the path frame (``drift_yaw`` rotates it); a sweep only uses its xy
-  norm, the same in either frame;
-- the velocity deviation ``dv``, an auxiliary target;
-- the fall hazard (``P(fallen by t)`` is monotone by construction), from
-  which how soon a fall comes (P(fall within 1 s), the time to fall) is read;
-- with ``latent_head``, HIM's latent (auxiliary: how the policy itself sees
-  the robot responding, a dense signal tied to falls);
-- with ``contact_heads`` (phase 1's model), also trunk or head contact
-  (``collision``), a contact landing off the map, and body-contact maps, one
-  64x64 map per second of the plan. The planner sweeps the drift over the
-  map instead, so v2 drops them.
+  over its map, so obstacles are geometric and work on layouts never trained
+  on. Its spread is per axis of the step's own path frame (``drift_frame=
+  "path"``: along and across the commanded heading), and the likelihood is a
+  Student-t with ``drift_nu`` degrees of freedom so rare large throws widen
+  the tails instead of squeezing the middle. ``drift`` comes back in the
+  start frame; ``drift_std`` is the per-axis standard deviation in the path
+  frame (``drift_yaw`` rotates it);
+- the trunk's velocity ``vel`` (x, y, z in the start yaw frame), with its
+  spread in the same path frame: how fast the body moves where it is, so a
+  contact the sweep finds can be priced by its energy, a fall onto
+  something included (its vertical speed).
 
-The model splits into a context encoder (map, state, history, fault; run
-once per planning cycle, once per fault for a safety filter) and a plan
-decoder (one pass per candidate plan), so a planner scoring many plans
-pays for the encoder once. The decoder is non-autoregressive: one query
-token per step built from that step's command and commanded pose, as in
-ZLIK's future-action queries (Pokhrel et al., arXiv:2602.12385). As in
-ZLIK, decoder self-attention is causal: a step sees the plan up to itself,
-never commands that come later.
+Models before 2026-11-02 took the fault as encoder tokens and also
+predicted a fall hazard (``fall_head``), the velocity deviation ``dv`` and,
+some, HIM's latent or body contacts (``contact_heads``: trunk or head
+contact, a contact off the map, one 64x64 contact map per second); their
+configs and checkpoints still load.
+
+The decoder is non-autoregressive: one query token per step built from that
+step's command and commanded pose (plus the fault), as in ZLIK's
+future-action queries (Pokhrel et al., arXiv:2602.12385). As in ZLIK,
+decoder self-attention is causal: a step sees the plan up to itself, never
+commands that come later. The fault's per-joint tokens join the context the
+decoder attends to, and their mean conditions every query.
 """
 
 from __future__ import annotations
@@ -77,8 +78,22 @@ class ImpactModelCfg:
   dimension, which phase 1's 1e-3 floor squashed."""
   contact_heads: bool = False
   """Also predict collision, off-map contact and contact maps (phase 1)."""
-  latent_head: bool = True
+  latent_head: bool = False
   """Also predict HIM's latent per step (``latent_future``, auxiliary)."""
+  fault_in_decoder: bool = True
+  """The fault enters the decoder with the candidate, so the encoder sees
+  only the context (map, state, latent, history) and runs once per planning
+  cycle whatever faults are imagined; False: an encoder token (models
+  before 2026-11-02)."""
+  fall_head: bool = False
+  """Also predict the fall hazard (``p_fallen``; models before 2026-11-02)."""
+  dv_head: bool = False
+  """Also predict the velocity deviation ``dv`` (auxiliary; models before
+  2026-11-02)."""
+  velocity_head: bool = True
+  """Predict the trunk's velocity per step (``vel``, x, y, z in the start
+  yaw frame) with its spread, as the drift's: with the drift, how fast the
+  body moves where it is, for an impact's energy."""
 
   @classmethod
   def from_saved(cls, saved: dict) -> ImpactModelCfg:
@@ -86,12 +101,31 @@ class ImpactModelCfg:
     kw: dict[str, Any] = {
       "contact_heads": True,
       "latent_head": False,
+      "fault_in_decoder": False,
+      "fall_head": True,
+      "dv_head": True,
+      "velocity_head": False,
       "drift_frame": "start",
       "drift_nu": 0.0,
       "norm_min_std": 1e-3,
     }
     kw |= {k: tuple(v) if isinstance(v, list) else v for k, v in saved.items()}
     return cls(**kw)
+
+
+def head_layout(cfg: ImpactModelCfg) -> dict[str, slice]:
+  """Where each output sits in the step head, in the order older models
+  have them (so their checkpoints load)."""
+  sizes = [("drift", 3), ("drift_logvar", 3)]
+  sizes += [("dv", 3)] * cfg.dv_head + [("hazard", 1)] * cfg.fall_head
+  sizes += [("collision", 1), ("offmap", 1)] * cfg.contact_heads
+  sizes += [("latent", cfg.latent_dim)] * cfg.latent_head
+  sizes += [("vel", 3), ("vel_logvar", 3)] * cfg.velocity_head
+  out, at = {}, 0
+  for name, size in sizes:
+    out[name] = slice(at, at + size)
+    at += size
+  return out
 
 
 def rotate_xy(v: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
@@ -241,12 +275,11 @@ class ImpactModel(nn.Module):
       nn.Transformer.generate_square_subsequent_mask(cfg.num_steps),
       persistent=False,
     )
+    if cfg.fault_in_decoder:
+      self.fault_pool = nn.Linear(d, d)
     self.head_norm = nn.LayerNorm(d)
-    # drift mean (3), drift log-variance (3), dv (3), hazard; then with
-    # contact_heads, collision and offmap.
-    self.step_head = nn.Linear(
-      d, 10 + 2 * cfg.contact_heads + cfg.latent_dim * cfg.latent_head
-    )
+    self.layout = head_layout(cfg)
+    self.step_head = nn.Linear(d, max(s.stop for s in self.layout.values()))
     self.contacts = ContactDecoder(d) if cfg.contact_heads else None
 
   def encode(self, batch: dict[str, torch.Tensor]) -> Context:
@@ -256,26 +289,29 @@ class ImpactModel(nn.Module):
     height = torch.where(known > 0, n("map", m[:, :1]), 0.0)
     feats = self.map_encoder(torch.cat([height, known], dim=1))
     map_tok = feats[3].flatten(2).transpose(1, 2) + self.map_pos
-    b = m.shape[0]
-    fault = batch["fault"].reshape(b, NUM_JOINTS, self.cfg.fault_params)
-    j = torch.arange(NUM_JOINTS, device=m.device)
-    fault_tok = (
-      self.fault_in(fault)
-      + self.leg_emb(j // JOINTS_PER_LEG)
-      + self.joint_type_emb(j % JOINTS_PER_LEG)
-    )
     groups = [
       map_tok,
       self.state_in(n("state", batch["state"]))[:, None],
       self.latent_in(n("him_latent", batch["him_latent"]))[:, None],
       self.history_in(n("history", batch["history"][..., : self.cfg.history_dim]))
       + self.history_pos,
-      fault_tok,
     ]
+    if not self.cfg.fault_in_decoder:
+      groups.append(self._fault_tokens(batch["fault"]))
     tokens = torch.cat(
       [g + self.type_emb.weight[i] for i, g in enumerate(groups)], dim=1
     )
     return Context(self.context(tokens), feats)
+
+  def _fault_tokens(self, fault: torch.Tensor) -> torch.Tensor:
+    """A token per joint ``[B, 12, d]`` from the encoded fault ``[B, 24]``."""
+    fault = fault.reshape(len(fault), NUM_JOINTS, self.cfg.fault_params)
+    j = torch.arange(NUM_JOINTS, device=fault.device)
+    return (
+      self.fault_in(fault)
+      + self.leg_emb(j // JOINTS_PER_LEG)
+      + self.joint_type_emb(j % JOINTS_PER_LEG)
+    )
 
   def decode(
     self,
@@ -283,51 +319,68 @@ class ImpactModel(nn.Module):
     cmd_seq: torch.Tensor,
     cmd_path: torch.Tensor,
     contact_maps: bool = True,
+    fault: torch.Tensor | None = None,
   ) -> dict[str, torch.Tensor]:
-    """Predictions for plans ``cmd_seq`` / ``cmd_path [B, T, 3]``. ``ctx``
-    may have batch 1 to score many plans against one context. ``contact_maps``
-    only applies with ``contact_heads``."""
+    """Predictions for plans ``cmd_seq`` / ``cmd_path [B, T, 3]`` under the
+    encoded ``fault [B, 24]`` (``fault_in_decoder`` models; the others took
+    it in ``encode``). ``ctx`` and ``fault`` may have batch 1 to score many
+    plans against one context. ``contact_maps`` only applies with
+    ``contact_heads``."""
+    cfg = self.cfg
     b = cmd_seq.shape[0]
     memory = ctx.memory.expand(b, -1, -1)
     plan = torch.cat(
       [self.norm("cmd_seq", cmd_seq), self.norm("cmd_path", cmd_path)], dim=-1
     )
-    h = self.decoder(
-      self.plan_in(plan) + self.step_pos,
-      memory,
-      tgt_mask=self.causal_mask,
-      tgt_is_causal=True,
-    )
+    query = self.plan_in(plan) + self.step_pos
+    if cfg.fault_in_decoder:
+      if fault is None:
+        raise ValueError("This model takes the fault in decode().")
+      tok = (self._fault_tokens(fault) + self.type_emb.weight[4]).expand(b, -1, -1)
+      memory = torch.cat([memory, tok], dim=1)
+      query = query + self.fault_pool(tok.mean(dim=1))[:, None]
+    h = self.decoder(query, memory, tgt_mask=self.causal_mask, tgt_is_causal=True)
     h = self.head_norm(h)
     out = self.step_head(h)
-    lo, hi = self.cfg.logvar_range
-    hazard = out[..., 9]
-    # P(upright at t) = prod (1 - sigmoid(hazard)) up to t.
-    log_up = torch.cumsum(nn.functional.logsigmoid(-hazard), dim=1)
-    logvar = out[..., 3:6].clamp(lo, hi)
-    yaw = cmd_path[..., 2] if self.cfg.drift_frame == "path" else 0 * cmd_path[..., 2]
-    nu = self.cfg.drift_nu
+    at = self.layout
+    lo, hi = cfg.logvar_range
+    yaw = cmd_path[..., 2] if cfg.drift_frame == "path" else 0 * cmd_path[..., 2]
+    nu = cfg.drift_nu
     t_var = nu / (nu - 2) if nu > 0 else 1.0  # A Student-t's variance per scale^2.
+    logvar = out[..., at["drift_logvar"]].clamp(lo, hi)
     pred = {
-      "drift": rotate_xy(out[..., 0:3], yaw),
-      "drift_local": out[..., 0:3],
+      "drift": rotate_xy(out[..., at["drift"]], yaw),
+      "drift_local": out[..., at["drift"]],
       "drift_logvar": logvar,
       "drift_std": torch.exp(0.5 * logvar) * t_var**0.5,
       "drift_yaw": yaw,
-      "dv": out[..., 6:9],
-      "hazard_logit": hazard,
-      "p_fallen": 1 - log_up.exp(),
     }
-    if self.cfg.latent_head:
-      at = 10 + 2 * self.cfg.contact_heads
+    if cfg.velocity_head:
+      # In the path frame as the drift (x along, y across the commanded
+      # heading, z up), returned in the start frame.
+      vel_logvar = out[..., at["vel_logvar"]].clamp(lo, hi)
+      pred |= {
+        "vel": rotate_xy(out[..., at["vel"]], yaw),
+        "vel_local": out[..., at["vel"]],
+        "vel_logvar": vel_logvar,
+        "vel_std": torch.exp(0.5 * vel_logvar) * t_var**0.5,
+      }
+    if cfg.dv_head:
+      pred["dv"] = out[..., at["dv"]]
+    if cfg.fall_head:
+      hazard = out[..., at["hazard"]][..., 0]
+      # P(upright at t) = prod (1 - sigmoid(hazard)) up to t.
+      log_up = torch.cumsum(nn.functional.logsigmoid(-hazard), dim=1)
+      pred |= {"hazard_logit": hazard, "p_fallen": 1 - log_up.exp()}
+    if cfg.latent_head:
       # Predicted in normalised units (an output of order 1 at the start),
       # returned in the latent's own.
-      z = out[..., at : at + self.cfg.latent_dim]
+      z = out[..., at["latent"]]
       pred["latent"] = z * self.norm.him_latent_std + self.norm.him_latent_mean
     if self.contacts is None:
       return pred
-    pred["collision_logit"] = out[..., 10]
-    pred["offmap_logit"] = out[..., 11]
+    pred["collision_logit"] = out[..., at["collision"]][..., 0]
+    pred["offmap_logit"] = out[..., at["offmap"]][..., 0]
     if contact_maps:
       k = self.cfg.steps_per_map
       tokens = h.reshape(b, self.cfg.num_steps // k, k, -1).mean(dim=2)
@@ -336,4 +389,6 @@ class ImpactModel(nn.Module):
     return pred
 
   def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return self.decode(self.encode(batch), batch["cmd_seq"], batch["cmd_path"])
+    return self.decode(
+      self.encode(batch), batch["cmd_seq"], batch["cmd_path"], fault=batch["fault"]
+    )

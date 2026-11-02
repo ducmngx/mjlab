@@ -10,6 +10,9 @@ control step ``s`` with ``r`` control steps per bin, bin ``k`` covers steps
   ``s + r k``; knots switch on bin edges).
 - ``dv[k]``: mean over the bin of (vx, vy, wz) minus the command the step
   was taken under, in the body frame of the moment.
+- ``vel[k]``: the trunk's mean velocity (x, y, z) over the bin, in the start
+  yaw frame (``start_frame_velocity``): with ``pose``, where the body is
+  and how fast it moves there, so an impact's energy can be priced.
 - ``pose[k]``: (x, y, yaw) at the end of the bin in the start yaw frame.
 - ``cmd_path[k]``: the same for the commanded twist integrated from the
   start pose, so ``pose - cmd_path`` is the drift from the plan.
@@ -69,7 +72,7 @@ from heat_bench.envs_mjlab.fault_impact import heading, to_yaw_frame
 
 from failbench.faults import FaultFamily, encode_fault, faulted_joint
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
-from mjlab.utils.lab_api.math import wrap_to_pi
+from mjlab.utils.lab_api.math import quat_apply, wrap_to_pi
 
 SPLITS = ("train", "val", "test_terrain", "test_fault")
 TERRAINS = ("rough", "stairs", "stairs_up", "course", "stairs_tall", "stairs_up_tall")
@@ -370,6 +373,8 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     steps = s + 1 + r * bins[:, None] + torch.arange(r, device=device)[None, :]
     v = torch.cat([lin[:, steps, :2], ang[:, steps, 2:]], dim=-1)  # [n,nb,r,3]
     put("dv", (v - cmd[:, steps - 1]).mean(dim=2))
+    start_yaw = o_yaw[:, None, None].expand(-1, nb, r)
+    put("vel", start_frame_velocity(lin[:, steps], quat[:, steps], start_yaw).mean(2))
     p = to_yaw_frame(pos[:, ends], o_pos, o_quat)
     yaw = wrap_to_pi(heading(quat[:, ends]) - o_yaw[:, None])
     put("pose", torch.cat([p[..., :2], yaw[..., None]], dim=-1))
@@ -504,6 +509,17 @@ def lidar_known(
     )
     fused.append(visible_cells(height[sl], sp, sa, bp, by, resolution, lidar))
   return torch.cat(single), torch.cat(fused)
+
+
+def start_frame_velocity(
+  v_b: torch.Tensor, quat_w: torch.Tensor, start_yaw: torch.Tensor
+) -> torch.Tensor:
+  """Body-frame linear velocities ``[..., 3]`` at orientations ``quat_w
+  [..., 4]`` in the gravity-aligned frame of heading ``start_yaw [...]``."""
+  v_w = quat_apply(quat_w.reshape(-1, 4), v_b.reshape(-1, 3)).reshape(v_b.shape)
+  c, s = torch.cos(start_yaw), torch.sin(start_yaw)
+  x, y = v_w[..., 0], v_w[..., 1]
+  return torch.stack([c * x + s * y, -s * x + c * y, v_w[..., 2]], dim=-1)
 
 
 def _integrate(cmd: torch.Tensor, dt: float) -> torch.Tensor:

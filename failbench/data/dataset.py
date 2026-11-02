@@ -51,7 +51,7 @@ _PER_SAMPLE = (
 )
 
 
-_OPTIONAL = ("safe", "latent_future")
+_OPTIONAL = ("safe", "latent_future", "vel")
 """Targets only shards built since they were added have."""
 
 

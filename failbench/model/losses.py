@@ -1,10 +1,12 @@
 """Losses and metrics for ``ImpactModel`` on ``FailBenchDataset`` batches.
 
-- drift: NLL of ``pose - cmd_path`` (yaw wrapped) over upright, valid
-  steps, in the model's drift frame (``pred["drift_yaw"]``: the path frame,
-  or the start frame), Gaussian or Student-t (``drift_nu``); the spread is
-  what a planner's ``+- k sigma`` footprint sweep uses, so it is trained,
-  not optional.
+- drift: NLL of ``pose - cmd_path`` (yaw wrapped) in the model's drift
+  frame (``pred["drift_yaw"]``: the path frame, or the start frame),
+  Gaussian or Student-t (``drift_nu``); the spread is what a planner's
+  ``+- k sigma`` footprint sweep uses, so it is trained, not optional. Over
+  every valid step for a model without a fall head (where the body goes
+  matters whether or not it falls), over upright ones for the older models.
+- vel: the same NLL for the trunk's velocity ``vel`` (in the same frame).
 - dv: Huber over upright, valid steps (auxiliary).
 - latent: squared error of HIM's predicted latent over upright, valid steps,
   per dimension in units of its dataset spread (``latent_std``, from
@@ -34,6 +36,7 @@ from mjlab.utils.lab_api.math import wrap_to_pi
 class LossWeights:
   drift: float = 1.0
   dv: float = 0.5
+  vel: float = 1.0
   latent: float = 0.2
   fall: float = 1.0
   fall_pos: float = 1.0
@@ -44,6 +47,28 @@ class LossWeights:
   pos_weight: float = 5.0
   """BCE weight on positive collision / offmap steps (both are rare)."""
   focal_gamma: float = 2.0
+
+
+def _t_nll(err: torch.Tensor, logvar: torch.Tensor, nu: float) -> torch.Tensor:
+  """Per-axis NLL of ``err`` under a Gaussian (``nu`` 0) or Student-t."""
+  z2 = err**2 * torch.exp(-logvar)
+  if nu > 0:
+    return 0.5 * logvar + 0.5 * (nu + 1) * torch.log1p(z2 / nu)
+  return 0.5 * (z2 + logvar)
+
+
+def vel_local_target(
+  pred: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
+) -> torch.Tensor:
+  """The velocity target in the model's drift frame."""
+  return rotate_xy(batch["vel"], -pred["drift_yaw"])
+
+
+def step_mask(pred: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]):
+  """The steps drift and velocity are scored on: every valid one, or for a
+  model with a fall head the upright ones."""
+  valid = batch["valid"].bool()
+  return valid & batch["upright"].bool() if "p_fallen" in pred else valid
 
 
 def drift_target(batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -121,17 +146,19 @@ def impact_loss(
   with what the batch holds). ``drift_nu``: the model's (0: Gaussian)."""
   valid = batch["valid"].bool()
   up = batch["upright"].bool() & valid
-  logvar = pred["drift_logvar"]
-  z2 = (local_target(pred, batch) - pred["drift_local"]) ** 2 * torch.exp(-logvar)
-  if drift_nu > 0:
-    nll = 0.5 * logvar + 0.5 * (drift_nu + 1) * torch.log1p(z2 / drift_nu)
-  else:
-    nll = 0.5 * (z2 + logvar)
-  terms = {
-    "drift": _masked_mean(nll, up),
-    "dv": _masked_mean(F.huber_loss(pred["dv"], batch["dv"], reduction="none"), up),
-    "fall": hazard_nll(pred["hazard_logit"], batch[fall_label], valid, w.fall_pos),
-  }
+  on = step_mask(pred, batch)
+  err = local_target(pred, batch) - pred["drift_local"]
+  terms = {"drift": _masked_mean(_t_nll(err, pred["drift_logvar"], drift_nu), on)}
+  if "vel" in pred:
+    err = vel_local_target(pred, batch) - pred["vel_local"]
+    terms["vel"] = _masked_mean(_t_nll(err, pred["vel_logvar"], drift_nu), on)
+  if "dv" in pred:
+    dv = F.huber_loss(pred["dv"], batch["dv"], reduction="none")
+    terms["dv"] = _masked_mean(dv, up)
+  if "hazard_logit" in pred:
+    terms["fall"] = hazard_nll(
+      pred["hazard_logit"], batch[fall_label], valid, w.fall_pos
+    )
   if "latent" in pred and "latent_future" in batch and w.latent > 0:
     tgt = batch["latent_future"].float()
     scale = tgt.flatten(0, 1).std(0) if latent_std is None else latent_std
@@ -177,16 +204,18 @@ def impact_metrics(
   """Per-sample quantities to pool over an eval set (concatenate, then
   ``summarize_metrics``). Falls are by ``fall_label``; ``fell_soon`` /
   ``p_fell_soon``: within ``soon_s``."""
-  up = batch["upright"].bool() & batch["valid"].bool()
+  up = step_mask(pred, batch)
   err = (pred["drift"][..., :2] - drift_target(batch)[..., :2]).norm(dim=-1)
-  fall_up = batch[fall_label].bool()
-  out = {"fell": ~fall_up.all(dim=1)}
+  out: dict[str, torch.Tensor] = {}
   if "fault_family" in batch:
     out["family"] = batch["fault_family"].long()
-  out["p_fell"] = pred["p_fallen"][:, -1]
-  k_soon = round(soon_s / step_s) - 1
-  out["fell_soon"] = ~fall_up[:, k_soon]
-  out["p_fell_soon"] = pred["p_fallen"][:, k_soon]
+  if "p_fallen" in pred:
+    fall_up = batch[fall_label].bool()
+    out["fell"] = ~fall_up.all(dim=1)
+    out["p_fell"] = pred["p_fallen"][:, -1]
+    k_soon = round(soon_s / step_s) - 1
+    out["fell_soon"] = ~fall_up[:, k_soon]
+    out["p_fell_soon"] = pred["p_fallen"][:, k_soon]
   if "collision_logit" in pred:
     out["collided"] = (batch["collision"].bool() & batch["valid"].bool()).any(dim=1)
     out["p_collided"] = torch.sigmoid(pred["collision_logit"]).amax(dim=1)
@@ -205,6 +234,18 @@ def impact_metrics(
     off = local_target(pred, batch)[:, k, :2] - pred["drift_local"][:, k, :2]
     inside = (off.abs() <= 2 * sigma).all(dim=-1)
     out[f"cover2s_{s}s"] = torch.where(up[:, k], inside.float(), float("nan"))
+    if "vel" in pred:
+      tgt = vel_local_target(pred, batch)[:, k]
+      vel_err = (pred["vel_local"][:, k] - tgt).norm(dim=-1)
+      out[f"vel_err_{s}s"] = torch.where(up[:, k], vel_err, float("nan"))
+      # The baseline: the body moves exactly as commanded (the command's
+      # twist along and across its own heading, no vertical speed).
+      cmd = torch.cat([batch["cmd_seq"][:, k, :2], torch.zeros_like(tgt[:, :1])], -1)
+      cmd_err = (cmd - tgt).norm(dim=-1)
+      out[f"cmd_vel_err_{s}s"] = torch.where(up[:, k], cmd_err, float("nan"))
+      off = tgt - pred["vel_local"][:, k]
+      inside = (off.abs() <= 2 * pred["vel_std"][:, k]).all(dim=-1)
+      out[f"vel_cover2s_{s}s"] = torch.where(up[:, k], inside.float(), float("nan"))
   return out
 
 
@@ -213,18 +254,23 @@ def summarize_metrics(m: dict[str, torch.Tensor]) -> dict[str, float]:
   healthy-robot dynamics MPPI plans with before any fault)."""
 
   def pool(sel: torch.Tensor, prefix: str) -> dict[str, float]:
-    out = {
-      f"{prefix}fall_auroc": auroc(m["p_fell"][sel], m["fell"][sel]),
-      f"{prefix}fall_soon_auroc": auroc(m["p_fell_soon"][sel], m["fell_soon"][sel]),
-    }
+    out: dict[str, float] = {}
+    if "p_fell" in m:
+      out[f"{prefix}fall_auroc"] = auroc(m["p_fell"][sel], m["fell"][sel])
+      out[f"{prefix}fall_soon_auroc"] = auroc(
+        m["p_fell_soon"][sel], m["fell_soon"][sel]
+      )
     if "p_collided" in m:
       out[f"{prefix}collision_auroc"] = auroc(m["p_collided"][sel], m["collided"][sel])
     for k, v in m.items():
-      if k.startswith(("drift_err", "zero_err", "cover2s")):
+      if k.startswith(
+        ("drift_err", "zero_err", "cover2s", "vel_err", "cmd_vel_err", "vel_cover2s")
+      ):
         out[f"{prefix}{k}"] = float(torch.nanmean(v[sel].float()))
     return out
 
-  out = pool(torch.ones_like(m["fell"]), "")
+  n = len(next(v for k, v in m.items() if k != "family"))
+  out = pool(torch.ones(n, dtype=torch.bool), "")
   if "family" in m:
     for f in FaultFamily:
       sel = m["family"] == f

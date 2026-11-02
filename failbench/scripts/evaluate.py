@@ -7,9 +7,11 @@ family and terrain:
 - drift error at 1, 2, 3 and 5 s (those within the model's window) against
   the zero-drift baseline, and the share of true drifts inside the predicted
   2 sigma (``impact_metrics``);
-- fall AUROC, by the window's end and within ``soon_s`` (1 s), on the model's
-  own fall label (``train_cfg.fall_label``: the fall, or the point of no
-  return);
+- for a model with a velocity head, the same for the trunk's velocity,
+  against the body moving exactly as commanded;
+- for a model with a fall head (before 2026-11-02): fall AUROC, by the
+  window's end and within ``soon_s`` (1 s), on the model's own fall label
+  (``train_cfg.fall_label``: the fall, or the point of no return);
 - calibration of P(fall within the window) and within ``soon_s`` (and, for a
   contact-head model, of the highest per-step P(trunk contact)): Brier score,
   expected calibration error over ``bins`` equal-width bins, and the bins
@@ -20,12 +22,14 @@ family and terrain:
   long until the robot is really on the ground (``upright``, whatever the
   label), the share of falls warned. Comparable across models trained on
   either label;
-- all of it, with drift error and 2 sigma coverage, per fault group
+- all of it, with drift (and velocity) error and 2 sigma coverage, per fault
+  group
   (healthy, locked, weak, limp: torque 0), per pre-fault mode
   (``failbench.commands.PREFAULT_MODES``) and per forward speed at the
   sample's start (``SPEED_BINS``).
 
-Writes ``<output_dir>/eval.json`` and ``reliability.png``. The map the model
+Writes ``<output_dir>/eval.json`` and, for a fall model, ``reliability.png``.
+The map the model
 sees follows its training (``train_cfg.map_mode``) unless ``map_mode`` is
 given.
 """
@@ -149,7 +153,9 @@ def evaluate_split(
       # Contact maps aren't scored here; skipping them saves most of the
       # memory and time.
       ctx = model.encode(batch)
-      pred = model.decode(ctx, batch["cmd_seq"], batch["cmd_path"], False)
+      pred = model.decode(
+        ctx, batch["cmd_seq"], batch["cmd_path"], False, fault=batch["fault"]
+      )
     pred = {k: v.float() for k, v in pred.items()}
     for k, v in impact_metrics(pred, batch, step_s, fall_label, cfg.soon_s).items():
       pooled.setdefault(k, []).append(v.cpu())
@@ -166,26 +172,27 @@ def evaluate_split(
   e = {k: np.concatenate(v) for k, v in extra.items()}
   horizon_s = len(ds[0]["upright"]) * step_s
   out: dict[str, Any] = dict(summarize_metrics(m))
-  out["samples"] = len(m["fell"])
-  out["fall_label"] = fall_label
+  out["samples"] = len(e["group"])
+  has_falls = "p_fell" in m
+  if has_falls:
+    out["fall_label"] = fall_label
 
   def falls(sel: np.ndarray) -> dict:
-    r: dict[str, Any] = {
-      "samples": int(sel.sum()),
-      "fall_calibration": calibration(
+    r: dict[str, Any] = {"samples": int(sel.sum())}
+    if has_falls:
+      r["fall_calibration"] = calibration(
         m["p_fell"].numpy()[sel], m["fell"].numpy()[sel].astype(float), cfg.bins
-      ),
-      "fall_soon_calibration": calibration(
+      )
+      r["fall_soon_calibration"] = calibration(
         m["p_fell_soon"].numpy()[sel],
         m["fell_soon"].numpy()[sel].astype(float),
         cfg.bins,
-      ),
-      "warning": warning_lead(
+      )
+      r["warning"] = warning_lead(
         m["p_fell_soon"].numpy()[sel], e["fall_t"][sel], cfg.false_alarm, horizon_s
-      ),
-    }
+      )
     for k in m:
-      if k.startswith(("drift_err_", "cover2s_")):
+      if k.startswith(("drift_err_", "cover2s_", "vel_err_", "vel_cover2s_")):
         r[k] = float(np.nanmean(m[k].numpy()[sel]))
     return r
 
@@ -218,10 +225,11 @@ def evaluate_split(
       **{
         k: float(torch.nanmean(v.float()))
         for k, v in s.items()
-        if k.startswith(("drift_err_", "zero_err_"))
+        if k.startswith(("drift_err_", "zero_err_", "vel_err_", "cmd_vel_err_"))
       },
-      "fall_auroc": auroc(s["p_fell"], s["fell"]),
     }
+    if has_falls:
+      per_terrain[name]["fall_auroc"] = auroc(s["p_fell"], s["fell"])
   out["per_terrain"] = per_terrain
   return out
 
@@ -253,28 +261,41 @@ def main():
       f"{f.name.lower()} {r.get(f'{f.name.lower()}/drift_err_{h}', float('nan')):.2f}"
       for f in FaultFamily
     )
-    w = r["warning"]
-    warned = " ".join(
-      f"{lo:g}-{hi:g}s {w.get(f'warned_{lo:g}_{hi:g}s') or float('nan'):.2f}"
-      for lo, hi in LEAD_BINS
-    )
-    print(
+    line = (
       f"[INFO] {split}: drift {h} {r[f'drift_err_{h}']:.3f} m (zero"
-      f" {r[f'zero_err_{h}']:.3f}; {fam}), cover2s {r[f'cover2s_{h}']:.3f}, fall"
-      f" AUROC {r['fall_auroc']:.3f} (within {cfg.soon_s:g} s"
-      f" {r['fall_soon_auroc']:.3f}, ECE {r['fall_soon_calibration']['ece']:.3f});"
-      f" warned at {cfg.false_alarm:.0%} false alarms, by time to fall: {warned}"
+      f" {r[f'zero_err_{h}']:.3f}; {fam}), cover2s {r[f'cover2s_{h}']:.3f}"
     )
+    if f"vel_err_{h}" in r:
+      line += (
+        f"; velocity {h} {r[f'vel_err_{h}']:.3f} m/s (as commanded"
+        f" {r[f'cmd_vel_err_{h}']:.3f}), cover2s {r[f'vel_cover2s_{h}']:.3f}"
+      )
+    if "warning" in r:
+      w = r["warning"]
+      warned = " ".join(
+        f"{lo:g}-{hi:g}s {w.get(f'warned_{lo:g}_{hi:g}s') or float('nan'):.2f}"
+        for lo, hi in LEAD_BINS
+      )
+      line += (
+        f"; fall AUROC {r['fall_auroc']:.3f} (within {cfg.soon_s:g} s"
+        f" {r['fall_soon_auroc']:.3f}, ECE {r['fall_soon_calibration']['ece']:.3f});"
+        f" warned at {cfg.false_alarm:.0%} false alarms, by time to fall: {warned}"
+      )
+    print(line)
     for key in ("per_prefault", "per_speed"):
       print(
         f"[INFO]   {key[4:]}: "
         + ", ".join(
           f"{k} n {v['samples']} drift {h} {v[f'drift_err_{h}']:.3f}"
           f" cover2s {v[f'cover2s_{h}']:.2f}"
+          + (f" vel {v[f'vel_err_{h}']:.3f}" if f"vel_err_{h}" in v else "")
           for k, v in r[key].items()
         )
       )
   (out_dir / "eval.json").write_text(json.dumps(results, indent=2))
+  if not any("fall_calibration" in r for r in splits.values()):
+    print(f"[INFO] -> {out_dir}")
+    return
 
   window = "the window"
   for r in splits.values():

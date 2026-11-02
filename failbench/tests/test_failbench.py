@@ -46,6 +46,7 @@ from failbench.model.losses import (
   hazard_nll,
   impact_loss,
   impact_metrics,
+  summarize_metrics,
 )
 from failbench.model.model import ImpactModel, ImpactModelCfg, rotate_xy
 from failbench.plans import PlanCfg, SegmentPlan
@@ -168,12 +169,21 @@ def _fake_batch(b: int = 3, t: int = 50) -> dict[str, torch.Tensor]:
     "cmd_path": torch.cumsum(torch.rand(b, t, 3) * 0.1, dim=1),
     "pose": torch.cumsum(torch.rand(b, t, 3) * 0.1, dim=1),
     "dv": torch.randn(b, t, 3) * 0.1,
+    "vel": torch.randn(b, t, 3) * 0.5,
     "upright": upright,
     "valid": torch.ones(b, t, dtype=torch.bool),
     "collision": torch.zeros(b, t, dtype=torch.bool),
     "contact_offmap": torch.zeros(b, t, dtype=torch.bool),
     "contact": torch.rand(b, t, cells, cells) > 0.999,
   }
+
+
+def _v2(cfg: ImpactModelCfg) -> ImpactModelCfg:
+  """``cfg`` as the model before 2026-11-02: the fault an encoder token,
+  falls and the velocity deviation predicted, no velocity head."""
+  return replace(
+    cfg, fault_in_decoder=False, fall_head=True, dv_head=True, velocity_head=False
+  )
 
 
 def _unit_stats() -> dict:
@@ -190,8 +200,8 @@ def _unit_stats() -> dict:
 
 def test_impact_model_shapes_and_plan_batching():
   torch.manual_seed(0)
-  cfg = ImpactModelCfg(
-    d_model=32, context_layers=1, decoder_layers=1, contact_heads=True
+  cfg = _v2(
+    ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1, contact_heads=True)
   )
   model = ImpactModel(cfg, _unit_stats()).eval()
   batch = _fake_batch()
@@ -556,7 +566,9 @@ def test_clutter_fields_differ_per_tile_and_keep_their_corridor():
 
 def test_v2_model_drops_the_contact_heads_and_learns_the_no_return_label():
   torch.manual_seed(0)
-  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  cfg = _v2(
+    ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1, latent_head=True)
+  )
   model = ImpactModel(cfg, _unit_stats())
   batch = _fake_batch()
   batch["safe"] = batch["upright"].clone()
@@ -681,7 +693,7 @@ def test_the_latent_head_starts_at_the_scale_of_its_target():
   # hundreds of spreads off, or the latent loss swamps the rest.
   torch.manual_seed(0)
   stats = _unit_stats() | {"him_latent": {"mean": [0.01] * 16, "std": [2e-3] * 16}}
-  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1)
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1, latent_head=True)
   model = ImpactModel(cfg, stats)
   batch = _fake_batch()
   batch["latent_future"] = 0.01 + 2e-3 * torch.randn(3, 50, 16)
@@ -796,6 +808,7 @@ def test_a_three_second_model_is_evaluated_per_split_and_terrain():
   eval_cfg = EvalConfig(checkpoint="", root="", output_dir="", num_workers=0)
   r = evaluate_split(dyn, samples, eval_cfg, "cpu", "safe")
   assert "drift_err_3s" in r and "drift_err_5s" not in r
+  assert {"vel_err_3s", "cmd_vel_err_3s", "vel_cover2s_3s"} <= set(r)
   assert set(r["per_terrain"]["rough"]) >= {"drift_err_3s", "zero_err_3s"}
 
 
@@ -810,3 +823,65 @@ def test_library_driven_stair_trials_fault_by_time_not_place():
     assert ("fire_radius" in params) == by_place
     if not by_place:
       assert params["fault_time_s"] == (3.0, 5.0)
+
+
+def test_a_trunk_velocity_is_taken_into_the_start_heading_frame():
+  from failbench.data.build import start_frame_velocity
+
+  # Turned 90 degrees left of the start heading, walking forward at 1 m/s
+  # and dropping at 0.5 m/s (in its own, level, body frame).
+  yaw = math.pi / 2
+  quat = torch.tensor([[math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]])
+  v_b = torch.tensor([[1.0, 0.0, -0.5]])
+  start_yaw = torch.tensor([0.0])
+  v = start_frame_velocity(v_b, quat, start_yaw)
+  assert torch.allclose(v, torch.tensor([[0.0, 1.0, -0.5]]), atol=1e-6)
+  # Seen from a start heading that also faced +y, it is straight ahead.
+  v = start_frame_velocity(v_b, quat, torch.tensor([yaw]))
+  assert torch.allclose(v, torch.tensor([[1.0, 0.0, -0.5]]), atol=1e-6)
+
+
+def _decoder_fault_model():
+  cfg = ImpactModelCfg(d_model=32, context_layers=1, decoder_layers=1, num_steps=30)
+  return ImpactModel(cfg, _unit_stats()).eval()
+
+
+def test_the_encoder_sees_only_context_and_the_decoder_the_fault():
+  torch.manual_seed(0)
+  model = _decoder_fault_model()
+  batch = _fake_batch(t=30)
+  locked = batch | {
+    "fault": encode_fault(
+      torch.tensor([[[0.0, 1.0]] * 4 + [[1.0, 1.0]] + [[0.0, 1.0]] * 7]).expand(
+        3, -1, -1
+      )
+    )
+  }
+  with torch.no_grad():
+    ctx = model.encode(batch)
+    assert torch.equal(ctx.memory, model.encode(locked).memory)
+    a = model.decode(ctx, batch["cmd_seq"], batch["cmd_path"], fault=batch["fault"])
+    b = model.decode(ctx, batch["cmd_seq"], batch["cmd_path"], fault=locked["fault"])
+  assert not torch.allclose(a["drift"], b["drift"])
+
+
+def test_the_model_predicts_drift_and_velocity_and_nothing_else():
+  torch.manual_seed(0)
+  model = _decoder_fault_model().train()
+  batch = _fake_batch(t=30)
+  pred = model(batch)
+  assert pred["vel"].shape == pred["vel_std"].shape == (3, 30, 3)
+  assert not {"p_fallen", "hazard_logit", "dv", "latent"} & set(pred)
+  total, terms = impact_loss(pred, batch, LossWeights(), 10)
+  assert set(terms) == {"drift", "vel"}
+  total.backward()
+  m = impact_metrics(pred, batch)
+  assert {"vel_err_1s", "vel_err_3s", "cmd_vel_err_3s", "vel_cover2s_3s"} <= set(m)
+  assert "fell" not in m
+  assert "vel_err_3s" in summarize_metrics(m)
+
+
+def test_an_old_checkpoints_config_keeps_its_fault_encoder_and_fall_head():
+  old = ImpactModelCfg.from_saved({})
+  assert not old.fault_in_decoder and old.fall_head and old.dv_head
+  assert not old.velocity_head
