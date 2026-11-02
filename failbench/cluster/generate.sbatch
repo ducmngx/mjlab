@@ -28,10 +28,22 @@
 #               window, one snapshot at the fault, builds 3 s samples, on
 #               the obstacle-free presets DRIVEN_TERRAINS[(i / 10) % 5]
 #               (rough, stairs, stairs_up, stairs_tall, stairs_up_tall).
+#   DRIVE_EXTRA driven data: more --driver.* options (failbench/driver.py
+#               PlannerDriveCfg), e.g. a path library, driving styles and
+#               random commits; empty (the default) is the stock planner
+#               straight at the goal around random phantoms
 #
 # The planner-driven v3 data (mostly MPPI, some DWB), seeds 0-49:
 #
 #   sbatch --array=0-49 --export=ALL,ROUNDS=1,DRIVER=mix,PREFAULT_MIX="0.6 0.1 0.1 0.1 0.1",RAW=/scratch/$USER/failbench/raw_v3,SAMPLES=/scratch/$USER/failbench/samples_v3 failbench/cluster/generate.sbatch
+#
+# The v5 data: planners tracking stretches of planned routes on phantom
+# maps (failbench/scripts/plan_paths.py; the library copied to scratch
+# first), half starting shortly before a corner, per-trial driving styles,
+# some random commits; new terrain seeds 50-249, in blocks of 40 (the QOS
+# submit limit):
+#
+#   sbatch --array=50-89 --export=ALL,ROUNDS=1,DRIVER=mix,PREFAULT_MIX="0.6 0.1 0.1 0.1 0.1",DRIVE_EXTRA="--driver.library /scratch/$USER/failbench/paths_v1.npz --driver.corner-prob 0.5 --driver.style-range 0.5 2.0 --driver.random-prob 0.2",RAW=/scratch/$USER/failbench/raw_v5,SAMPLES=/scratch/$USER/failbench/samples_driven_v5 failbench/cluster/generate.sbatch
 #
 # The low-speed shards (faults at rest, setting off, slow, just stopped),
 # seeds 60-119:
@@ -82,13 +94,15 @@ if [ -n "$DRIVER" ]; then
   DRIVEN_TERRAINS=(rough stairs stairs_up stairs_tall stairs_up_tall)
   TERRAIN="${TERRAIN:-${DRIVEN_TERRAINS[$(( (SEED / 10) % 5 ))]}}"
   driven=(--horizon-s 3.5 --snapshot-s 0 driver:planner-drive-cfg --driver.planner "$DRIVER")
+  read -r -a drive_extra <<< "${DRIVE_EXTRA:-}"
+  driven+=("${drive_extra[@]}")
   build=(--horizon-s 3.0)
 fi
 TERRAINS=(rough stairs stairs_up course stairs_tall stairs_up_tall)
 TERRAIN="${TERRAIN:-${TERRAINS[$(( (SEED / 10) % 6 ))]}}"
 
 echo "[failbench] $(date) host=$(hostname) job=${SLURM_JOB_ID:-local} commit=$(git rev-parse --short HEAD)"
-echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS prefault=${mix[*]} driver=${DRIVER:-none} -> $SAMPLES"
+echo "[failbench] terrain=$TERRAIN seed=$SEED envs=$NUM_ENVS rounds=$ROUNDS prefault=${mix[*]} driver=${DRIVER:-none} extra=${DRIVE_EXTRA:-none} -> $SAMPLES"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 uv run python -m failbench.scripts.generate \

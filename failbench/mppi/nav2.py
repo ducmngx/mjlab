@@ -374,11 +374,29 @@ class Nav2Mppi:
   ``(data) -> cost [n, K]`` added to the critics' sum (e.g. the fault risk);
   ``data`` holds the trajectories, controls, path, goal and maps."""
 
+  CRITICS = (
+    "constraint",
+    "cost",
+    "goal",
+    "goal_angle",
+    "path_align",
+    "path_follow",
+    "path_angle",
+    "prefer_forward",
+    "twirling",
+  )
+  """The stock critics' names (their ``step`` cost terms)."""
+
   def __init__(self, cfg: Nav2MppiCfg, n: int, device, extra_critics=()):
     self.cfg = cfg
     self.n = n
     self.device = device
     self.extra_critics = list(extra_critics)
+    self.critic_scale: dict[str, torch.Tensor] = {}
+    """Per-robot factors ``[n]`` on named critics (the planner-driven data's
+    driving styles, ``failbench/driver.py``); empty is stock Nav2."""
+    self.temperature_scale = torch.ones(n, device=device)
+    """Per-robot factor on ``temperature`` (1 is stock)."""
     t = cfg.time_steps
     self.seq = torch.zeros(n, t, 3, device=device)
     """The control sequence (vx, vy, wz); ``seq[:, 1]`` is sent next."""
@@ -426,12 +444,15 @@ class Nav2Mppi:
     goal: torch.Tensor,
     speed: torch.Tensor,
     context: dict[str, Any] | None = None,
+    path: tuple[torch.Tensor, ...] | None = None,
   ) -> dict[str, Any]:
     """Plan one cycle. ``costmap [n, H, W]`` (``inflate``), ``goal [n, 2]``
     and ``speed [n, 3]`` (measured vx, vy, wz) in the robot's yaw frame.
-    ``context`` is passed to the extra critics. Returns ``cmd [n, 3]``, the
-    new ``plan``, its kinematic ``path``, the trajectories' ``cost`` and
-    ``weight``, and each critic's cost on the heaviest trajectory."""
+    ``context`` is passed to the extra critics. ``path``: the global path to
+    track, as ``straight_path`` gives it (default: straight at the goal).
+    Returns ``cmd [n, 3]``, the new ``plan``, its kinematic ``path``, the
+    trajectories' ``cost`` and ``weight``, and each critic's cost on the
+    heaviest trajectory."""
     c = self.cfg
     n, dev = self.n, self.device
     dt = c.model_dt
@@ -453,13 +474,14 @@ class Nav2Mppi:
       cv[:, -len(c.offset_m) :] = self._offsets()
     v = self._predict(cv, v0)
     traj = self._integrate(v, pose0)
-    path, path_yaw, path_real, path_len = self._path(pose0[:, :2], goal)
+    track = path if path is not None else self._path(pose0[:, :2], goal)
+    points, path_yaw, path_real, path_len = track
     data = {
       "traj": traj,
       "v": v,
       "cv": cv,
       "pose0": pose0,
-      "path": path,
+      "path": points,
       "path_yaw": path_yaw,
       "path_real": path_real,
       "path_length": path_len,
@@ -471,15 +493,19 @@ class Nav2Mppi:
     terms, fail = self._critics(data)
     for name, critic in [(f.__name__, f) for f in self.extra_critics]:
       terms[name] = critic(data)
+    for name, scale in self.critic_scale.items():
+      if name in terms:
+        terms[name] = terms[name] * scale[:, None]
     cost = torch.stack(list(terms.values())).sum(0)
     # MPPI's control cost: noise against the mean, per axis.
     gamma = c.gamma / std.square()
     cost = cost + ((cv - self.seq[:, None]) * self.seq[:, None] * gamma).sum((-1, -2))
     low = cost.amin(-1, keepdim=True)
-    scale = c.temperature
+    temperature = c.temperature * self.temperature_scale[:, None]
+    scale = temperature
     if c.gap_quantile is not None:
       gap = cost.quantile(c.gap_quantile, dim=-1, keepdim=True) - low
-      scale = c.temperature * gap + 1e-6
+      scale = temperature * gap + 1e-6
     weight = torch.softmax(-(cost - low) / scale, -1)
     mean = (weight[..., None, None] * cv).sum(1)
     mean = _sg_filter(mean, self.hist, c.sgf_order)

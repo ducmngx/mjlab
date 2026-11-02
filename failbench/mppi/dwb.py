@@ -154,10 +154,23 @@ class Dwb:
   ``extra_critics``: callables ``(data) -> cost [n, S]`` added to the
   critics' sum; ``data["cv"]`` holds each twist held for ``commit_steps``."""
 
+  CRITICS = (
+    "base_obstacle",
+    "path_dist",
+    "goal_dist",
+    "path_align",
+    "goal_align",
+    "rotate_to_goal",
+  )
+  """The stock scored critics' names (their ``step`` cost terms)."""
+
   def __init__(self, cfg: DwbCfg, n: int, device, extra_critics=()):
     self.cfg = cfg
     self.n = n
     self.device = device
+    self.critic_scale: dict[str, torch.Tensor] = {}
+    """Per-robot factors ``[n]`` on named critics (as ``Nav2Mppi``'s); empty
+    is stock DWB."""
     self.extra_critics = list(extra_critics)
     self.substeps = 5
     """Control steps per cycle (50 Hz policy, 10 Hz planning)."""
@@ -197,25 +210,28 @@ class Dwb:
     goal: torch.Tensor,
     speed: torch.Tensor,
     context: dict[str, Any] | None = None,
+    path: tuple[torch.Tensor, ...] | None = None,
   ) -> dict[str, Any]:
     """Plan one cycle, as ``Nav2Mppi.step``: ``costmap [n, H, W]``, ``goal
     [n, 2]`` and ``speed [n, 3]`` (measured vx, vy, wz) in the robot's yaw
-    frame. ``weight`` is 1 on the chosen twist."""
+    frame, ``path`` the global path to track (default: straight at the
+    goal). ``weight`` is 1 on the chosen twist."""
     c = self.cfg
     n, dev = self.n, self.device
     self._oscillation_moved(speed)
     twist = velocity_grid(speed, c)  # [n, S, 3]
     traj, v = rollout(twist, speed, c)
     pose0 = torch.zeros(n, 3, device=dev)
-    path, path_yaw, path_real, path_len = straight_path(pose0[:, :2], goal, c)
-    end = path.gather(1, (path_real - 1)[:, None, None].expand(-1, 1, 2))
+    track = path if path is not None else straight_path(pose0[:, :2], goal, c)
+    points, path_yaw, path_real, path_len = track
+    end = points.gather(1, (path_real - 1)[:, None, None].expand(-1, 1, 2))
     cv = twist[:, :, None].expand(-1, -1, c.commit_steps, -1)
     data = {
       "traj": traj,
       "v": v,
       "cv": cv,
       "pose0": pose0,
-      "path": path,
+      "path": points,
       "path_yaw": path_yaw,
       "path_real": path_real,
       "path_length": path_len,
@@ -227,6 +243,9 @@ class Dwb:
     terms, legal = self._critics(data, twist, end)
     for name, critic in [(f.__name__, f) for f in self.extra_critics]:
       terms[name] = critic(data)
+    for name, scale in self.critic_scale.items():
+      if name in terms:
+        terms[name] = terms[name] * scale[:, None]
     cost = torch.stack(list(terms.values())).sum(0)
     cost = torch.where(legal, cost, torch.inf)
     fail = ~legal.any(-1)

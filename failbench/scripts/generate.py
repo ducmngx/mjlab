@@ -25,7 +25,10 @@ A shard (``<output_dir>/<prefix>_r<round>.npz``) holds, per trial ``b``:
   (``fault_elevation_sensor_cfg``).
 - ``plan_source``: what a planner-driven trial (``--driver``) committed to
   at its fault (``failbench.driver.SOURCES``; 255 otherwise); ``phantoms``
-  ``[B, M, 5]`` its phantom boxes (world centre x, y, half x, y, yaw).
+  ``[B, M, 5]`` its phantom boxes (world centre x, y, half x, y, yaw);
+  and, in driven shards only, ``plan_path_id`` the library path it tracked
+  (``--driver.library``; else 0) and ``plan_style`` ``[B, 10]`` its style
+  factors (``failbench.driver.STYLE_COLUMNS``).
 - ``fault_params`` ``[B, 12, 2]``, ``fault_family``, ``fault_time_s``
   (when it actually fired); ``goal_w``, ``cmd_speed`` (the follower's
   cruise speed), ``prefault_mode`` (``failbench.commands.PREFAULT_MODES``), ``cmd_c0`` (the command on the fault step), ``plan_hold``
@@ -323,6 +326,14 @@ def run_round(
       _np(command.driver.source).astype(np.uint8)
       if command.driver is not None
       else np.full(n, NO_SOURCE, np.uint8)
+    ),
+    **(
+      {
+        "plan_path_id": _np(command.driver.path_id).astype(np.int32),
+        "plan_style": _np(command.driver.style).astype(np.float16),
+      }
+      if command.driver is not None
+      else {}
     ),
     "tile_fault": _np(tile),
     "pre_steps": np.array(pre),

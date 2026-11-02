@@ -199,7 +199,8 @@ def failbench_env_cfg(
   driver: PlannerDriveCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """``fault_time_s`` applies to rough and course; stair trials fault by
-  position (``STAIR_FIRE_RADIUS``). ``prefault``: what trials do before the
+  position (``STAIR_FIRE_RADIUS``) unless a ``driver`` tracks library paths.
+  ``prefault``: what trials do before the
   fault (default: walk). ``driver``: a stock planner drives trials around
   phantoms and commits to a candidate at the fault (``failbench/driver.py``)
   instead of the goal follower and segment plan."""
@@ -271,7 +272,8 @@ def failbench_env_cfg(
     "mixture": mixture or FaultMixture(),
     "asset_cfg": SceneEntityCfg("robot"),
   }
-  if terrain in STAIR_FIRE_RADIUS:
+  # Library-driven trials start anywhere on a route, so they fault by time.
+  if terrain in STAIR_FIRE_RADIUS and (driver is None or driver.library is None):
     fault_params |= {
       "fault_time_s": STAIR_TIMEOUT_S,
       "fire_radius": STAIR_FIRE_RADIUS[terrain],

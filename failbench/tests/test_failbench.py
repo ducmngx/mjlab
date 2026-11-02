@@ -797,3 +797,16 @@ def test_a_three_second_model_is_evaluated_per_split_and_terrain():
   r = evaluate_split(dyn, samples, eval_cfg, "cpu", "safe")
   assert "drift_err_3s" in r and "drift_err_5s" not in r
   assert set(r["per_terrain"]["rough"]) >= {"drift_err_3s", "zero_err_3s"}
+
+
+def test_library_driven_stair_trials_fault_by_time_not_place():
+  from failbench.driver import PlannerDriveCfg
+  from failbench.env_cfg import failbench_env_cfg
+  from failbench.faults import FAULT_TERM
+
+  for drive, by_place in ((None, True), (PlannerDriveCfg(library="paths.npz"), False)):
+    cfg = failbench_env_cfg("Go2-HIM-Rough", "stairs", 0, (3.0, 5.0), driver=drive)
+    params = cfg.events[FAULT_TERM].params
+    assert ("fire_radius" in params) == by_place
+    if not by_place:
+      assert params["fault_time_s"] == (3.0, 5.0)

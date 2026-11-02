@@ -190,3 +190,29 @@ def test_the_fault_risk_critic_keeps_away_from_where_a_fault_would_throw():
   beside = lambda p: p[..., 1][(p[..., 0] > 1.5) & (p[..., 0] < 4.0)].mean()  # noqa: E731
   assert not hit
   assert beside(careful) > beside(plain) + 0.15
+
+
+def test_a_critic_scaled_for_one_robot_changes_only_its_plan():
+  goal = torch.tensor([[3.0, 1.5]]).expand(2, 2)
+  cmap = torch.zeros(2, 80, 80)
+
+  def run(scale=None, temperature=None):
+    torch.manual_seed(0)
+    planner = Nav2Mppi(Nav2MppiCfg(), 2, "cpu")
+    if scale is not None:
+      planner.critic_scale = scale
+    if temperature is not None:
+      planner.temperature_scale = temperature
+    out = planner.step(cmap, RES, goal, torch.zeros(2, 3))
+    for _ in range(2):
+      out = planner.step(cmap, RES, goal, torch.zeros(2, 3))
+    return out["cmd"]
+
+  base = run()
+  both = torch.tensor([1.0, 4.0])
+  for kw in (
+    {"scale": {k: both for k in Nav2Mppi.CRITICS}},
+    {"temperature": torch.tensor([1.0, 0.1])},
+  ):
+    cmd = run(**kw)
+    assert torch.equal(cmd[0], base[0]) and not torch.equal(cmd[1], base[1])

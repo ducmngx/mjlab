@@ -95,3 +95,21 @@ def test_a_fast_rollout_cannot_step_through_a_thin_wall():
   # Walking on at speed would cross the wall: it must slow or stop short.
   traj = out["path"][0, : round(1.7 / 0.1)]
   assert (traj[:, 0] + cfg.costmap.footprint[0] / 2 < 1.0).all()
+
+
+def test_a_critic_scaled_for_one_dwb_robot_changes_only_its_twist():
+  goal = torch.tensor([[3.0, 1.5]]).expand(2, 2)
+  cmap = torch.zeros(2, 80, 80)
+
+  def run(scale=None):
+    planner = _dwb(2)
+    if scale is not None:
+      planner.critic_scale = scale
+    return planner.step(cmap, RES, goal, torch.tensor([[0.6, 0.0, 0.0]] * 2))["cmd"]
+
+  assert set(Dwb.CRITICS) >= {"path_dist", "goal_align"}
+  base = run()
+  off = torch.tensor([1.0, 0.0])
+  # Without the goal's pull robot 1 has no reason to hurry.
+  cmd = run({"goal_dist": off, "goal_align": off})
+  assert torch.equal(cmd[0], base[0]) and not torch.equal(cmd[1], base[1])
