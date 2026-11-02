@@ -44,6 +44,10 @@ warns of falls), and the encoded fault (24). ``plan_hold``: the
 post-fault plan holds the fault-time command. ``prefault_mode``: what the
 robot did before the fault (``failbench.commands.PREFAULT_MODES``).
 
+``plan_source``: what a planner-driven trial (``failbench/driver.py``)
+committed to at its fault (an index into ``failbench.driver.SOURCES``;
+``NO_SOURCE`` for the follower-driven data).
+
 ``split``: 0 train, 1 val, 2 test_terrain (unseen terrain seeds), 3
 test_fault (the ``held_out`` joint and family pairs, never trained on).
 
@@ -236,6 +240,18 @@ class BuildConfig:
   lidar: LidarCfg = field(default_factory=LidarCfg)
 
 
+NO_SOURCE = 255
+"""``plan_source`` of a trial no planner drove (follower-driven shards)."""
+
+
+def plan_sources(raw, idx: np.ndarray) -> np.ndarray:
+  """Each kept trial's ``plan_source`` (``NO_SOURCE`` for shards without)."""
+  files = raw.files if hasattr(raw, "files") else raw.keys()
+  if "plan_source" not in files:
+    return np.full(len(idx), NO_SOURCE, np.uint8)
+  return raw["plan_source"][idx].astype(np.uint8)
+
+
 def _split(
   seed: int, family: np.ndarray, params: np.ndarray, joints, cfg
 ) -> np.ndarray:
@@ -315,6 +331,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     if "prefault_mode" in raw.files
     else np.zeros(len(idx), np.uint8)
   )
+  sources = plan_sources(raw, idx)
   seed = int(raw["terrain_seed"])
   split = _split(seed, family, params, raw["joint_names"], cfg)
   fault_enc = encode_fault(torch.as_tensor(params)).numpy().astype(np.float32)
@@ -406,6 +423,7 @@ def build_shard(path: Path, cfg: BuildConfig, device: str) -> Path:
     put("trial", idx.astype(np.int32))
     put("plan_hold", raw["plan_hold"][idx])
     put("prefault_mode", prefault)
+    put("plan_source", sources)
     put("tile", raw["tile_fault"][idx].astype(np.int16))
 
   # CSR contacts over samples ordered (snapshot, trial).

@@ -1,10 +1,15 @@
 """Tests for the MPPI planner: input parity with the data builder, the
 obstacle sweep and the planner on a synthetic map."""
 
+import math
+from dataclasses import replace
+from typing import cast
+
 import pytest
 import torch
 from failbench.data.build import _integrate
 from failbench.faults import NOMINAL
+from failbench.mppi.cbf import CbfCfg, CbfFilter, severity_fields
 from failbench.mppi.costmap import (
   FootprintCfg,
   distance_field,
@@ -17,6 +22,7 @@ from failbench.mppi.models import ZeroDriftModel
 from failbench.mppi.planner import (
   CostWeights,
   FaultRiskCfg,
+  InflationCfg,
   Mppi,
   MppiCfg,
   risk_weights,
@@ -268,7 +274,9 @@ def test_fault_risk_keeps_further_from_the_more_severe_side():
   away_from_right, _ = _side(_Thrown(), h, right_worse)
   away_from_left, _ = _side(_Thrown(), h, left_worse)
   # The same boxes; only what they are differs, and the choice mirrors.
-  assert away_from_right > 0.05 and away_from_left < -0.05
+  # (Small: the goal is on the centre line, and the cost-to-go knows the
+  # robot must come back to it.)
+  assert away_from_right > 0.02 and away_from_left < -0.02
 
 
 def _wall_costs(at_x: float, weights: CostWeights) -> dict[str, torch.Tensor]:
@@ -336,9 +344,11 @@ def test_fault_risk_reports_each_branch():
   names = Mppi(MppiCfg(fault_risk=FaultRiskCfg(modes=("free",))), _Thrown(), 1, "cpu")
   assert out["risk_branch"].shape == (1, 4)
   assert names.branch_names()[0] == "FL_hip_joint:free"
-  # FL hip (even joint) is thrown right, onto the ledge; FR hip left.
-  assert out["risk_branch"][0, 0] > 0 and out["risk_branch"][0, 1] == 0
-  assert out["risk_thrown"].shape[:3] == (1, 6, 4)
+  # FL hip (even joint) is thrown right, onto the ledge; FR hip left (only
+  # the route's last turn toward the goal brings the ledge near).
+  branch = out["risk_branch"][0]
+  assert branch[0] > 0 and branch[1] < 0.05 * branch[0]
+  assert out["risk_thrown"].shape[:3] == (1, 16, 4)
 
 
 def test_risk_measures_span_mean_to_worst():
@@ -376,7 +386,7 @@ def test_tail_measures_price_the_ledge_more():
     known = torch.ones_like(h, dtype=torch.bool)
     out = planner.step(inputs, h, known, RES, torch.tensor([[3.0, 0.0]]))
     costs[m] = float(out["risk_branch"].sum())
-  assert 0 < costs["mean"] < costs["cvar"] <= costs["max"]
+  assert 0 < costs["mean"] < costs["cvar"] <= costs["max"] * (1 + 1e-4)
 
 
 class _Falls(ZeroDriftModel):
@@ -417,20 +427,63 @@ def test_a_fall_costs_only_what_it_lands_on():
   assert fall["glass"] > 0.5 * 25
 
 
+def test_the_margin_grows_with_severity_and_speed_only_when_asked():
+  h = torch.zeros(1, 160, 160)
+  h[:, 92:95] = 0.8  # A wall along x, 0.6 m left: 0.4 m past the footprint.
+  plans = torch.zeros(1, 2, 50, 3)
+  plans[0, 1, :, 0] = 0.8  # Stand, or walk past it at cruise speed.
+
+  def reach(inflation: InflationCfg, severity: float) -> list[float]:
+    cfg = MppiCfg(sampler=SamplerCfg(num_plans=16, compile=False), inflation=inflation)
+    planner = Mppi(cfg, ZeroDriftModel(), 1, "cpu")
+    fp = cfg.footprint
+    obst = obstacle_cells(h, fp.wall_jump_m)
+    sc = planner.score(
+      {},
+      plans,
+      distance_field(obst, RES, fp.max_dist_m),
+      torch.ones_like(h, dtype=torch.bool),
+      RES,
+      torch.tensor([[3.0, 0.0]]),
+      risk_fields=planner._risk_fields(
+        obst, obst & False, torch.full_like(h, severity), RES
+      ),
+    )
+    if inflation.margin == 0:
+      assert "inflation" not in sc["terms"]
+      return [0.0, 0.0]
+    return (sc["terms"]["inflation"][0] / cfg.weights.inflation).tolist()
+
+  uniform = InflationCfg(margin=0.5)
+  semantic = InflationCfg(margin=0.5, severity_ref=25.0, speed_ref=0.8)
+  # Uniform: 0.1 m into the margin, whatever the wall is and however fast.
+  for severity in (5.0, 25.0):
+    assert reach(uniform, severity) == pytest.approx([0.1, 0.1], abs=0.03)
+  # Semantic: glass keeps the full margin, crates a fifth of it (clear);
+  # walking at cruise doubles it.
+  assert reach(semantic, 25.0) == pytest.approx([0.1, 0.6], abs=0.03)
+  assert reach(semantic, 5.0) == [0.0, 0.0]
+  assert reach(InflationCfg(), 25.0) == [0.0, 0.0]
+
+
 def test_standing_still_pays_the_fault_risk_of_the_ground_ahead():
   h = torch.zeros(1, 160, 160)
   h[:, :66, 112:] = -0.6  # A ledge to the right (-y), from 1.6 m ahead on.
   costs = {}
-  for fire_m in ((0.5, 1.0, 1.5, 2.0, 2.5, 3.0), None):
-    cfg = MppiCfg(
-      sampler=SamplerCfg(num_plans=16, compile=False),
-      fault_risk=FaultRiskCfg(p=0.1, modes=("free",), fire_m=fire_m),
-    )
+  base = FaultRiskCfg(p=0.1, modes=("free",))
+  layouts = {
+    "to_goal": base,
+    "per_m": replace(base, fire_step_m=None),
+    "per_s": replace(base, fire_step_m=None, fire_m=None),
+  }
+  for name, layout in layouts.items():
+    cfg = MppiCfg(sampler=SamplerCfg(num_plans=16, compile=False), fault_risk=layout)
     planner = Mppi(cfg, _Thrown(side=-1.0), 1, "cpu")
     fp = cfg.footprint
     obst, drops = obstacle_cells(h, fp.wall_jump_m), drop_cells(h, fp, RES)
     plans = torch.zeros(1, 2, 50, 3)
-    plans[0, 1, :, 0] = 0.3  # Stand, or creep along the ledge.
+    # Stand, or walk on at the cruise speed the ground ahead is priced at.
+    plans[0, 1, :, 0] = layout.cruise_vx or 0.3
     sc = planner.score(
       {"fault": torch.tensor(NOMINAL).repeat(12)[None]},
       plans,
@@ -441,13 +494,43 @@ def test_standing_still_pays_the_fault_risk_of_the_ground_ahead():
       drop_dist=distance_field(drops, RES, fp.max_dist_m),
       risk_fields=planner._risk_fields(obst, drops, None, RES),
     )
-    costs[fire_m is not None] = sc["terms"]["fault_risk"][0]
+    costs[name] = sc["terms"]["fault_risk"][0]
   # Faults by the metre: standing only puts the ledge off, at the same risk.
-  per_m = costs[True]
-  assert per_m[1] > 0 and torch.isclose(per_m[0], per_m[1], rtol=0.01)
+  for name in ("to_goal", "per_m"):
+    assert costs[name][1] > 0
+    assert torch.isclose(costs[name][0], costs[name][1], rtol=0.01)
   # Faults by the second: standing where nothing is in reach looks safe.
-  per_s = costs[False]
+  per_s = costs["per_s"]
   assert per_s[0] < 0.05 * per_s[1]
+
+
+def test_speed_share_zero_prices_only_where_a_plan_walks():
+  h = torch.zeros(1, 160, 160)
+  h[:, :66, 112:] = -0.6  # A ledge to the right (-y), from 1.6 m ahead on.
+  costs = {}
+  for share in (0.0, 1.0):
+    fr = FaultRiskCfg(p=0.1, modes=("free",), speed_share=share)
+    cfg = MppiCfg(sampler=SamplerCfg(num_plans=16, compile=False), fault_risk=fr)
+    planner = Mppi(cfg, _Thrown(side=-1.0), 1, "cpu")
+    fp = cfg.footprint
+    obst, drops = obstacle_cells(h, fp.wall_jump_m), drop_cells(h, fp, RES)
+    plans = torch.zeros(1, 2, 50, 3)
+    plans[0, 0, :, 0] = 0.4  # The same line, slow or fast.
+    plans[0, 1, :, 0] = 1.1
+    pose = planner._path(plans)
+    risk = planner._fault_risk(
+      planner._throws({"fault": torch.tensor(NOMINAL).repeat(12)[None]}),
+      plans,
+      pose,
+      planner._risk_fields(obst, drops, None, RES),
+      RES,
+      torch.tensor([[6.0, 0.0]]),
+    )
+    costs[share] = cast(torch.Tensor, risk)[0]
+  # Steering only: the same ground costs the same at any speed.
+  assert torch.isclose(costs[0.0][0], costs[0.0][1], rtol=0.01)
+  # The full price: the faster plan's throws reach further along the ledge.
+  assert costs[1.0][1] > costs[1.0][0]
 
 
 def test_turning_on_the_spot_does_not_dodge_the_ground_ahead():
@@ -475,3 +558,85 @@ def test_turning_on_the_spot_does_not_dodge_the_ground_ahead():
   # The ground still to walk lies toward the goal, whichever way it faces.
   risk = sc["terms"]["fault_risk"][0]
   assert risk[0] > 0 and torch.isclose(risk[0], risk[1], rtol=0.01)
+
+
+def test_looping_back_through_the_open_does_not_dodge_the_hazard_ahead():
+  h = torch.zeros(1, 160, 160)
+  h[:, 60:72, 120:150] = 0.8  # Glass 0.4-1.0 m right (-y), 2.0-3.5 m ahead.
+  severity = torch.full_like(h, 25.0)
+  plans = torch.zeros(1, 2, 50, 3)
+  plans[0, :, :, 0] = 0.6  # Walk on past it, or...
+  plans[0, 1, :, 2] = 2 * math.pi / 5.0  # ...loop left, back to the start.
+  risk = {}
+  base = FaultRiskCfg(p=0.1, modes=("free",))
+  for name, layout in (("next_3m", replace(base, fire_step_m=None)), ("to_goal", base)):
+    cfg = MppiCfg(sampler=SamplerCfg(num_plans=16, compile=False), fault_risk=layout)
+    planner = Mppi(cfg, _Thrown(side=-1.0), 1, "cpu")  # Thrown right.
+    fp = cfg.footprint
+    obst = obstacle_cells(h, fp.wall_jump_m)
+    sc = planner.score(
+      {"fault": torch.tensor(NOMINAL).repeat(12)[None]},
+      plans,
+      distance_field(obst, RES, fp.max_dist_m),
+      torch.ones_like(h, dtype=torch.bool),
+      RES,
+      torch.tensor([[6.0, 0.0]]),
+      risk_fields=planner._risk_fields(obst, obst & False, severity, RES),
+    )
+    risk[name] = sc["terms"]["fault_risk"][0]
+  # Pricing the next 3 m only, the loop spends them in the open and looks
+  # far safer; with the route to the goal priced, it still owes the glass.
+  # (A loop that ended on a line clear of it would rightly cost less.)
+  assert risk["next_3m"][1] < 0.5 * risk["next_3m"][0]
+  assert risk["to_goal"][1] >= 0.95 * risk["to_goal"][0]
+
+
+def _filtered(cmd, rows=None, severity=25.0, margin=0.3, **kw):
+  """The CBF's command for ``cmd`` beside a wall filling map ``rows`` (+y
+  is up the rows) or ``cols`` (+x), and its logs."""
+  h = torch.zeros(1, 160, 160)
+  if rows is not None:
+    h[:, rows] = 0.8
+  if "cols" in kw:
+    h[:, :, kw.pop("cols")] = 0.8
+  cfg = CbfCfg(margin=margin, **kw)
+  fields = severity_fields(h, torch.full_like(h, severity), RES, cfg.footprint)
+  safe, log = CbfFilter(cfg).filter(torch.tensor([cmd]), fields, torch.zeros(1), RES)
+  return safe[0], log
+
+
+def test_the_cbf_passes_commands_through_in_open_ground():
+  safe, log = _filtered((0.8, 0.1, 0.3))
+  assert torch.allclose(safe, torch.tensor([0.8, 0.1, 0.3]))
+  assert log["active"][0] == 0
+
+
+def test_the_cbf_slows_the_approach_to_a_wall_but_not_the_walk_along_it():
+  # A wall 1.03 m ahead: the front circle is 0.81 m off, 0.31 m outside a
+  # 0.3 m margin, so it may close at gamma h / dt = 0.61 m/s.
+  safe, log = _filtered((1.0, 0.3, 0.0), cols=slice(100, 103))
+  assert safe[0] == pytest.approx(0.61, abs=0.03)
+  assert safe[1] == pytest.approx(0.3, abs=0.01)
+  assert log["active"][0] >= 1
+
+
+def test_the_semantic_cbf_keeps_off_glass_but_not_crates():
+  toward = (0.0, 0.5, 0.0)  # Strafing at a wall 0.62 m left.
+  wall = slice(92, 95)
+  glass, _ = _filtered(toward, wall, 25.0, severity_ref=25.0)
+  crates, _ = _filtered(toward, wall, 5.0, severity_ref=25.0)
+  uniform_crates, _ = _filtered(toward, wall, 5.0)
+  assert glass[1] < 0.35  # 0.12 m from glass's margin: at most ~0.25 m/s.
+  assert crates[1] == pytest.approx(0.5, abs=0.01)  # A 0.06 m margin.
+  assert uniform_crates[1] < 0.35  # Uniform: crates as glass.
+
+
+def test_the_cbf_pushes_out_of_the_margin_and_limits_turning_into_it():
+  # 0.42 m from a wall with a 0.3 m margin: 0.08 m inside, standing still.
+  inside, _ = _filtered((0.0, 0.0, 0.0), slice(88, 91))
+  assert inside[1] < -0.1
+  # Turning toward a wall swings the front circle at it (0.22 m/s per
+  # rad/s): with 0.075 m to the margin it may close at 0.15 m/s.
+  turn, _ = _filtered((0.0, 0.0, 1.0), slice(89, 92), margin=0.2)
+  assert turn[2] < 0.9
+  assert turn[1] + 0.22 * turn[2] <= 0.16

@@ -11,31 +11,38 @@ One cycle (every ``step_s``) for ``n`` robots:
    obstacle on the map (``hit_prob``) and how far its mean reaches in,
    the same for drops (ledges), unknown cells, falling onto something,
    P(trunk contact) (off by default), smoothness, the fault risk (below),
-   going nowhere once the robot has been still a while, and on the course
-   the offset from the lane centre. Every risk is priced by what would be
+   going nowhere once the robot has been still a while, on the course
+   the offset from the lane centre, and for the margin baseline
+   (``InflationCfg``, off by default) the reach into a margin kept around
+   obstacles. Every risk is priced by what would be
    hit: in open ground none costs anything.
    The fault risk (``FaultRiskCfg``, off at ``p = 0``) prices a fault that
    hasn't happened: what each single-joint fault would do if it fired at
    points along the plan's predicted path, the robot carrying on at the
    plan's speed (it hasn't noticed yet, and couldn't stop at once if it
-   had). The points are the first few metres the robot will walk
-   (``fire_m``), past the plan's end on toward the goal (the ground it
-   still has to walk; along its last heading, a plan that turns on the spot
-   would price open ground instead), and
-   the fault chance is per metre: faults come with use, so standing still
-   only puts the same stretch off, and a plan that stops pays for the
-   ground ahead as one that walks it. Each branch's throw (drift, spread
+   had). The points run every ``fire_step_m`` along the whole route left,
+   the plan's own path and then straight on from its end to the goal (a
+   cost-to-go): every plan pays for all the ground still to walk, so one
+   that turns on the spot or loops back through open ground still owes the
+   stretch past the hazard, while one that really reaches safer ground
+   pays less. The fault chance is per metre: faults come with use, so
+   standing still only puts the same stretch off, and a plan that stops
+   pays for the ground ahead as one that walks it. Each branch's throw (drift, spread
    and falls) is predicted once per robot from the current state, as if it
    fired now, at a few held speeds (``hold_vx``), then placed at each
-   firing point's pose, from the speed nearest the plan's there. The plan
+   firing point's pose, blended between the held speeds either side of the
+   plan's there (past the plan's end, ``cruise_vx``). How much the plan's
+   own speed counts is ``speed_share``: 0 prices every throw at
+   ``cruise_vx``, so only where the plan walks matters. The plan
    pays, summed over branches and firing points weighted by their chances,
    each obstacle's severity times the chance the thrown robot touches it
    (``hit_prob``) or falls onto it, whichever is larger. Severity comes per
    map cell (``failbench/severity.py``; drops have their own), so a healthy
    robot keeps away from where a fault would throw it, from glass more
    than a box; in open ground nothing is in reach and the risk is 0.
-   Every hazard (obstacle, drop, fall, collision, fault risk) is discounted
-   by ``discount_per_s`` per second ahead, so a nearer hit costs more.
+   Every hazard (obstacle, drop, fall, collision, margin, fault risk) is
+   discounted by ``discount_per_s`` per second ahead, so a nearer hit costs
+   more.
 4. weight plans by ``exp(-(cost - min) / (temperature * (q - min)))``, ``q``
    the ``gap_quantile`` cost (the median by default), and average them into
    the new plan, kept (shifted) as the next warm start. Scaling by a
@@ -62,6 +69,7 @@ import torch
 from failbench.faults import JOINT_NAMES, LOCK, NOMINAL, TORQUE, encode_fault
 from failbench.mppi.costmap import (
   FootprintCfg,
+  clearance,
   distance_field,
   drop_cells,
   hit_prob,
@@ -117,6 +125,9 @@ class CostWeights:
   only the goal term, while every plan that moves also pays its risks, so
   near a waypoint or with a bad leg standing can win every cycle: nothing
   changes while the robot stands, so it stands for good."""
+  inflation: float = 20.0
+  """Per metre the predicted footprint reaches into ``InflationCfg``'s
+  margin (the deepest over steps, discounted)."""
   fault_risk: float = 1.0
   """On ``FaultRiskCfg``'s expected severity: how much a fault that hasn't
   happened matters, apart from how likely it is (``p``)."""
@@ -147,8 +158,9 @@ symmetry. Weak (partial torque) faults fell at most 4% and aren't priced."""
 @dataclass(frozen=True)
 class FaultRiskCfg:
   p: float = 0.0
-  """Probability a fault fires per metre walked (with ``fire_m``; per plan,
-  spread evenly over ``fire_s``, without), split over the branches
+  """Probability a fault fires per metre walked (with ``fire_step_m`` or
+  ``fire_m``; per plan, spread evenly over ``fire_s``, without), split over
+  the branches
   (``mode_share``, then evenly over each mode's joints); 0 turns the term
   off."""
   faults: tuple[str, ...] | None = VULNERABLE_FAULTS
@@ -169,9 +181,22 @@ class FaultRiskCfg:
   the fault outcomes."""
   mode_share: tuple[float, ...] | None = None
   """Each mode's share of ``p`` (normalised); None: equal."""
+  fire_step_m: float | None = 0.5
+  """Cost-to-go: a firing point every this many metres along the plan's
+  predicted path and on from its end straight to the goal, up to
+  ``fire_max_m`` or the goal: every plan pays for all the ground left to
+  walk, so one that spends its metres in the open (a loop back) still owes
+  the stretch past the hazard. None: ``fire_m``."""
+  fire_max_m: float = 8.0
+  """How far along the route the cost-to-go prices (the map reaches 4 m
+  from the robot; beyond, nothing is seen and nothing costs)."""
+  goal_radius_m: float = 0.5
+  """The cost-to-go's route ends at a plan's first step this close to the
+  goal (the robot stops on arrival): no ground past it is priced."""
   fire_m: tuple[float, ...] | None = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
-  """Firing points, metres along the plan's predicted path; each stands for
-  the stretch since the one before. None: ``fire_s``."""
+  """Without ``fire_step_m``: firing points, metres along the plan's
+  predicted path (and past its end toward the goal); each stands for the
+  stretch since the one before. None: ``fire_s``."""
   fire_s: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
   """Firing points, s into the plan, when ``fire_m`` is None: a robot that
   stands meets no fault, so waiting looks safe."""
@@ -179,11 +204,27 @@ class FaultRiskCfg:
   """How long after firing the throw is swept. In the data a free hip
   throws the robot 0.2-0.4 m toward its side by 1.5 s and 0.4-0.6 m by
   2 s, and most falls come within 2 s of the fault."""
-  hold_vx: tuple[float, ...] = (0.3, 0.6, 0.9)
-  """Forward speeds the robot is assumed to hold after a fault fires; each
-  firing point uses the nearest to the plan's speed there. Holding the
-  sample's own command reproduces the data's free-hip throws (within a few
-  cm at 1.5 s); assuming a stop halves them."""
+  hold_vx: tuple[float, ...] = (0.3, 0.6, 0.9, 1.2)
+  """Forward speeds the robot is assumed to hold after a fault fires (one
+  model call each per cycle), ascending. Holding the sample's own command
+  reproduces the data's free-hip throws (within a few cm at 1.5 s);
+  assuming a stop halves them."""
+  blend_speeds: bool = True
+  """A firing point's throw is blended linearly between the two held speeds
+  either side of the plan's speed there (clamped to their range), so the
+  risk changes smoothly with speed. False: the nearest one's throw, which
+  makes small slowdowns step the risk down."""
+  cruise_vx: float | None = 1.0
+  """The speed of the cost-to-go: firing points past a plan's end, on the
+  way to the goal, are priced at it, since a plan that slows for its few
+  seconds won't crawl the rest of the route. None: the plan's last speed.
+  Also the reference speed of ``speed_share``."""
+  speed_share: float = 1.0
+  """How much of the plan's own speed the risk prices. The risk is split
+  into where the plan walks (every throw at ``cruise_vx``) and how fast
+  (the risk at the plan's speeds minus that): cost = where + share * how
+  fast. 1: the full price; 0: steering only, speed free; between, slowing
+  pays part of what it saves."""
   fallen_radius: float = 0.4
   """Footprint circles' radius for a robot lying down (``hit_prob``)."""
   default_severity: float = 10.0
@@ -195,22 +236,44 @@ class FaultRiskCfg:
 def risk_weights(
   cost: torch.Tensor, prob: torch.Tensor, fr: FaultRiskCfg
 ) -> torch.Tensor:
-  """Weights over outcomes ``cost [..., O]`` (probabilities ``prob [O]``,
-  summing to ``p``; no fault, the rest, costs 0) whose dot with the costs is
-  ``FaultRiskCfg.measure``: the probabilities (the expectation), the CVaR's
-  tail mass over ``cvar_alpha``, or one-hot on the worst outcome."""
+  """Weights over outcomes ``cost [..., O]`` (probabilities ``prob``,
+  broadcastable to it; no fault, the rest, costs 0) whose dot with the costs
+  is ``FaultRiskCfg.measure``: the probabilities (the expectation), the
+  CVaR's tail mass over ``cvar_alpha``, or one-hot on the worst outcome.
+  Outcomes of zero probability (firing points past the goal) never count."""
+  prob = prob.expand_as(cost)
   if fr.measure == "mean":
-    return prob.expand_as(cost)
+    return prob
+  possible = cost.masked_fill(prob <= 0, -torch.inf)
   if fr.measure == "max":
-    return torch.nn.functional.one_hot(cost.argmax(-1), cost.shape[-1]).to(cost)
+    return torch.nn.functional.one_hot(possible.argmax(-1), cost.shape[-1]).to(cost)
   if fr.measure != "cvar":
     raise ValueError(f"Unknown risk measure {fr.measure!r}.")
   # Fill the worst cvar_alpha of the probability, worst outcome first.
-  order = cost.argsort(-1, descending=True)
-  q = prob[order]
+  order = possible.argsort(-1, descending=True)
+  q = prob.gather(-1, order)
   before = q.cumsum(-1) - q
   taken = (fr.cvar_alpha - before).clamp(min=0).minimum(q)
   return torch.zeros_like(cost).scatter(-1, order, taken / fr.cvar_alpha)
+
+
+@dataclass(frozen=True)
+class InflationCfg:
+  """A margin kept around obstacles, the hand-made way to be careful (a
+  baseline to the fault risk): the plan pays for reaching into it. Uniform
+  by default; ``severity_ref`` scales it by what each obstacle is and
+  ``speed_ref`` by how fast the plan goes, a throw growing with both."""
+
+  margin: float = 0.0
+  """Footprint to obstacle (m) kept clear, at ``severity_ref`` and standing
+  still; 0 turns the term off."""
+  severity_ref: float | None = None
+  """Each severity level's margin is ``margin * severity / severity_ref``
+  (25, glass: crates 0.2x, walls 0.4x, people 2x); None: one margin for
+  all."""
+  speed_ref: float | None = None
+  """The margin grows by ``1 + speed / speed_ref`` with the plan's
+  commanded speed at each step (0.8: doubled at cruise); None: fixed."""
 
 
 @dataclass(frozen=True)
@@ -219,6 +282,7 @@ class MppiCfg:
   footprint: FootprintCfg = field(default_factory=FootprintCfg)
   weights: CostWeights = field(default_factory=CostWeights)
   fault_risk: FaultRiskCfg = field(default_factory=FaultRiskCfg)
+  inflation: InflationCfg = field(default_factory=InflationCfg)
   temperature: float = 0.25
   gap_quantile: float = 0.5
   """Weights scale by the gap from the best plan to this cost quantile."""
@@ -346,28 +410,42 @@ class Mppi:
     """Where each fault fires on ``plans [n, k, T, 3]`` (predicted ``pose``,
     ``goal [n, 2]``): poses ``[n, k, F, 3]``, forward speeds ``[n, k, F]``,
     seconds ahead ``[n, k, F]`` and each point's chance per unit ``p``
-    ``[F]``."""
+    (metres of route it stands for), ``[F]`` or, for the cost-to-go, per
+    plan ``[n, k, F]`` (0 past the goal)."""
     c, fr = self.cfg, self.cfg.fault_risk
     s = c.sampler
-    if fr.fire_m is None:
+    if fr.fire_step_m is None and fr.fire_m is None:
       at = torch.tensor(
         [round(t / s.step_s) - 1 for t in fr.fire_s], device=pose.device
       )
       when = torch.tensor(fr.fire_s, device=pose.device).expand(*pose.shape[:2], -1)
       share = torch.full((len(at),), 1 / len(at), device=pose.device)
       return pose[:, :, at], plans[:, :, at, 0], when, share
-    marks = torch.tensor(fr.fire_m, device=pose.device)
+    if fr.fire_step_m is not None:
+      step_m = fr.fire_step_m
+      count = round(fr.fire_max_m / step_m)
+      marks = step_m * torch.arange(1, count + 1, device=pose.device)
+    else:
+      marks = torch.tensor(fr.fire_m, device=pose.device)
     xy = pose[..., :2]
     walked = torch.cat([xy[..., :1, :].norm(dim=-1), xy.diff(dim=-2).norm(dim=-1)], -1)
     walked = walked.cumsum(-1)  # [n, k, T]
     steps = walked.shape[-1]
+    last = torch.full(walked.shape[:2], steps - 1, device=pose.device)
+    if fr.fire_step_m is not None:
+      # The robot stops at the goal: a plan's route ends where it gets there.
+      there = (xy - goal[:, None, None]).norm(dim=-1) < fr.goal_radius_m
+      last = torch.where(there.any(-1), there.float().argmax(-1), last)
+    walked_end = walked.gather(2, last[..., None])  # [n, k, 1]
     # The first step at or past each mark; past the end, on toward the goal.
     idx = (walked[..., None, :] < marks[:, None]).sum(-1)  # [n, k, F]
-    beyond = idx >= steps
-    idx = idx.clamp(max=steps - 1)
+    beyond = idx > last[..., None]
+    idx = torch.minimum(idx, last[..., None])
     p0 = pose.gather(2, idx[..., None].expand(-1, -1, -1, 3))
     vx = plans[..., 0].gather(2, idx)
-    extra = (marks - walked[..., -1:]).clamp(min=0) * beyond  # [n, k, F]
+    if fr.cruise_vx is not None:
+      vx = torch.where(beyond, fr.cruise_vx, vx)
+    extra = (marks - walked_end).clamp(min=0) * beyond  # [n, k, F]
     to_goal = goal[:, None, None] - p0[..., :2]
     bearing = torch.atan2(to_goal[..., 1], to_goal[..., 0])
     yaw = torch.where(beyond, bearing, p0[..., 2])
@@ -377,7 +455,12 @@ class Mppi:
     )
     slow = min(fr.hold_vx)
     when = (idx + 1) * s.step_s + extra / vx.clamp(min=slow)
-    share = marks.diff(prepend=marks.new_zeros(1))
+    if fr.fire_step_m is None:
+      return p0, vx, when, marks.diff(prepend=marks.new_zeros(1))
+    # Route left: the plan's own metres, then straight on to the goal.
+    end = pose.gather(2, last[..., None, None].expand(-1, -1, 1, 3))[:, :, 0, :2]
+    route = walked_end[..., 0] + (goal[:, None] - end).norm(dim=-1)  # [n, k]
+    share = (route[..., None] - (marks - fr.fire_step_m)).clamp(0, fr.fire_step_m)
     return p0, vx, when, share
 
   def _fault_risk(
@@ -392,24 +475,45 @@ class Mppi:
   ) -> torch.Tensor | dict[str, torch.Tensor]:
     """Expected severity of a fault's throw per plan ``[n, k]``: over
     branches (by prior) and firing points (mean), over ``fields`` (severity,
-    distance field), severity times P(touch or fall onto). ``per_branch``:
-    instead each branch's share ``cost [n, k, B]`` (prior-weighted; they sum
-    to the total) and the throws ``placed`` at the firing points
+    distance field), severity times P(touch or fall onto), the plan's speed
+    priced by ``speed_share``. ``per_branch``: instead each branch's share
+    ``cost [n, k, B]`` at the plan's speeds (prior-weighted; they sum to
+    that total) and the throws ``placed`` at the firing points
     ``[n, k, F, B, Tp, 3]`` (map frame) with their ``std`` and ``p_fall``."""
+    fr = self.cfg.fault_risk
+    p0, vx, fire_at, share = self._firing_points(plans, pose, goal)  # [n, k, F, ...]
+    args = (throws, p0, fire_at, share, fields, resolution)
+    if per_branch or fr.speed_share == 1.0:
+      return self._priced(*args, vx, per_branch)
+    if fr.cruise_vx is None:
+      raise ValueError("speed_share needs cruise_vx as its reference speed.")
+    where = cast(torch.Tensor, self._priced(*args, torch.full_like(vx, fr.cruise_vx)))
+    if fr.speed_share == 0.0:
+      return where
+    actual = cast(torch.Tensor, self._priced(*args, vx))
+    return where + fr.speed_share * (actual - where)
+
+  def _priced(
+    self,
+    throws: dict[str, torch.Tensor],
+    p0: torch.Tensor,
+    fire_at: torch.Tensor,
+    share: torch.Tensor,
+    fields: list[tuple[float, torch.Tensor]],
+    resolution: float,
+    vx: torch.Tensor,
+    per_branch: bool = False,
+  ) -> torch.Tensor | dict[str, torch.Tensor]:
+    """``_fault_risk`` with each firing point's robot at speed ``vx
+    [n, k, F]``."""
     c, fr = self.cfg, self.cfg.fault_risk
-    n, k = pose.shape[:2]
+    n, k = p0.shape[:2]
     s = c.sampler
     prior = throws["prior"]
     nb = len(prior)
-    vxs = torch.tensor(fr.hold_vx, device=pose.device)
-    d, sd, fall = throws["thrown"], throws["std"], throws["p_fall"]
+    d, sd, fall = self._held(throws, vx)  # [n, k, F, B, ...]
     tp = d.shape[-2]
-    # Placed at each firing point's pose on every plan, from the held speed
-    # nearest the plan's there.
-    p0, vx, fire_at, share = self._firing_points(plans, pose, goal)  # [n, k, F, ...]
-    near = (vx[..., None] - vxs).abs().argmin(-1)  # [n, k, F]
-    rows = torch.arange(n, device=pose.device)[:, None, None]
-    d, sd, fall = d[rows, near], sd[rows, near], fall[rows, near]  # [n, k, F, B, ...]
+    # Placed at each firing point's pose on every plan.
     yaw = p0[..., None, None, 2]
     cy, sy = torch.cos(yaw), torch.sin(yaw)
     dx, dy = d[..., 0], d[..., 1]
@@ -421,15 +525,15 @@ class Mppi:
       ],
       dim=-1,
     )  # [n, k, F, B, Tp, 3]
-    nf = len(share)
+    nf = share.shape[-1]
     flat = placed.flatten(1, 3)
     std = sd.flatten(1, 3)
     p_fall = fall.flatten(1, 3)
     # Discounted by when the hit would happen: firing time plus time since.
-    after = (torch.arange(tp, device=pose.device) + 1) * s.step_s
+    after = (torch.arange(tp, device=p0.device) + 1) * s.step_s
     when = fire_at[..., None] + after  # [n, k, F, Tp]
     disc = (c.weights.discount_per_s**when)[..., None, :]  # [n, k, F, 1, Tp]
-    cost = torch.zeros(n, k, nf, nb, device=pose.device)
+    cost = torch.zeros(n, k, nf, nb, device=p0.device)
     for severity, dist in fields:
       touch = hit_prob(dist, flat, std, resolution, c.footprint)
       onto = p_fall * hit_prob(
@@ -440,7 +544,7 @@ class Mppi:
     # Outcomes (firing point, fault), each as likely as its prior times the
     # point's share; the rest of the probability (no fault) costs nothing.
     outcome = cost.flatten(2)  # [n, k, F * B]
-    chance = (share[:, None] * prior).flatten()
+    chance = (share[..., None] * prior).flatten(-2)
     part = risk_weights(outcome, chance, fr) * outcome
     if per_branch:
       return {
@@ -450,6 +554,31 @@ class Mppi:
         "p_fall": fall,
       }
     return part.sum(-1)
+
+  def _held(
+    self, throws: dict[str, torch.Tensor], vx: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Each fault's throw (path, std, P(fallen)) ``[n, k, F, B, Tp, ...]``
+    for a robot at speed ``vx [n, k, F]``, from the held speeds' (blended
+    or nearest, ``blend_speeds``)."""
+    fr = self.cfg.fault_risk
+    vxs = torch.tensor(fr.hold_vx, device=vx.device)
+    rows = torch.arange(vx.shape[0], device=vx.device)[:, None, None]
+    keys = ("thrown", "std", "p_fall")
+    if not fr.blend_speeds or len(vxs) == 1:
+      near = (vx[..., None] - vxs).abs().argmin(-1)  # [n, k, F]
+      d, sd, fall = (throws[key][rows, near] for key in keys)
+      return d, sd, fall
+    x = vx.clamp(vxs[0], vxs[-1])
+    hi = torch.searchsorted(vxs, x.contiguous()).clamp(1, len(vxs) - 1)
+    lo = hi - 1
+    a = (x - vxs[lo]) / (vxs[hi] - vxs[lo])  # [n, k, F]
+    out = []
+    for key in keys:
+      t = throws[key]
+      w = a.view(*a.shape, *([1] * (t.dim() - 2)))
+      out.append(torch.lerp(t[rows, lo], t[rows, hi], w))
+    return out[0], out[1], out[2]
 
   def _risk_fields(
     self,
@@ -472,6 +601,28 @@ class Mppi:
       for v in level.unique().tolist()
       if v > 0
     ]
+
+  def _inflation(
+    self,
+    plans: torch.Tensor,
+    pose: torch.Tensor,
+    fields: list[tuple[float, torch.Tensor]],
+    resolution: float,
+  ) -> torch.Tensor:
+    """Deepest reach (m) of the footprint along ``pose`` into each severity
+    level's margin (``InflationCfg``), per step ``[n, k, T]``."""
+    inf, fp = self.cfg.inflation, self.cfg.footprint
+    margin = pose.new_full(pose.shape[:-1], inf.margin)
+    if inf.speed_ref is not None:
+      margin = margin * (1 + plans[..., :2].norm(dim=-1) / inf.speed_ref)
+    reach = pose.new_zeros(pose.shape[:-1])
+    for severity, dist in fields:
+      scale = 1.0 if inf.severity_ref is None else severity / inf.severity_ref
+      # Distances are known up to max_dist_m: a wider margin can't be seen.
+      want = (fp.radius + scale * margin).clamp(max=fp.max_dist_m)
+      clear = clearance(dist, pose, resolution, fp).amin(-1)
+      reach = torch.maximum(reach, (want - clear).clamp(min=0))
+    return reach
 
   def _path(self, plans: torch.Tensor) -> torch.Tensor:
     return integrate_plan(plans, self.cfg.control_dt, self.substeps)
@@ -552,6 +703,10 @@ class Mppi:
       * ((self.still_s - c.idle_after_s) / c.idle_ramp_s).clamp(0, 1)[:, None]
       * (1 - pose[..., :2].norm(dim=-1).amax(-1) / c.idle_move_m).clamp(min=0),
     }
+    if c.inflation.margin > 0:
+      fields = risk_fields or [(c.fault_risk.default_severity, dist)]
+      reach = self._inflation(plans, pose, fields, resolution)
+      terms["inflation"] = w.inflation * (disc * reach).amax(-1)
     throws = None
     if c.fault_risk.p > 0:
       if risk_fields:

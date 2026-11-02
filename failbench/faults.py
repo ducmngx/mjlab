@@ -69,6 +69,9 @@ class FaultMixture:
   """Instead of the families: one of these ``joint:mode`` faults per env,
   uniformly (``free`` = limp, ``lock`` = seized), as the planner's
   ``FaultRiskCfg.faults``."""
+  balanced: bool = False
+  """``pairs``: each drawn equally often over the envs (shuffled) instead of
+  independently, so a run doesn't pile up on a few faults."""
 
 
 def _uniform(shape, lo: float, hi: float, device) -> torch.Tensor:
@@ -84,7 +87,12 @@ def sample_fault_params(
     split = [f.split(":") for f in mix.pairs]
     joints = torch.tensor([JOINT_NAMES.index(j) for j, _ in split], device=device)
     locked = torch.tensor([m == "lock" for _, m in split], device=device)
-    pick = torch.randint(len(split), (n,), device=device)
+    if mix.balanced:
+      pick = (torch.arange(n, device=device) % len(split))[
+        torch.randperm(n, device=device)
+      ]
+    else:
+      pick = torch.randint(len(split), (n,), device=device)
     rows, j, lock = torch.arange(n, device=device), joints[pick], locked[pick]
     params[rows, j, LOCK] = lock.float()
     params[rows, j, TORQUE] = torch.where(lock, 1.0, 0.0)
@@ -126,8 +134,11 @@ class inject_kinodynamic_fault:
   and the model is restored to nominal. With ``fire_radius`` the fault
   instead fires once the trunk is a sampled distance in ``fire_radius``
   (Chebyshev, m) from its terrain origin, the centre of a stair pyramid, and
-  at least ``min_time_s`` in; ``fault_time_s`` is then the timeout. Not for envs with heat_bench's
-  ``actuator_health`` term, which rewrites the force range every step.
+  at least ``min_time_s`` in; ``fault_time_s`` is then the timeout. A
+  caller can also fire faults itself (``fire_now``), e.g. at a place on the
+  route, with ``fault_time_s`` as the timeout. Not for envs with
+  heat_bench's ``actuator_health`` term, which rewrites the force range
+  every step.
   """
 
   model_fields = ("jnt_range", "actuator_forcerange")
@@ -218,6 +229,12 @@ class inject_kinodynamic_fault:
     fire = ~self.faulted & due
     if fire.any():
       self._fire(fire.nonzero().squeeze(-1))
+
+  def fire_now(self, due: torch.Tensor) -> None:
+    """Fire the faults of the envs in mask ``due [n]`` that haven't yet."""
+    rows = (due & ~self.faulted).nonzero().squeeze(-1)
+    if rows.numel():
+      self._fire(rows)
 
   def _fire(self, rows: torch.Tensor) -> None:
     env, data = self._env, self._asset.data

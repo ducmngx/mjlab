@@ -23,6 +23,9 @@ A shard (``<output_dir>/<prefix>_r<round>.npz``) holds, per trial ``b``:
 - ``map`` ``[B, S, 64, 64]`` (fp16): terrain height relative to the trunk
   at each snapshot, NaN where a ray missed; trunk-centred and yaw-aligned
   (``fault_elevation_sensor_cfg``).
+- ``plan_source``: what a planner-driven trial (``--driver``) committed to
+  at its fault (``failbench.driver.SOURCES``; 255 otherwise); ``phantoms``
+  ``[B, M, 5]`` its phantom boxes (world centre x, y, half x, y, yaw).
 - ``fault_params`` ``[B, 12, 2]``, ``fault_family``, ``fault_time_s``
   (when it actually fired); ``goal_w``, ``cmd_speed`` (the follower's
   cruise speed), ``prefault_mode`` (``failbench.commands.PREFAULT_MODES``), ``cmd_c0`` (the command on the fault step), ``plan_hold``
@@ -61,7 +64,8 @@ from heat_bench.envs_mjlab.joint_fault_injection import (
 from heat_bench.scripts.policy_loading import load_runner
 
 from failbench.commands import GoalVelocityCommand, PrefaultCfg
-from failbench.data.build import fallen
+from failbench.data.build import NO_SOURCE, fallen
+from failbench.driver import PlannerDriveCfg
 from failbench.env_cfg import DEFAULT_TASK, failbench_env_cfg
 from failbench.faults import FAULT_PARAMS, FAULT_TERM, inject_kinodynamic_fault
 from mjlab.envs import ManagerBasedRlEnv
@@ -96,6 +100,12 @@ class GenerateConfig:
   0.2`` also faults robots at rest, setting off, slow and just stopped."""
   prefix: str | None = None
   """Shard name prefix; defaults to '<terrain>_s<seed>'."""
+  driver: PlannerDriveCfg | None = None
+  """The planner-driven mode (``failbench/driver.py``): a stock planner
+  drives around phantom obstacles and each trial commits to one of its
+  candidates at the fault, 3 s open loop; pair with ``--horizon-s 3.5
+  --snapshot-s 0`` and build with ``--horizon-s 3``. ``--driver.planner``
+  picks Nav2 MPPI or DWB."""
 
 
 HIM_LATENT_DIM = 16
@@ -304,6 +314,16 @@ def run_round(
     "prefault_mode": _np(command.mode).astype(np.uint8),
     "cmd_c0": _np(command.c0),
     "plan_hold": _np(command.plan.hold),
+    "phantoms": (
+      _np(command.driver.boxes)
+      if command.driver is not None
+      else np.zeros((n, 0, 5), np.float32)
+    ),
+    "plan_source": (
+      _np(command.driver.source).astype(np.uint8)
+      if command.driver is not None
+      else np.full(n, NO_SOURCE, np.uint8)
+    ),
     "tile_fault": _np(tile),
     "pre_steps": np.array(pre),
     "step_dt": np.array(step_dt),
@@ -327,6 +347,7 @@ def generate(cfg: GenerateConfig) -> list[Path]:
     cfg.terrain_seed,
     fault_time_s=cfg.fault_time_s,
     prefault=cfg.prefault,
+    driver=cfg.driver,
   )
   env_cfg.scene.num_envs = cfg.num_envs
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)

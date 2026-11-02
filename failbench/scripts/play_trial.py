@@ -11,7 +11,9 @@ the scene:
 - after the fault, the post-fault plan's commanded path, the logged
   command integrated from the fault pose (orange), and a red line from the
   trunk to where the plan says it should be now (the drift);
-- the faulted joint (red = locked, blue = weak).
+- the faulted joint (red = locked, blue = weak);
+- in planner-driven shards (``generate.py --driver``), the phantom
+  obstacles only the planner saw (translucent purple).
 
 A caption gives the time, the plan (goal follower before the fault, then
 hold or the current segment and its target twist), the command, the
@@ -31,7 +33,8 @@ import torch
 import tyro
 from PIL import Image, ImageDraw
 
-from failbench.data.build import fallen
+from failbench.data.build import NO_SOURCE, fallen
+from failbench.driver import SOURCES
 from failbench.env_cfg import failbench_env_cfg
 from failbench.faults import LOCK, TORQUE, FaultFamily, faulted_joint
 from mjlab.envs import ManagerBasedRlEnv
@@ -40,6 +43,7 @@ _BLUE = (0.15, 0.45, 1.0, 0.9)
 _RED = (1.0, 0.15, 0.1, 0.9)
 _ORANGE = (1.0, 0.6, 0.0, 0.9)
 _GREEN = (0.1, 0.85, 0.3, 0.8)
+_PURPLE = (0.6, 0.2, 0.9, 0.35)
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,9 @@ def main():
     if family == "WEAK":
       what += f" torque x{params[joint, TORQUE]:.2f}"
   hold = bool(raw["plan_hold"][b])
+  source = int(raw["plan_source"][b]) if "plan_source" in raw.files else NO_SOURCE
+  phantoms = raw["phantoms"][b] if "phantoms" in raw.files else np.zeros((0, 5))
+  phantoms = phantoms[phantoms[:, 2] > 0]
   goal = raw["goal_w"][b]
   down = fallen(torch.as_tensor(dense["tilt"]), torch.as_tensor(dense["base_height"]))
   ever_down = np.maximum.accumulate(down.numpy() & (np.arange(len(down)) >= pre))
@@ -176,6 +183,17 @@ def main():
       (goal[0], goal[1], ground + 0.4),
       _GREEN,
     )
+    for cx, cy, hx, hy, yaw in phantoms:
+      c, si = math.cos(yaw), math.sin(yaw)
+      mat = np.array([c, -si, 0, si, c, 0, 0, 0, 1], dtype=np.float64)
+      _add(
+        scene,
+        mujoco.mjtGeom.mjGEOM_BOX,
+        (hx, hy, 0.4),
+        (cx, cy, ground + 0.4),
+        _PURPLE,
+        mat,
+      )
     k = np.arange(0, t + 1, 5)
     for a, c in zip(k[:-1], k[1:], strict=True):
       _line(scene, pos[a], pos[c], 0.012, _RED if ever_down[c] else _BLUE)
@@ -201,7 +219,14 @@ def main():
     img = Image.fromarray(renderer.render())
     draw = ImageDraw.Draw(img)
     cmd, v, wz = dense["cmd"][t], dense["lin_vel_b"][t], dense["ang_vel_b"][t, 2]
-    if rel < 0:
+    if source != NO_SOURCE:
+      planner = "DWB" if SOURCES[source].startswith("dwb") else "Nav2 MPPI"
+      plan = (
+        f"{planner} driving around phantoms (closed loop)"
+        if rel < 0
+        else f"committed: {SOURCES[source]} (open loop)"
+      )
+    elif rel < 0:
       plan = "goal follower (closed loop)"
     elif hold:
       plan = "plan: HOLD the fault-time command"

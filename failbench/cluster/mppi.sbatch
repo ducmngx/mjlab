@@ -11,6 +11,14 @@
 #   avg   expected severity at RISK_P         -> <course>_p<RISK_P>_s<seed>
 #   cvar  CVaR of the worst CVAR_ALPHA        -> <course>_cvar<CVAR_ALPHA>_s<seed>
 #   max   the worst fault outcome             -> <course>_max_s<seed>
+#   margin    no fault risk, a uniform MARGIN around obstacles
+#                                             -> <course>_m<MARGIN>_s<seed>
+#   semantic  no fault risk, MARGIN for glass, scaled by severity and
+#             doubled at cruise speed         -> <course>_sm<MARGIN>_s<seed>
+#   cbf       no fault risk, a CBF filter keeping a uniform MARGIN
+#                                             -> <course>_cbf<MARGIN>_s<seed>
+#   cbf_sem   as cbf, MARGIN for glass, scaled as semantic
+#                                             -> <course>_scbf<MARGIN>_s<seed>
 #
 #   sbatch --array=0-29 --export=ALL,ARMS="cvar max" failbench/cluster/mppi.sbatch
 #
@@ -25,6 +33,7 @@
 #   ARMS      "none avg"
 #   RISK_P    0.1 (fault-risk prior of avg, cvar and max)
 #   CVAR_ALPHA  0.025
+#   MARGIN    0.3 (m, the margin arms)
 #   EXTRA     extra run_mppi.py arguments
 #SBATCH --partition=gpuq
 #SBATCH --qos=gpu
@@ -57,12 +66,21 @@ arm="${arms[$(( (i / SEEDS) % ${#arms[@]} ))]}"
 seed=$(( i % SEEDS ))
 p="${RISK_P:-0.1}"
 alpha="${CVAR_ALPHA:-0.025}"
+margin="${MARGIN:-0.3}"
 case "$arm" in
   none) risk=(--mppi.fault-risk.p 0); tag="p0" ;;
   avg) risk=(--mppi.fault-risk.p "$p"); tag="p$p" ;;
   cvar) risk=(--mppi.fault-risk.p "$p" --mppi.fault-risk.measure cvar
               --mppi.fault-risk.cvar-alpha "$alpha"); tag="cvar$alpha" ;;
   max) risk=(--mppi.fault-risk.p "$p" --mppi.fault-risk.measure max); tag="max" ;;
+  margin) risk=(--mppi.fault-risk.p 0 --mppi.inflation.margin "$margin")
+          tag="m$margin" ;;
+  semantic) risk=(--mppi.fault-risk.p 0 --mppi.inflation.margin "$margin"
+                  --mppi.inflation.severity-ref 25 --mppi.inflation.speed-ref 0.8)
+            tag="sm$margin" ;;
+  cbf) risk=(--mppi.fault-risk.p 0 --cbf.margin "$margin"); tag="cbf$margin" ;;
+  cbf_sem) risk=(--mppi.fault-risk.p 0 --cbf.margin "$margin" --cbf.severity-ref 25
+                 --cbf.speed-ref 0.8); tag="scbf$margin" ;;
   *) echo "[failbench] unknown arm $arm" >&2; exit 1 ;;
 esac
 name="${course}_${tag}_s${seed}"

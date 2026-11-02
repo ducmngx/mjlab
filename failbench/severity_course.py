@@ -114,3 +114,14 @@ SEVERITY_COURSE_TERRAIN = _terrain(SEVERITY_COURSE)
 SEVERITY_SWAP = replace(SEVERITY_COURSE, classes=SEVERITY_COURSE.classes[::-1])
 SEVERITY_SWAP_TERRAIN = _terrain(SEVERITY_SWAP)
 """The same geometry, glass left and boxes right."""
+SEVERITY_WALL = replace(SEVERITY_COURSE, classes=("box", "wall"))
+SEVERITY_WALL_TERRAIN = _terrain(SEVERITY_WALL)
+SEVERITY_WALL_SWAP = replace(SEVERITY_WALL, classes=SEVERITY_WALL.classes[::-1])
+SEVERITY_WALL_SWAP_TERRAIN = _terrain(SEVERITY_WALL_SWAP)
+SEVERITY_PERSON = replace(SEVERITY_COURSE, classes=("box", "person"))
+SEVERITY_PERSON_TERRAIN = _terrain(SEVERITY_PERSON)
+SEVERITY_PERSON_SWAP = replace(SEVERITY_PERSON, classes=SEVERITY_PERSON.classes[::-1])
+SEVERITY_PERSON_SWAP_TERRAIN = _terrain(SEVERITY_PERSON_SWAP)
+"""The severity ladder: boxes (5) against a wall (10), glass (25) or a
+person (50) at the same places, for the sideways offset against what the
+far row is."""

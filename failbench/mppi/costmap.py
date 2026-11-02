@@ -33,6 +33,8 @@ path over the elevation map.
   each circle reaches into an obstacle and whether its centre is on an
   unknown cell. Off the map counts as free and unknown.
 
+- ``clearance``: each circle centre's distance to the nearest obstacle,
+  for margins kept around them (``failbench/mppi/planner.InflationCfg``).
 - ``hit_prob``: the chance a footprint touches an obstacle at each step,
   for a predicted pose with Gaussian spread: per circle,
   ``Phi((radius - clearance) / spread)`` with the same spread as ``sweep``'s
@@ -142,6 +144,30 @@ def _sample(grid: torch.Tensor, xy: torch.Tensor, resolution: float) -> torch.Te
   return out.view(*xy.shape[:-1])
 
 
+def _centres(pose: torch.Tensor, cfg: FootprintCfg) -> torch.Tensor:
+  """Footprint circle centres ``[B, K, T, C, 2]`` along ``pose``."""
+  ox = torch.tensor(cfg.circles_x, device=pose.device)
+  yaw = pose[..., 2:3]
+  return pose[..., None, :2] + ox[:, None] * torch.stack(
+    [torch.cos(yaw), torch.sin(yaw)], dim=-1
+  )
+
+
+def _clear(
+  dist: torch.Tensor, centres: torch.Tensor, resolution: float, cfg: FootprintCfg
+) -> torch.Tensor:
+  # Off the map: distance max_dist (sampled as max_dist - d, zero padded).
+  return cfg.max_dist_m - _sample(cfg.max_dist_m - dist, centres, resolution)
+
+
+def clearance(
+  dist: torch.Tensor, pose: torch.Tensor, resolution: float, cfg: FootprintCfg
+) -> torch.Tensor:
+  """Distance (m) from each footprint circle's centre along ``pose [B, K, T,
+  3]`` to the nearest obstacle of ``dist [B, H, W]``, ``[B, K, T, C]``."""
+  return _clear(dist, _centres(pose, cfg), resolution, cfg)
+
+
 def sweep(
   dist: torch.Tensor,
   known: torch.Tensor,
@@ -154,12 +180,8 @@ def sweep(
   circles along ``pose [B, K, T, 3]`` with spread ``std [B, K, T, 3]``
   over ``dist`` / ``known [B, H, W]``."""
   ox = torch.tensor(cfg.circles_x, device=pose.device)
-  yaw = pose[..., 2:3]
-  centres = pose[..., None, :2] + ox[:, None] * torch.stack(
-    [torch.cos(yaw), torch.sin(yaw)], dim=-1
-  )  # [B, K, T, C, 2]
-  # Off the map: distance max_dist (sampled as max_dist - d, zero padded).
-  clear = cfg.max_dist_m - _sample(cfg.max_dist_m - dist, centres, resolution)
+  centres = _centres(pose, cfg)
+  clear = _clear(dist, centres, resolution, cfg)
   unknown = _sample(known.float(), centres, resolution) < 0.5
   grow = cfg.k_sigma * (
     std[..., :2].norm(dim=-1, keepdim=True) + ox.abs() * std[..., 2:3]
@@ -181,11 +203,7 @@ def hit_prob(
   obstacle of ``dist [B, H, W]``) per step ``[B, K, T]``; ``radius``
   overrides the circles' (e.g. a robot lying down)."""
   ox = torch.tensor(cfg.circles_x, device=pose.device)
-  yaw = pose[..., 2:3]
-  centres = pose[..., None, :2] + ox[:, None] * torch.stack(
-    [torch.cos(yaw), torch.sin(yaw)], dim=-1
-  )
-  clear = cfg.max_dist_m - _sample(cfg.max_dist_m - dist, centres, resolution)
+  clear = clearance(dist, pose, resolution, cfg)
   spread = std[..., :2].norm(dim=-1, keepdim=True) + ox.abs() * std[..., 2:3]
   r = cfg.radius if radius is None else radius
   z = (r - clear) / spread.clamp(min=min_std)

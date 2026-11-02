@@ -4,6 +4,8 @@ import json
 import math
 import os
 from dataclasses import replace
+from types import SimpleNamespace
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -35,9 +37,10 @@ from failbench.faults import (
   FaultMixture,
   encode_fault,
   faulted_joint,
+  inject_kinodynamic_fault,
   sample_fault_params,
 )
-from failbench.goals import sample_goal
+from failbench.goals import route_progress, sample_goal
 from failbench.model.losses import (
   LossWeights,
   hazard_nll,
@@ -46,6 +49,18 @@ from failbench.model.losses import (
 )
 from failbench.model.model import ImpactModel, ImpactModelCfg, rotate_xy
 from failbench.plans import PlanCfg, SegmentPlan
+from failbench.scene_course import (
+  CLUSTER_COURSE,
+  CLUSTER_COURSE_TERRAIN,
+  CLUSTER_SWAP,
+  CLUTTER_FIELD,
+  CLUTTER_SWAP,
+  GAP_COURSE,
+  GAP_SWAP,
+  PASS_COURSE,
+  PASS_SWAP,
+)
+from failbench.scripts.run_mppi import _touched_severity
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
 from failbench.severity import DEFAULT_SEVERITY, SEVERITY, geom_severity
 
@@ -321,6 +336,53 @@ def test_fault_writes_and_plan_starts_in_real_env():
   env.close()
 
 
+@pytest.mark.slow
+def test_the_driver_commits_on_the_fault_step_in_real_env():
+  from failbench.driver import PlannerDriveCfg
+  from failbench.env_cfg import failbench_env_cfg
+  from failbench.mppi.inputs import deadband
+
+  from mjlab.envs import ManagerBasedRlEnv
+
+  device = get_test_device()
+  # 1.23 s: after the 1 s warm-up and between planning cycles (every 0.1 s).
+  cfg = failbench_env_cfg(
+    "Go2-HIM-Rough", "rough", 0, fault_time_s=(1.23, 1.23), driver=PlannerDriveCfg()
+  )
+  cfg.scene.num_envs = 2
+  env = ManagerBasedRlEnv(cfg, device=device)
+  env.reset()
+  fault = env.event_manager.get_term_cfg(FAULT_TERM).func
+  command = env.command_manager.get_term("twist")
+  assert isinstance(command, GoalVelocityCommand) and command.driver is not None
+  # Phantoms lie along each trial's own spawn-to-goal line (the reset reads
+  # the new spawn, not the stale body pose).
+  robot = env.scene["robot"]
+  start = robot.data.data.qpos[:, robot.indexing.free_joint_q_adr[:2]]
+  goal = command.goal_w[:, :2]
+  u = (goal - start) / (goal - start).norm(dim=-1, keepdim=True)
+  boxes = command.driver.boxes
+  real = boxes[..., 2] > 0
+  rel = boxes[..., :2] - start[:, None]
+  along = (rel * u[:, None]).sum(-1)
+  side = (rel[..., 0] * -u[:, None, 1] + rel[..., 1] * u[:, None, 0]).abs()
+  assert (along[real] > 0.7).all() and (along[real] < 4.6).all()
+  assert (side[real] < 1.51).all()
+  act = torch.zeros(2, 12, device=device)
+  seen = False
+  for _ in range(100):
+    env.step(act)
+    if not seen and fault.faulted.all():
+      seen = True
+      # On the fault step itself the first committed command runs.
+      assert command.started.all()
+      torch.testing.assert_close(
+        command.command, deadband(command.committed[:, 0], 0.2)
+      )
+  assert seen
+  env.close()
+
+
 def _after(seed: int, draws: int) -> torch.Generator:
   """A generator seeded with ``seed`` that has drawn ``draws`` uniforms."""
   g = torch.Generator().manual_seed(seed)
@@ -360,6 +422,7 @@ def test_prefault_modes_stand_set_off_and_stop_around_the_fault():
   cmd.started = torch.ones(n, dtype=torch.bool)
   cmd.use_external = torch.ones(n, dtype=torch.bool)
   cmd.vel_command_b = torch.ones(n, 3)
+  cmd.driver = None
   torch.manual_seed(0)
   cmd._resample_command(torch.arange(n))
   share = torch.bincount(cmd.mode, minlength=5) / n
@@ -394,12 +457,97 @@ def test_a_waypoint_passed_outside_its_radius_still_counts():
   assert term.index[0] == 1
 
 
+def test_a_touch_takes_the_severity_of_what_is_under_it_far_from_the_origin():
+  # World coordinates of a far tile; on GPU in TF32 a matmul-based distance
+  # matched floor contacts to glass a metre away.
+  dev = "cuda" if torch.cuda.is_available() else "cpu"
+  base = torch.tensor([49.3, -7.4], device=dev)
+  hits = base + torch.tensor([[0.0, 0.0], [1.2, -0.8], [0.03, 0.0]], device=dev)
+  rays = SimpleNamespace(
+    hit_pos_w=torch.cat([hits, torch.zeros(3, 1, device=dev)], -1)[None],
+    hit_geom_id=torch.tensor([[0, 1, 2]], device=dev),
+  )
+  geom_sev = torch.tensor([0.0, 25.0, 5.0], device=dev)  # Floor, glass, crate.
+  contact = torch.zeros(1, 2, 3, device=dev)
+  contact[0, :, :2] = base
+  touch = torch.tensor([[True, False]], device=dev)
+  assert _touched_severity(touch, contact, rays, geom_sev).item() == 5.0  # type: ignore[arg-type]
+
+
 def test_geom_names_map_to_severity():
   spec = mujoco.MjSpec()
   for name in ("course_glass_3", "course_wall_7", "course_floor_0", ""):
     spec.worldbody.add_geom(name=name, size=(0.1, 0.1, 0.1))
   sev = geom_severity(spec.compile()).tolist()
   assert sev == [SEVERITY["glass"], SEVERITY["wall"], 0.0, DEFAULT_SEVERITY, 0.0]
+
+
+@pytest.mark.parametrize(
+  ("scene", "twin"),
+  [
+    (CLUSTER_COURSE, CLUSTER_SWAP),
+    (GAP_COURSE, GAP_SWAP),
+    (PASS_COURSE, PASS_SWAP),
+    (CLUTTER_FIELD, CLUTTER_SWAP),
+  ],
+)
+def test_scenes_keep_the_line_clear_and_their_twins_swap_glass_for_crates(scene, twin):
+  def build(cfg, difficulty):
+    spec = mujoco.MjSpec()
+    spec.worldbody.add_body(name="terrain")
+    cfg = replace(cfg, size=CLUSTER_COURSE_TERRAIN.size)
+    out = cfg.function(difficulty, spec, np.random.default_rng(0))
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    names = [model.geom(i).name.split("_")[1] for i in range(model.ngeom)]
+    pos = data.geom_xpos[:, :2] - out.origin[:2]
+    return names, pos, model.geom_size[:, :2]
+
+  for difficulty in (0.0, 1.0):
+    names, pos, size = build(scene, difficulty)
+    # A robot-wide strip (0.31 m) from the spawn to the goal meets nothing
+    # but the pass-around pillar.
+    hit = {
+      n
+      for n, (x, y), (sx, sy) in zip(names, pos, size, strict=True)
+      if n != "floor" and x + sx > 0 and x - sx < scene.goal_x and abs(y) - sy < 0.155
+    }
+    assert hit == ({"wall"} if scene is PASS_COURSE else set())
+    # Every glass piece has crates where it stood in the twin, and back.
+    tnames, tpos, _ = build(twin, difficulty)
+    for a, pa, b, pb in ((names, pos, tnames, tpos), (tnames, tpos, names, pos)):
+      glass = pa[[n == "glass" for n in a]]
+      boxes = pb[[n == "box" for n in b]]
+      assert len(glass) and len(boxes)
+      gap = np.linalg.norm(glass[:, None] - boxes[None], axis=-1).min(1)
+      assert (gap < 0.3).all()
+
+
+def test_clutter_fields_differ_per_tile_and_keep_their_corridor():
+  def objects(seed, difficulty):
+    spec = mujoco.MjSpec()
+    spec.worldbody.add_body(name="terrain")
+    cfg = replace(CLUTTER_FIELD, size=CLUSTER_COURSE_TERRAIN.size)
+    out = cfg.function(difficulty, spec, np.random.default_rng(seed))
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    keep = [
+      model.geom(i).name.split("_")[1] in ("box", "glass") for i in range(model.ngeom)
+    ]
+    pos = data.geom_xpos[keep, :2] - out.origin[:2]
+    return pos, model.geom_size[keep, :2]
+
+  layouts = [objects(seed, 1.0) for seed in range(4)]
+  assert len({len(p) for p, _ in layouts}) > 1 or not np.allclose(
+    layouts[0][0], layouts[1][0]
+  )
+  for pos, size in layouts:
+    # 0.8 m corridor at difficulty 1: every near face 0.4 m or more off the line.
+    assert (np.abs(pos[:, 1]) - size[:, 1] >= 0.4 - 1e-6).all()
+  wide, size = objects(0, 0.0)
+  assert (np.abs(wide[:, 1]) - size[:, 1] >= 0.8 - 1e-6).all()
 
 
 def test_v2_model_drops_the_contact_heads_and_learns_the_no_return_label():
@@ -574,3 +722,41 @@ def test_priced_faults_draw_only_the_named_pairs():
   assert (limp == (joint == 3)).all() and (locked == (joint == 7)).all()
   assert (family[joint == 7] == FaultFamily.LOCK).all()
   assert 150 < int(limp.sum()) < 250
+  # Balanced: each pair exactly as often, in a shuffled order.
+  mix = FaultMixture(pairs=pairs, balanced=True)
+  params, _ = sample_fault_params(64, 12, mix, "cpu")
+  joint = faulted_joint(params)
+  assert int((joint == 3).sum()) == 32 and not (joint[:32] == 3).all()
+
+
+def test_route_progress_measures_how_far_along_however_the_robot_wandered():
+  start = torch.zeros(4, 2)
+  corner_then_goal = torch.tensor([[2.0, 0.0], [2.0, 3.0]]).expand(4, 2, 2)
+  xy = torch.tensor(
+    [
+      [1.0, 0.0],  # Halfway down the first leg.
+      [1.0, -0.8],  # As far, 0.8 m off to the side.
+      [2.3, 1.0],  # 1 m up the second leg.
+      [-1.0, 0.5],  # Behind the start: no progress.
+    ]
+  )
+  got = route_progress(xy, start, corner_then_goal)
+  assert torch.allclose(got, torch.tensor([1.0, 1.0, 3.0, 0.0]))
+
+
+def test_fire_now_fires_only_faults_not_yet_fired():
+  # A stand-in fault term: only the bookkeeping fire_now touches.
+  term: Any = object.__new__(inject_kinodynamic_fault)
+  term.faulted = torch.tensor([False, True, False])
+  fired = []
+  term._fire = lambda rows: fired.extend(rows.tolist())
+  term.fire_now(torch.tensor([True, True, False]))
+  assert fired == [0]
+
+
+def test_samples_keep_what_the_driver_committed_to_and_old_shards_say_none():
+  from failbench.data.build import NO_SOURCE, plan_sources
+
+  raw = {"plan_source": np.array([0, 1, 2, 3], np.uint8)}
+  assert plan_sources(raw, np.array([3, 1])).tolist() == [3, 1]
+  assert plan_sources({}, np.array([0, 2])).tolist() == [NO_SOURCE] * 2

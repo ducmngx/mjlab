@@ -19,6 +19,15 @@ known the moment it fires (no detection), and the command is:
   course), along the lane centre line through the goal. It never reacts to the drift the impact
   model has to predict, like a candidate sequence MPPI scores.
 
+With ``driver`` set (the planner-driven data mode, ``failbench/driver.py``)
+a stock planner replaces both: before the fault it drives toward the goal
+around the trial's phantom obstacles, a new command every planning cycle
+(``DRIVE_SUBSTEPS`` control steps) held in between, the pre-fault modes
+standing it as they stand the follower; on the fault step it plans once
+more and the trial commits to one of that cycle's candidates
+(``committed``), which runs open loop from that very step, each command for
+one cycle, the last held.
+
 Where ``use_external`` is set, ``external`` (a planner's command, e.g.
 ``failbench/scripts/run_mppi.py``) replaces both.
 
@@ -35,6 +44,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from failbench.driver import PlannerDriveCfg, PlannerDriver
 from failbench.faults import FAULT_TERM
 from failbench.plans import PlanCfg, SegmentPlan
 from mjlab.tasks.velocity.mdp import UniformVelocityCommand, UniformVelocityCommandCfg
@@ -44,6 +54,8 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 GOAL_TERM = "goal"
+DRIVE_SUBSTEPS = 5
+"""Control steps (50 Hz) per planning cycle (10 Hz) of the driver."""
 
 
 PREFAULT_MODES = ("walk", "stand", "start", "slow", "stopped")
@@ -101,6 +113,14 @@ class GoalVelocityCommand(UniformVelocityCommand):
     """A command written from outside (a planner), used where
     ``use_external``; still deadbanded."""
     self.use_external = torch.zeros(n, dtype=torch.bool, device=dev)
+    self.driver = None if cfg.driver is None else PlannerDriver(n, cfg.driver, dev)
+    steps = 1 if cfg.driver is None else cfg.driver.commit_steps
+    self.committed = torch.zeros(n, steps, 3, device=dev)
+    """The driver's open-loop plan from the fault, one command per cycle."""
+    self.commit_step = torch.zeros(n, dtype=torch.long, device=dev)
+    self.held = torch.zeros(n, 3, device=dev)
+    """The driver's command, held between its cycles."""
+    self.tick = 0
 
   def _deadband(self, cmd: torch.Tensor) -> torch.Tensor:
     small = cmd[..., :2].norm(dim=-1, keepdim=True) <= self.goal_cfg.zero_below
@@ -115,6 +135,12 @@ class GoalVelocityCommand(UniformVelocityCommand):
     self.started[env_ids] = False
     self.use_external[env_ids] = False
     self.vel_command_b[env_ids] = 0.0
+    if self.driver is not None:
+      self.held[env_ids] = 0.0
+      # The new spawn from qpos: body poses are stale until the next forward.
+      adr = self.robot.indexing.free_joint_q_adr[:2]
+      spawn = self.robot.data.data.qpos[env_ids[:, None], adr]
+      self.driver.reset(env_ids, spawn, self.goal_w[env_ids, :2])
     if not any(pc.mix[1:]):
       # All walk: the same random draws as before the modes, so seeded runs
       # (paired MPPI arms) keep their faults and goals.
@@ -153,6 +179,9 @@ class GoalVelocityCommand(UniformVelocityCommand):
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     del env_ids
+    if self.driver is not None:
+      self._drive(self.driver)
+      return
     fault = self._env.event_manager.get_term_cfg(FAULT_TERM).func
     follow = self.follow()
     running = (fault.faulted & self.started).nonzero().squeeze(-1)
@@ -180,6 +209,46 @@ class GoalVelocityCommand(UniformVelocityCommand):
     cmd = torch.where(self.use_external[:, None], self.external, cmd)
     self.vel_command_b[:] = self._deadband(cmd)
 
+  def _drive(self, driver: PlannerDriver) -> None:
+    """The planner-driven data mode's command (``driver``)."""
+    fault = self._env.event_manager.get_term_cfg(FAULT_TERM).func
+    step = self._env.episode_length_buf
+    t = step.float() * self._env.step_dt
+    still = prefault_still(
+      t, fault.fault_time_s, self.mode, self.lead, self.goal_cfg.warmup_s
+    )
+    new = fault.faulted & ~self.started
+    due = self.tick % DRIVE_SUBSTEPS == 0
+    self.tick += 1
+    if due or new.any():
+      data = self.robot.data
+      pose = torch.cat([data.root_link_pos_w[:, :2], data.heading_w[:, None]], -1)
+      speed = torch.cat(
+        [data.root_link_lin_vel_b[:, :2], data.root_link_ang_vel_b[:, 2:]], -1
+      )
+      # Off the cycle clock (a fault between cycles) only the faulting
+      # trials take this plan; the rest keep their planner as it was.
+      saved = None if due else driver.snapshot()
+      slow = self.mode == PREFAULT_MODES.index("slow")
+      cap = torch.where(slow, self.speed, torch.inf)
+      cmd = driver.cycle(pose, speed, self.goal_w[:, :2], still, cap)
+      if saved is None:
+        self.held = cmd
+      else:
+        driver.restore(saved, keep=new)
+      ids = new.nonzero().squeeze(-1)
+      if len(ids):
+        self.committed[ids] = driver.commit(ids)
+        self.commit_step[ids] = step[ids]
+        self.c0[ids] = self.committed[ids, 0]
+        self.started[ids] = True
+    last = self.committed.shape[1] - 1
+    j = ((step - self.commit_step) // DRIVE_SUBSTEPS).clamp(0, last)
+    rows = torch.arange(self.num_envs, device=self.device)
+    cmd = torch.where(fault.faulted[:, None], self.committed[rows, j], self.held)
+    cmd = torch.where(self.use_external[:, None], self.external, cmd)
+    self.vel_command_b[:] = self._deadband(cmd)
+
 
 @dataclass(kw_only=True)
 class GoalVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -197,6 +266,9 @@ class GoalVelocityCommandCfg(UniformVelocityCommandCfg):
   (the course: 0, lanes run along +x); ``None`` for goal-bearing plans."""
   zero_below: float = 0.2
   prefault: PrefaultCfg = field(default_factory=PrefaultCfg)
+  driver: PlannerDriveCfg | None = None
+  """A stock planner drives the trials (``failbench/driver.py``) instead of
+  the goal follower and segment plan."""
 
   def build(self, env: ManagerBasedRlEnv) -> GoalVelocityCommand:
     return GoalVelocityCommand(self, env)

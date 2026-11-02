@@ -72,8 +72,8 @@ class PlayMppiConfig:
   """Contact probability below which a cell isn't drawn."""
   max_contact_cells: int = 1500
   risk_fire: int = 1
-  """Firing point (index into ``fire_m``, or ``fire_s``) whose throws are drawn
-  bold."""
+  """Firing point (index along the route, ``fire_step_m`` apart, or into
+  ``fire_m`` / ``fire_s``) whose throws are drawn bold."""
   device: str = "cpu"
 
 
@@ -145,8 +145,12 @@ def main():
   down = fallen(torch.as_tensor(dense["tilt"]), torch.as_tensor(dense["base_height"]))
   ever_down = np.maximum.accumulate(down.numpy())
   fire_cfg = FaultRiskCfg()
-  cfg_fire = list(fire_cfg.fire_m or fire_cfg.fire_s)
-  fire_unit = "m" if fire_cfg.fire_m else "s"
+  if fire_cfg.fire_step_m is not None:
+    count = round(fire_cfg.fire_max_m / fire_cfg.fire_step_m)
+    cfg_fire = [fire_cfg.fire_step_m * (i + 1) for i in range(count)]
+  else:
+    cfg_fire = list(fire_cfg.fire_m or fire_cfg.fire_s)
+  fire_unit = "m" if fire_cfg.fire_step_m or fire_cfg.fire_m else "s"
 
   cam = mujoco.MjvCamera()
   cam.type = mujoco.mjtCamera.mjCAMERA_FREE

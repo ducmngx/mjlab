@@ -18,6 +18,9 @@ env's goal (``goal_w``) by terrain kind (``GoalMode``):
 
 For ``pyramid`` and ``free`` the robot is turned to face its goal; on the
 course it keeps the lane-facing spawn jitter.
+
+``route_progress`` measures how far along its route (spawn, then the
+waypoints) a robot has got, for faults that fire at a place on the route.
 """
 
 from __future__ import annotations
@@ -122,3 +125,21 @@ class sample_goal:
     self._asset.write_root_link_pose_to_sim(
       torch.cat([pose[:, :3], quat], dim=-1), env_ids=env_ids
     )
+
+
+def route_progress(
+  xy: torch.Tensor, start: torch.Tensor, waypoints: torch.Tensor
+) -> torch.Tensor:
+  """Distance along each route (``start [n, 2]``, then ``waypoints [n, W,
+  2]``) to the point on it nearest ``xy [n, 2]``, ``[n]``: how far a robot
+  has got, however it wandered to get there."""
+  pts = torch.cat([start[:, None], waypoints], 1)  # [n, W + 1, 2]
+  a, b = pts[:, :-1], pts[:, 1:]
+  seg = b - a
+  length = seg.norm(dim=-1)  # [n, W]
+  u = ((xy[:, None] - a) * seg).sum(-1) / length.square().clamp(min=1e-9)
+  u = u.clamp(0, 1)
+  gap = (a + u[..., None] * seg - xy[:, None]).norm(dim=-1)
+  before = length.cumsum(-1) - length
+  near = gap.argmin(-1, keepdim=True)
+  return (before + u * length).gather(1, near)[:, 0]

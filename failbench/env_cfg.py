@@ -30,15 +30,43 @@ from heat_bench.envs_mjlab.joint_fault_injection import fault_contact_sensor_cfg
 from failbench.cliff_course import CLIFF_COURSE, CLIFF_COURSE_TERRAIN, cliff_waypoints
 from failbench.commands import GOAL_TERM, GoalVelocityCommandCfg, PrefaultCfg
 from failbench.door_course import DOOR_COURSE, DOOR_COURSE_TERRAIN, door_waypoints
+from failbench.driver import PlannerDriveCfg
 from failbench.faults import FAULT_TERM, FaultMixture, inject_kinodynamic_fault
 from failbench.goals import GoalMode, sample_goal
 from failbench.l_course import L_CORRIDOR, L_COURSE_TERRAIN, corridor_waypoints
 from failbench.plans import PlanCfg
+from failbench.scene_course import (
+  CLUSTER_COURSE,
+  CLUSTER_COURSE_TERRAIN,
+  CLUSTER_SWAP,
+  CLUSTER_SWAP_TERRAIN,
+  CLUTTER_FIELD,
+  CLUTTER_FIELD_TERRAIN,
+  CLUTTER_SWAP,
+  CLUTTER_SWAP_TERRAIN,
+  GAP_COURSE,
+  GAP_COURSE_TERRAIN,
+  GAP_SWAP,
+  GAP_SWAP_TERRAIN,
+  PASS_COURSE,
+  PASS_COURSE_TERRAIN,
+  PASS_SWAP,
+  PASS_SWAP_TERRAIN,
+  scene_waypoints,
+)
 from failbench.severity_course import (
   SEVERITY_COURSE,
   SEVERITY_COURSE_TERRAIN,
+  SEVERITY_PERSON,
+  SEVERITY_PERSON_SWAP,
+  SEVERITY_PERSON_SWAP_TERRAIN,
+  SEVERITY_PERSON_TERRAIN,
   SEVERITY_SWAP,
   SEVERITY_SWAP_TERRAIN,
+  SEVERITY_WALL,
+  SEVERITY_WALL_SWAP,
+  SEVERITY_WALL_SWAP_TERRAIN,
+  SEVERITY_WALL_TERRAIN,
   severity_waypoints,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -100,6 +128,18 @@ GOAL_MODES: dict[str, GoalMode] = {
   "cliff": "waypoints",
   "severity": "waypoints",
   "severity_swap": "waypoints",
+  "severity_wall": "waypoints",
+  "severity_wall_swap": "waypoints",
+  "severity_person": "waypoints",
+  "severity_person_swap": "waypoints",
+  "cluster": "waypoints",
+  "cluster_swap": "waypoints",
+  "gap": "waypoints",
+  "gap_swap": "waypoints",
+  "pass": "waypoints",
+  "pass_swap": "waypoints",
+  "clutter": "waypoints",
+  "clutter_swap": "waypoints",
 }
 WAYPOINT_TERRAINS = {
   "l_course": (L_COURSE_TERRAIN, corridor_waypoints(L_CORRIDOR)),
@@ -107,6 +147,24 @@ WAYPOINT_TERRAINS = {
   "cliff": (CLIFF_COURSE_TERRAIN, cliff_waypoints(CLIFF_COURSE)),
   "severity": (SEVERITY_COURSE_TERRAIN, severity_waypoints(SEVERITY_COURSE)),
   "severity_swap": (SEVERITY_SWAP_TERRAIN, severity_waypoints(SEVERITY_SWAP)),
+  "severity_wall": (SEVERITY_WALL_TERRAIN, severity_waypoints(SEVERITY_WALL)),
+  "severity_wall_swap": (
+    SEVERITY_WALL_SWAP_TERRAIN,
+    severity_waypoints(SEVERITY_WALL_SWAP),
+  ),
+  "severity_person": (SEVERITY_PERSON_TERRAIN, severity_waypoints(SEVERITY_PERSON)),
+  "severity_person_swap": (
+    SEVERITY_PERSON_SWAP_TERRAIN,
+    severity_waypoints(SEVERITY_PERSON_SWAP),
+  ),
+  "cluster": (CLUSTER_COURSE_TERRAIN, scene_waypoints(CLUSTER_COURSE)),
+  "cluster_swap": (CLUSTER_SWAP_TERRAIN, scene_waypoints(CLUSTER_SWAP)),
+  "gap": (GAP_COURSE_TERRAIN, scene_waypoints(GAP_COURSE)),
+  "gap_swap": (GAP_SWAP_TERRAIN, scene_waypoints(GAP_SWAP)),
+  "pass": (PASS_COURSE_TERRAIN, scene_waypoints(PASS_COURSE)),
+  "pass_swap": (PASS_SWAP_TERRAIN, scene_waypoints(PASS_SWAP)),
+  "clutter": (CLUTTER_FIELD_TERRAIN, scene_waypoints(CLUTTER_FIELD)),
+  "clutter_swap": (CLUTTER_SWAP_TERRAIN, scene_waypoints(CLUTTER_SWAP)),
 }
 """Evaluation scenes (no data is generated on them): the generator and the
 waypoints relative to the spawn, the last one the goal."""
@@ -138,10 +196,13 @@ def failbench_env_cfg(
   plan: PlanCfg | None = None,
   mixture: FaultMixture | None = None,
   prefault: PrefaultCfg | None = None,
+  driver: PlannerDriveCfg | None = None,
 ) -> ManagerBasedRlEnvCfg:
   """``fault_time_s`` applies to rough and course; stair trials fault by
   position (``STAIR_FIRE_RADIUS``). ``prefault``: what trials do before the
-  fault (default: walk)."""
+  fault (default: walk). ``driver``: a stock planner drives trials around
+  phantoms and commits to a candidate at the fault (``failbench/driver.py``)
+  instead of the goal follower and segment plan."""
   cfg = load_env_cfg(task, play=True)
   if "actuator_health" in cfg.events:
     raise ValueError("FailBench faults write the force range themselves.")
@@ -231,6 +292,7 @@ def failbench_env_cfg(
     ),
     plan=plan or PlanCfg(),
     prefault=prefault or PrefaultCfg(),
+    driver=driver,
     # Course lanes run along +x through the goal at the lane end.
     lane_heading=0.0 if GOAL_MODES[terrain] == "lane" else None,
   )

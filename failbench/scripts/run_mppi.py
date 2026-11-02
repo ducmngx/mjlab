@@ -36,7 +36,7 @@ import json
 import math
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -76,10 +76,14 @@ from failbench.faults import (
   faulted_joint,
   inject_kinodynamic_fault,
 )
-from failbench.goals import sample_goal
-from failbench.mppi.costmap import distance_field, obstacle_cells
+from failbench.goals import route_progress, sample_goal
+from failbench.mppi.cbf import CbfCfg, CbfFilter, severity_fields
+from failbench.mppi.costmap import distance_field, drop_cells, obstacle_cells
+from failbench.mppi.dwb import Dwb, DwbCfg
+from failbench.mppi.fault_critic import FaultRiskCritic
 from failbench.mppi.inputs import HistoryBuffer, crop_center
 from failbench.mppi.models import DynamicsModel, ImpactDynamics, ZeroDriftModel
+from failbench.mppi.nav2 import Nav2Mppi, Nav2MppiCfg, nav2_costmap
 from failbench.mppi.planner import VULNERABLE_FAULTS, Mppi, MppiCfg
 from failbench.scripts.generate import policy_estimates
 from failbench.sensing import LidarCfg, NoiseCfg, corrupt_map
@@ -103,11 +107,11 @@ FAMILIES = {
   "lock": FaultMixture(probs=(0.0, 1.0, 0.0)),
   "weak": FaultMixture(probs=(0.0, 0.0, 1.0)),
   "free": FaultMixture(probs=(0.0, 0.0, 1.0), limp_prob=1.0),
-  "priced": FaultMixture(pairs=VULNERABLE_FAULTS),
+  "priced": FaultMixture(pairs=VULNERABLE_FAULTS, balanced=True),
 }
 """Fault mixture per ``--family``; ``free`` is WEAK at zero torque only (a
 limp joint, heat_bench's FREE); ``priced`` is one of the fault-risk
-planner's default faults (``VULNERABLE_FAULTS``), uniformly."""
+planner's default faults (``VULNERABLE_FAULTS``), each as often."""
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,15 @@ class RunMppiConfig:
   """Output path without extension (``.npz`` and ``.json`` are appended, so
   dots in the name are kept)."""
   controller: Literal["mppi", "follower"] = "mppi"
+  planner: Literal["legacy", "nav2", "dwb"] = "legacy"
+  """``nav2``: Nav2's MPPI (``failbench/mppi/nav2.py``, settings ``nav2``);
+  ``dwb``: Nav2's DWB (``failbench/mppi/dwb.py``, settings ``dwb``);
+  ``legacy``: FailBench's own MPPI over the impact model (``mppi``)."""
+  post_fault: Literal["replan", "hold"] = "replan"
+  """After a fault fires: ``hold`` the command running then for
+  ``hold_s``, then stop (every planner alike, nothing replanned); ``replan``
+  keeps planning, told of the fault (``fault_aware``)."""
+  hold_s: float = 2.5
   """``follower``: no planner; the data's goal follower (turn toward the
   goal, walk at the trial's cruise speed) drives from ``start_s``, steering
   on the same odometry. The baseline MPPI has to beat."""
@@ -136,6 +149,19 @@ class RunMppiConfig:
   num_envs: int = 16
   duration_s: float = 30.0
   fault_time_s: tuple[float, float] = (4.0, 8.0)
+  """When faults fire (s), without ``fault_place_m``."""
+  fault_place_m: tuple[float, float] | None = (1.5, 6.0)
+  """Fire each fault at a place on the route: once the robot has got this
+  far along it from the spawn (m, ``route_progress``; stratified over the
+  robots, the same places for every planner of a seed). Faults are rare
+  and come by the metre, so a trial's damage is what a fault at that place
+  does, whatever the planner did before: by time, a slower planner would
+  meet its fault further back than a faster one, and by distance walked,
+  metres wasted in the open would use it up harmlessly. None: by
+  ``fault_time_s``."""
+  fault_timeout_s: float = 20.0
+  """With ``fault_place_m``: a robot that hasn't got that far by then faults
+  anyway, so hanging back doesn't dodge faults."""
   family: Literal["mixture", "nominal", "lock", "weak", "free", "priced"] = "mixture"
   start_s: float = 2.5
   """MPPI takes over from the goal follower (history and fused poses full)."""
@@ -158,6 +184,11 @@ class RunMppiConfig:
   """On waypoint terrains (``l_course``, ``doors``), move on to the next waypoint
   within this distance of the current one (or once past it)."""
   mppi: MppiCfg = field(default_factory=MppiCfg)
+  nav2: Nav2MppiCfg = field(default_factory=Nav2MppiCfg)
+  dwb: DwbCfg = field(default_factory=DwbCfg)
+  cbf: CbfCfg = field(default_factory=CbfCfg)
+  """A CBF safety filter on MPPI's command (``failbench/mppi/cbf.py``), each
+  cycle on the map MPPI plans on; off at ``margin`` 0."""
   lidar: LidarCfg = field(default_factory=LidarCfg)
   noise: NoiseCfg = field(default_factory=NoiseCfg)
   fuse_back_s: tuple[float, ...] = (0.5, 1.0, 1.5)
@@ -181,7 +212,10 @@ def _touched_severity(
   sev = geom_sev[rays.hit_geom_id.long()]  # [n, R]
   for b in touch.any(-1).nonzero()[:, 0].tolist():
     pts = contact_w[b, touch[b], :2]
-    near = torch.cdist(pts, rays.hit_pos_w[b, :, :2]) < reach_m  # [M, R]
+    # Not cdist: on GPU it takes |a|^2 + |b|^2 - 2ab by a matmul, which in
+    # TF32 (mjlab's default) is metres off at world coordinates of tens of m.
+    gap = pts[:, None] - rays.hit_pos_w[b, None, :, :2]
+    near = gap.norm(dim=-1) < reach_m  # [M, R]
     out[b] = torch.where(near, sev[b], 0.0).amax()
   return out
 
@@ -214,7 +248,11 @@ def run(cfg: RunMppiConfig) -> dict:
     cfg.task,
     cfg.terrain,
     cfg.terrain_seed,
-    fault_time_s=cfg.fault_time_s,
+    fault_time_s=(
+      cfg.fault_time_s
+      if cfg.fault_place_m is None
+      else (cfg.fault_timeout_s, cfg.fault_timeout_s)
+    ),
     mixture=mixture,
   )
   env_cfg.scene.num_envs = cfg.num_envs
@@ -241,6 +279,15 @@ def run(cfg: RunMppiConfig) -> dict:
   assert isinstance(fault, inject_kinodynamic_fault)
   command = env.command_manager.get_term("twist")
   goal_term = env.event_manager.get_term_cfg(GOAL_TERM).func
+  # Fault places, stratified over the robots, from their own generator so
+  # every planner run with this seed meets its faults at the same places.
+  place = torch.full((n,), float("inf"), device=device)
+  if cfg.fault_place_m is not None:
+    gen = torch.Generator().manual_seed(cfg.seed)
+    lo, hi = cfg.fault_place_m
+    u = (torch.randperm(n, generator=gen) + torch.rand(n, generator=gen)) / n
+    place = (lo + (hi - lo) * u).to(device)
+  spawn_xy = torch.zeros(n, 2, device=device)
   assert isinstance(goal_term, sample_goal)
   assert isinstance(command, GoalVelocityCommand)
   elev = env.scene[MPPI_MAP_SENSOR]
@@ -257,7 +304,32 @@ def run(cfg: RunMppiConfig) -> dict:
     [g != "foot" for g in geom_part], device=device
   ).repeat_interleave(sensor.cfg.num_slots)
 
-  planner = Mppi(cfg.mppi, model, n, device)
+  planner: Mppi | Nav2Mppi | Dwb
+  if cfg.planner in ("nav2", "dwb"):
+    if cfg.explain or cfg.replan_every_s != cfg.nav2.model_dt:
+      raise ValueError("Nav2 MPPI plans every model_dt and has no explain mode.")
+    # Our method: the fault risk, priced by the legacy planner's code, as one
+    # more critic (``--mppi.fault-risk.p`` > 0; its weight the critic's).
+    critics = []
+    if cfg.mppi.fault_risk.p > 0:
+      engine = Mppi(cfg.mppi, model, n, device)
+      critics.append(FaultRiskCritic(engine, cfg.mppi.weights.fault_risk))
+    if cfg.planner == "dwb":
+      planner = Dwb(cfg.dwb, n, device, extra_critics=critics)
+    else:
+      planner = Nav2Mppi(cfg.nav2, n, device, extra_critics=critics)
+  else:
+    planner = Mppi(cfg.mppi, model, n, device)
+  frozen = torch.zeros(n, 3, device=device)
+  """Each robot's command when its fault fired (``post_fault`` hold)."""
+  was_faulted = torch.zeros(n, dtype=torch.bool, device=device)
+  shield = None
+  if cfg.cbf.margin > 0:
+    if cfg.replan_every_s > cfg.mppi.sampler.step_s:
+      raise ValueError("The CBF filters each cycle's command on a fresh map.")
+    shield = CbfFilter(
+      replace(cfg.cbf, footprint=cfg.mppi.footprint, dt=cfg.mppi.sampler.step_s)
+    )
   r = planner.substeps
   # What a history step holds is the model's: state and command, then HIM's
   # latent for models trained with it.
@@ -363,6 +435,17 @@ def run(cfg: RunMppiConfig) -> dict:
 
   obs, _ = wrapped.reset()
   for i in range(num_steps):
+    if cfg.post_fault == "hold":
+      # The robot hasn't noticed: the command running when the fault fired,
+      # held for hold_s, then a stop. Nothing is replanned.
+      # Only a fault that changes a joint (a fault-free trial still fires
+      # its nominal placeholder).
+      new = fault.faulted & ~was_faulted & (faulted_joint(fault.params) >= 0)
+      frozen[new] = command.command[new]
+      was_faulted |= new
+      since = i * step_dt - fault.fault_step.float() * step_dt
+      held = torch.where((since < cfg.hold_s)[:, None], frozen, 0.0)
+      command.external[:] = torch.where(was_faulted[:, None], held, command.external)
     with torch.no_grad():
       obs, _, _, _ = wrapped.step(policy(obs))
       vel_est, latent = policy_estimates(actor, obs, n, device)
@@ -390,6 +473,10 @@ def run(cfg: RunMppiConfig) -> dict:
     collided |= trunk_hit & started & ~reached
     if i == 0:
       start_z = pos[:, 2].clone()
+      spawn_xy = pos[:, :2].clone()
+    if cfg.fault_place_m is not None:
+      got = route_progress(pos[:, :2], spawn_xy, goal_term.waypoints[..., :2])
+      fault.fire_now((got >= place) & started)
     if cfg.terrain == "cliff":
       fell_off |= (pos[:, 2] < start_z - FELL_OFF_M) & started & ~reached
       down |= fell_off
@@ -528,18 +615,39 @@ def run(cfg: RunMppiConfig) -> dict:
       route_w = goal_term.waypoints[torch.arange(n, device=device), nxt, :2]
       route = _to_yaw_frame_2d(route_w, est_pos[:, :2], est_yaw)
     planner.track(est_pos[:, :2], replan_k * cfg.mppi.sampler.step_s)
-    out = planner.step(
-      inputs,
-      plan_h,
-      plan_known,
-      MAP_RESOLUTION,
-      goal,
-      bearing,
-      alt_inputs,
-      route,
-      exposed=~told,  # The fault risk prices faults still to come.
-      severity=severity,
-    )
+    if isinstance(planner, (Nav2Mppi, Dwb)):
+      body_v = torch.cat(
+        [(vel_est / LIN_VEL_SCALE)[:, :2], data.root_link_ang_vel_b[:, 2:3]], -1
+      )
+      costmap = nav2_costmap(plan_h, MAP_RESOLUTION, planner.cfg.costmap, severity)
+      context = None
+      if planner.extra_critics:
+        fp = cfg.mppi.footprint
+        engine = planner.extra_critics[0].engine
+        context = {
+          "inputs": inputs,
+          "risk_fields": engine._risk_fields(
+            obstacle_cells(plan_h, fp.wall_jump_m),
+            drop_cells(plan_h, fp, MAP_RESOLUTION),
+            severity,
+            MAP_RESOLUTION,
+          ),
+          "exposed": ~told,  # Faults still to come.
+        }
+      out = planner.step(costmap, MAP_RESOLUTION, goal, body_v, context)
+    else:
+      out = planner.step(
+        inputs,
+        plan_h,
+        plan_known,
+        MAP_RESOLUTION,
+        goal,
+        bearing,
+        alt_inputs,
+        route,
+        exposed=~told,  # The fault risk prices faults still to come.
+        severity=severity,
+      )
     if explain_now:
       e, m = out["explain"], (step // r) // every
       xy = lambda v: v[..., :2].float().cpu().numpy()  # noqa: E731
@@ -579,7 +687,19 @@ def run(cfg: RunMppiConfig) -> dict:
         obstacle_cells(plan_h, cfg.mppi.footprint.wall_jump_m).cpu().numpy()
       )
 
-    cmd = torch.where(active[:, None], out["cmd"], 0.0)
+    cmd = out["cmd"]
+    if shield is not None:
+      speed = (vel_est / LIN_VEL_SCALE)[:, :2].norm(dim=-1)
+      fields = severity_fields(plan_h, severity, MAP_RESOLUTION, shield.cfg.footprint)
+      cmd, cbf_log = shield.filter(cmd, fields, speed, MAP_RESOLUTION)
+      # MPPI's next warm start takes its first step as the one that ran.
+      planner.plan[:, 0] = cmd
+      for k, v in cbf_log.items():
+        arr = cost_logs.setdefault(
+          f"cbf_{k}", np.full((n, num_cycles), np.nan, np.float32)
+        )
+        arr[:, c] = np.where(active.cpu().numpy(), v.float().cpu().numpy(), np.nan)
+    cmd = torch.where(active[:, None], cmd, 0.0)
     command.external[:] = cmd
     command.use_external |= started
     yaw = heading(quat)
@@ -624,7 +744,7 @@ def run(cfg: RunMppiConfig) -> dict:
       contact[on, c] = probs.cpu().numpy()
       contact_height[on, c] = crop_center(height[active], MAP_CELLS).cpu().numpy()
     for k, v in out.items():
-      if k.startswith(("cost_", "probe_")):
+      if k.startswith(("cost_", "probe_", "spread_")):
         arr = cost_logs.setdefault(k, np.full((n, num_cycles), np.nan, np.float32))
         arr[:, c] = np.where(active.cpu().numpy(), v.cpu().numpy(), np.nan)
 
@@ -634,15 +754,23 @@ def run(cfg: RunMppiConfig) -> dict:
   # for robots without a fault) until arrival or a fall.
   from_step = np.maximum(fault.fault_step.cpu().numpy(), round(cfg.start_s / step_dt))
   after_fault = np.where(cyc["step"][None, :] >= from_step[:, None], clearance, np.nan)
+  terrain = env.scene.terrain
+  tiles = (
+    None
+    if terrain is None or terrain.terrain_levels is None
+    else torch.stack([terrain.terrain_levels, terrain.terrain_types], -1).tolist()
+  )
   trials = [
     {
       "env": b,
+      "tile": None if tiles is None else tiles[b],
       "family": FaultFamily(int(fam[b])).name,
       "joint": fault.joint_names[joint[b]] if joint[b] >= 0 else None,
       "torque": float(fault.params[b, joint[b], 0]) if joint[b] >= 0 else 1.0,
       "fault_time_s": float(fault.fault_step[b]) * step_dt
       if fault.faulted[b]
       else None,
+      "fault_place_m": None if cfg.fault_place_m is None else float(place[b]),
       "reached": bool(reached[b]),
       "time_to_goal_s": None if torch.isnan(t_reach[b]) else float(t_reach[b]),
       "fell": bool(down[b]),
