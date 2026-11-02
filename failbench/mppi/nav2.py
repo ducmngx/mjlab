@@ -310,23 +310,46 @@ def integrate(v: torch.Tensor, pose0: torch.Tensor, c: Any) -> torch.Tensor:
   return torch.stack([x, y, yaw], -1)
 
 
-def footprint_points(pts: torch.Tensor, cm: CostmapCfg) -> torch.Tensor:
-  """Points on the footprint rectangle's outline at poses ``[..., 3]``."""
+def _outline(cm: CostmapCfg, device) -> torch.Tensor:
+  """The footprint rectangle's outline points ``[F, 2]`` in the body frame."""
   hl, hw = cm.footprint[0] / 2, cm.footprint[1] / 2
-  t = torch.linspace(-1, 1, cm.footprint_points, device=pts.device)
-  local = torch.cat(
+  t = torch.linspace(-1, 1, cm.footprint_points, device=device)
+  return torch.cat(
     [
       torch.stack([t * hl, torch.full_like(t, hw)], -1),
       torch.stack([t * hl, torch.full_like(t, -hw)], -1),
       torch.stack([torch.full_like(t, hl), t * hw], -1),
       torch.stack([torch.full_like(t, -hl), t * hw], -1),
     ]
-  )  # [F, 2]
+  )
+
+
+def footprint_points(pts: torch.Tensor, cm: CostmapCfg) -> torch.Tensor:
+  """Points on the footprint rectangle's outline at poses ``[..., 3]``."""
+  local = _outline(cm, pts.device)
   lx, ly = local[:, 0], local[:, 1]
   cy, sy = torch.cos(pts[..., 2:3]), torch.sin(pts[..., 2:3])
   x = pts[..., 0:1] + cy * lx - sy * ly
   y = pts[..., 1:2] + sy * lx + cy * ly
   return torch.stack([x, y], -1)
+
+
+def footprint_max_cost(
+  costmap: torch.Tensor, pts: torch.Tensor, cm: CostmapCfg, resolution: float
+) -> torch.Tensor:
+  """The highest cost under the footprint outline at poses ``[n, ..., 3]``:
+  ``_lookup`` of ``footprint_points`` maxed over the outline, one outline
+  point at a time so a whole batch of rollouts never holds every point (at
+  4096 robots that tensor alone is tens of GB)."""
+  cy, sy = torch.cos(pts[..., 2]), torch.sin(pts[..., 2])
+  out = None
+  for lx, ly in _outline(cm, pts.device).tolist():
+    x = pts[..., 0] + cy * lx - sy * ly
+    y = pts[..., 1] + sy * lx + cy * ly
+    cost = _lookup(costmap, torch.stack([x, y], -1), resolution)
+    out = cost if out is None else torch.maximum(out, cost)
+  assert out is not None
+  return out
 
 
 def straight_path(start: torch.Tensor, goal: torch.Tensor, c: Any):
@@ -591,8 +614,7 @@ class Nav2Mppi:
     pts = d["traj"][:, :, :: cfg.trajectory_point_step]  # [n, K, S, 3]
     centre = _lookup(costmap, pts[..., :2], res)
     if cfg.consider_footprint:
-      fp = self._footprint(pts)  # [n, K, S, F, 2]
-      edge = _lookup(costmap, fp, res).amax(-1)
+      edge = footprint_max_cost(costmap, pts, cm, res)
       circum = math.hypot(cm.footprint[0] / 2, cm.footprint[1] / 2)
       inscribed = cm.footprint[1] / 2
       possible = (INSCRIBED - 1) * math.exp(
@@ -619,9 +641,6 @@ class Nav2Mppi:
     total = torch.where(collide, cfg.collision_cost, total)
     fail = collide.all(-1)
     return total / (254.0 * pts.shape[2]), fail
-
-  def _footprint(self, pts: torch.Tensor) -> torch.Tensor:
-    return footprint_points(pts, self.cfg.costmap)
 
   def _goal(self, d: dict) -> torch.Tensor:
     cfg = self.cfg.critics.goal

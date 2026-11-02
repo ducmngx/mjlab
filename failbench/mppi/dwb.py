@@ -37,7 +37,7 @@ from failbench.mppi.nav2 import (
   _lookup,
   _wrap,
   accel_limited,
-  footprint_points,
+  footprint_max_cost,
   integrate,
   straight_path,
 )
@@ -275,8 +275,8 @@ class Dwb:
     # pose on an obstacle, the robot's inscribed band or unknown ground, or
     # a footprint point on an obstacle, rules the twist out.
     centre = _lookup(d["costmap"], traj[..., :2], res)
-    edge = _lookup(d["costmap"], footprint_points(traj, c.costmap), res)
-    legal = ~((centre >= INSCRIBED).any(-1) | (edge >= LETHAL).any((-1, -2)))
+    edge = footprint_max_cost(d["costmap"], traj, c.costmap, res)
+    legal = ~((centre >= INSCRIBED).any(-1) | (edge >= LETHAL).any(-1))
     terms["base_obstacle"] = c.base_obstacle_scale * centre[..., -1].where(
       centre[..., -1] < NO_INFORMATION, 0.0
     )

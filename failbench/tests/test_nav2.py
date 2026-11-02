@@ -13,7 +13,9 @@ from failbench.mppi.nav2 import (
   CostmapCfg,
   Nav2Mppi,
   Nav2MppiCfg,
+  _lookup,
   accel_limited,
+  footprint_max_cost,
   footprint_points,
   inflate,
   integrate,
@@ -94,6 +96,15 @@ def _drive(boxes, goal_w, cycles=80, n=4, seed=0, risk_weight=0.0, make=None):
       )
       hit |= bool(inside.any())
   return torch.stack(poses), torch.stack(cmds), hit
+
+
+def test_footprint_max_cost_matches_the_outline_lookup():
+  cm = CostmapCfg()
+  g = torch.Generator().manual_seed(0)
+  costmap = torch.randint(0, 255, (3, 40, 40), generator=g).float()
+  pts = torch.randn(3, 5, 7, 3, generator=g)
+  full = _lookup(costmap, footprint_points(pts, cm), RES).amax(-1)
+  assert torch.equal(footprint_max_cost(costmap, pts, cm, RES), full)
 
 
 def test_inflation_matches_nav2s_layer():
