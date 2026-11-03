@@ -58,6 +58,8 @@ from failbench.severity_course import (
   SEVERITY_COURSE,
   SEVERITY_COURSE_TERRAIN,
   SEVERITY_PERSON,
+  SEVERITY_PERSON_SIDE,
+  SEVERITY_PERSON_SIDE_TERRAIN,
   SEVERITY_PERSON_SWAP,
   SEVERITY_PERSON_SWAP_TERRAIN,
   SEVERITY_PERSON_TERRAIN,
@@ -132,6 +134,7 @@ GOAL_MODES: dict[str, GoalMode] = {
   "severity_wall_swap": "waypoints",
   "severity_person": "waypoints",
   "severity_person_swap": "waypoints",
+  "severity_person_side": "waypoints",
   "cluster": "waypoints",
   "cluster_swap": "waypoints",
   "gap": "waypoints",
@@ -156,6 +159,10 @@ WAYPOINT_TERRAINS = {
   "severity_person_swap": (
     SEVERITY_PERSON_SWAP_TERRAIN,
     severity_waypoints(SEVERITY_PERSON_SWAP),
+  ),
+  "severity_person_side": (
+    SEVERITY_PERSON_SIDE_TERRAIN,
+    severity_waypoints(SEVERITY_PERSON_SIDE),
   ),
   "cluster": (CLUSTER_COURSE_TERRAIN, scene_waypoints(CLUSTER_COURSE)),
   "cluster_swap": (CLUSTER_SWAP_TERRAIN, scene_waypoints(CLUSTER_SWAP)),

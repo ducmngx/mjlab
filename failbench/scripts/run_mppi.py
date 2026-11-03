@@ -85,6 +85,7 @@ from failbench.mppi.inputs import HistoryBuffer, crop_center
 from failbench.mppi.models import DynamicsModel, ImpactDynamics, ZeroDriftModel
 from failbench.mppi.nav2 import Nav2Mppi, Nav2MppiCfg, nav2_costmap
 from failbench.mppi.planner import VULNERABLE_FAULTS, Mppi, MppiCfg
+from failbench.mppi.risk_critic import RiskCritic, RiskCriticCfg, blank_obstacles
 from failbench.scripts.generate import policy_estimates
 from failbench.sensing import LidarCfg, NoiseCfg, corrupt_map
 from failbench.severity import DROP_SEVERITY, geom_severity
@@ -186,6 +187,10 @@ class RunMppiConfig:
   mppi: MppiCfg = field(default_factory=MppiCfg)
   nav2: Nav2MppiCfg = field(default_factory=Nav2MppiCfg)
   dwb: DwbCfg = field(default_factory=DwbCfg)
+  risk_critic: bool = False
+  """``nav2`` / ``dwb``: add the fault-risk critic (``risk``,
+  ``failbench/mppi/risk_critic.py``), our method; its ``weight`` the knob."""
+  risk: RiskCriticCfg = field(default_factory=RiskCriticCfg)
   cbf: CbfCfg = field(default_factory=CbfCfg)
   """A CBF safety filter on MPPI's command (``failbench/mppi/cbf.py``), each
   cycle on the map MPPI plans on; off at ``margin`` 0."""
@@ -310,8 +315,10 @@ def run(cfg: RunMppiConfig) -> dict:
       raise ValueError("Nav2 MPPI plans every model_dt and has no explain mode.")
     # Our method: the fault risk, priced by the legacy planner's code, as one
     # more critic (``--mppi.fault-risk.p`` > 0; its weight the critic's).
-    critics = []
-    if cfg.mppi.fault_risk.p > 0:
+    critics: list = []
+    if cfg.risk_critic:
+      critics.append(RiskCritic(cfg.risk, model))
+    elif cfg.mppi.fault_risk.p > 0:
       engine = Mppi(cfg.mppi, model, n, device)
       critics.append(FaultRiskCritic(engine, cfg.mppi.weights.fault_risk))
     if cfg.planner == "dwb":
@@ -621,7 +628,18 @@ def run(cfg: RunMppiConfig) -> dict:
       )
       costmap = nav2_costmap(plan_h, MAP_RESOLUTION, planner.cfg.costmap, severity)
       context = None
-      if planner.extra_critics:
+      if cfg.risk_critic:
+        # The model knows terrain only: objects are flattened out of its
+        # map, and priced by the critic from the severity map.
+        objects = crop_center(severity > 0, MAP_CELLS)
+        context = {
+          "inputs": inputs | {"map": blank_obstacles(model_map, objects)},
+          "risk_fields": severity_fields(
+            plan_h, severity, MAP_RESOLUTION, cfg.risk.footprint
+          ),
+          "exposed": ~told,  # Faults still to come.
+        }
+      elif planner.extra_critics:
         fp = cfg.mppi.footprint
         engine = planner.extra_critics[0].engine
         context = {
@@ -671,11 +689,18 @@ def run(cfg: RunMppiConfig) -> dict:
     # What the model predicts for the chosen plan given the true fault (the
     # same as the plan's own prediction for a fault-aware planner).
     true_params = torch.where(fault.faulted[:, None, None], fault.params, nominal)
+    # Over the model's horizon; the rest of a longer plan is NaN.
+    plan_t = out["plan"].shape[1]
+    horizon = model.model.cfg.num_steps if isinstance(model, ImpactDynamics) else plan_t
     true_pred = model.predict(
       inputs | {"fault": encode_fault(true_params)},
-      out["plan"][:, None],
-      out["path"][:, None],
+      out["plan"][:, None, :horizon],
+      out["path"][:, None, :horizon],
     )
+    for k in ("drift", "drift_std", "p_fallen"):
+      v = true_pred[k]
+      pad = v.new_full((*v.shape[:2], plan_t - v.shape[2], *v.shape[3:]), torch.nan)
+      true_pred[k] = torch.cat([v, pad], 2)
     if device.startswith("cuda"):
       torch.cuda.synchronize()
     plan_time.append(time.perf_counter() - t0)

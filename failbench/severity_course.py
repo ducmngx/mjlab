@@ -41,8 +41,9 @@ _names = itertools.count()
 @dataclass(kw_only=True)
 class SeverityCourseTerrainCfg(SubTerrainCfg):
   spawn_x: float = 1.0
-  classes: tuple[str, str] = ("box", "glass")
-  """The left (+y) and right (-y) panels' class."""
+  classes: tuple[str | None, str | None] = ("box", "glass")
+  """The left (+y) and right (-y) panels' class; None leaves that side
+  open."""
   side_range: tuple[float, float] = (1.0, 0.6)
   """Centre line to either row's face at difficulty 0 and 1."""
   goal_x: float = 10.0
@@ -86,6 +87,8 @@ class SeverityCourseTerrainCfg(SubTerrainCfg):
         (self.classes[0], yc + side, yc + side + t),
         (self.classes[1], yc - side - t, yc - side),
       ):
+        if cls is None:
+          continue
         box(cls, x0, x1, y0, y1, -0.03, z1, CLASS_RGBA.get(cls, CLASS_RGBA["wall"]))
     return TerrainOutput(origin=np.array([self.spawn_x, yc, 0.0]), geometries=out)
 
@@ -122,6 +125,11 @@ SEVERITY_PERSON = replace(SEVERITY_COURSE, classes=("box", "person"))
 SEVERITY_PERSON_TERRAIN = _terrain(SEVERITY_PERSON)
 SEVERITY_PERSON_SWAP = replace(SEVERITY_PERSON, classes=SEVERITY_PERSON.classes[::-1])
 SEVERITY_PERSON_SWAP_TERRAIN = _terrain(SEVERITY_PERSON_SWAP)
+SEVERITY_PERSON_SIDE = replace(
+  SEVERITY_COURSE, classes=(None, "person"), side_range=(0.7, 0.5)
+)
+"""People close on the right, open floor on the left: room to give."""
+SEVERITY_PERSON_SIDE_TERRAIN = _terrain(SEVERITY_PERSON_SIDE)
 """The severity ladder: boxes (5) against a wall (10), glass (25) or a
 person (50) at the same places, for the sideways offset against what the
 far row is."""

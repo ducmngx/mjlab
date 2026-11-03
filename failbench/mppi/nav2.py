@@ -480,6 +480,8 @@ class Nav2Mppi:
       "traj": traj,
       "v": v,
       "cv": cv,
+      "v0": v0,
+      "commands": self._sent(cv, v0) if self.extra_critics else None,
       "pose0": pose0,
       "path": points,
       "path_yaw": path_yaw,
@@ -491,6 +493,7 @@ class Nav2Mppi:
       **(context or {}),
     }
     terms, fail = self._critics(data)
+    data["stock_cost"] = torch.stack(list(terms.values())).sum(0)
     for name, critic in [(f.__name__, f) for f in self.extra_critics]:
       terms[name] = critic(data)
     for name, scale in self.critic_scale.items():
@@ -566,6 +569,14 @@ class Nav2Mppi:
       shift[:, 1] = vy
       out.append(self.seq + shift)
     return torch.stack(out, 1)
+
+  def _sent(self, cv: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
+    """What the robot would be sent if it committed to each sample ``cv [n,
+    K, T, 3]``: within the limits, from the command sent next, the last held
+    (as the planner-driven data commits, ``PlannerDriver.commit``)."""
+    n, k = cv.shape[:2]
+    sent = self._constrain(cv.flatten(0, 1), v0.repeat_interleave(k, 0))
+    return torch.cat([sent[:, 1:], sent[:, -1:]], 1).unflatten(0, (n, k))
 
   def _constrain(self, seq: torch.Tensor, v0: torch.Tensor) -> torch.Tensor:
     """Clamp a sequence ``[n, T, 3]`` to the speed limits and, from the

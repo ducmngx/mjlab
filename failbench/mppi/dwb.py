@@ -230,6 +230,8 @@ class Dwb:
       "traj": traj,
       "v": v,
       "cv": cv,
+      "v0": speed,
+      "commands": cv,
       "pose0": pose0,
       "path": points,
       "path_yaw": path_yaw,
@@ -241,6 +243,7 @@ class Dwb:
       **(context or {}),
     }
     terms, legal = self._critics(data, twist, end)
+    data["stock_cost"] = torch.stack(list(terms.values())).sum(0)
     for name, critic in [(f.__name__, f) for f in self.extra_critics]:
       terms[name] = critic(data)
     for name, scale in self.critic_scale.items():
