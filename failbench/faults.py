@@ -120,6 +120,28 @@ def faulted_joint(params: torch.Tensor) -> torch.Tensor:
   return torch.where(touched.any(-1), touched.float().argmax(-1), -1)
 
 
+FAULT_GROUPS = ("healthy", "locked", "weak", "limp")
+"""``fault_group``'s groups: weak splits into limp (torque 0) and the rest."""
+
+
+def fault_group(fault: torch.Tensor) -> torch.Tensor:
+  """Encoded faults ``[..., J * 2]`` -> group index into ``FAULT_GROUPS``."""
+  p = fault.unflatten(-1, (-1, len(FAULT_PARAMS)))
+  torque, lock = p[..., TORQUE].amin(-1), p[..., LOCK].amax(-1)
+  return torch.where(
+    lock > 0.5, 1, torch.where(torque <= 1e-6, 3, torch.where(torque < 1, 2, 0))
+  )
+
+
+def fault_stratum(fault: torch.Tensor, joints_per_leg: int = 3) -> torch.Tensor:
+  """Encoded faults ``[..., J * 2]`` -> 0 for healthy, else ``1 + 3 *
+  (group - 1) + joint type`` (hip, thigh, calf): 10 strata."""
+  joint = faulted_joint(fault.unflatten(-1, (-1, len(FAULT_PARAMS))))
+  group = fault_group(fault)
+  kind = joint.clamp(min=0) % joints_per_leg
+  return torch.where(group == 0, 0, 1 + joints_per_leg * (group - 1) + kind)
+
+
 def encode_fault(params: torch.Tensor) -> torch.Tensor:
   """Network encoding of ``[..., J, 2]`` parameters: the parameters as is,
   flattened to ``[..., J * 2]``. A healthy joint is (1, 0)."""

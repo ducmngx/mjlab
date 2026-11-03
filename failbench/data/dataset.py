@@ -27,6 +27,7 @@ import torch
 from torch.utils.data import Dataset
 
 from failbench.data.build import SPLITS
+from failbench.faults import fault_stratum
 from failbench.sensing import NoiseCfg, corrupt_map
 
 MapMode = Literal["fused", "single", "clean"]
@@ -97,6 +98,23 @@ class FailBenchDataset(Dataset):
 
   def __len__(self) -> int:
     return len(self.index)
+
+  def fault_strata(self) -> np.ndarray:
+    """Each item's ``fault_stratum`` (healthy, or family x joint type)."""
+    out = np.empty(len(self.index), np.int64)
+    for s, a in enumerate(self.shards):
+      at = np.flatnonzero(self.index[:, 0] == s)
+      fault = torch.from_numpy(np.asarray(a["fault"][self.index[at, 1]], np.float32))
+      out[at] = fault_stratum(fault).numpy()
+    return out
+
+  def sample_weights(self, power: float) -> np.ndarray:
+    """Per-item sampling weights giving each fault stratum a share of
+    ``count ** (1 - power)``: 0 keeps the data's mix, 1 samples every stratum
+    equally (rare faults, e.g. a limp hip, as often as common ones)."""
+    strata = self.fault_strata()
+    counts = np.bincount(strata)
+    return counts[strata].astype(np.float64) ** -power
 
   def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
     s, row = (int(x) for x in self.index[index])

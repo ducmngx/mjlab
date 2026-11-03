@@ -23,7 +23,7 @@ from typing import Literal
 import torch
 import tyro
 import wandb
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from failbench.data.dataset import FailBenchDataset, MapMode
@@ -61,6 +61,12 @@ class TrainConfig:
   wandb_project: str = "failbench"
   run_name: str | None = None
   log_every: int = 50
+  balance_power: float = 0.5
+  """Rebalance the training faults (``FailBenchDataset.sample_weights``):
+  each family x joint type stratum is drawn in proportion to its count to
+  the power ``1 - balance_power`` (0: the data's mix; 1: every stratum
+  equally). A limp joint is about a tenth of the samples; 0.5 nearly
+  doubles its share."""
   fall_label: Literal["upright", "safe"] = "upright"
   """What the fall hazard learns: the fall itself, or the point of no
   return before it (``safe``, ``failbench/data/build.py``)."""
@@ -132,10 +138,15 @@ def main():
   train_ds = FailBenchDataset(root, "train", cfg.map_mode, contacts=contacts)
 
   def loader(ds: FailBenchDataset, train: bool) -> DataLoader:
+    sampler = None
+    if train and cfg.balance_power > 0:
+      weights = ds.sample_weights(cfg.balance_power).tolist()
+      sampler = WeightedRandomSampler(weights, len(ds), replacement=True)
     return DataLoader(
       ds,
       batch_size=cfg.batch_size,
-      shuffle=train,
+      shuffle=train and sampler is None,
+      sampler=sampler,
       drop_last=train,
       num_workers=cfg.num_workers,
       pin_memory=device != "cpu",

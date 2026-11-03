@@ -28,6 +28,7 @@ from failbench.data.build import (
 )
 from failbench.data.dataset import FailBenchDataset
 from failbench.faults import (
+  FAULT_GROUPS,
   FAULT_TERM,
   JOINT_NAMES,
   LOCK,
@@ -36,6 +37,8 @@ from failbench.faults import (
   FaultFamily,
   FaultMixture,
   encode_fault,
+  fault_group,
+  fault_stratum,
   faulted_joint,
   inject_kinodynamic_fault,
   sample_fault_params,
@@ -885,3 +888,136 @@ def test_an_old_checkpoints_config_keeps_its_fault_encoder_and_fall_head():
   old = ImpactModelCfg.from_saved({})
   assert not old.fault_in_decoder and old.fall_head and old.dv_head
   assert not old.velocity_head
+
+
+def _drift_pred(mean: torch.Tensor, logvar: torch.Tensor) -> dict[str, torch.Tensor]:
+  """A drift-only prediction on the start frame (``drift_yaw`` 0)."""
+  return {
+    "drift_local": mean,
+    "drift_logvar": logvar,
+    "drift_yaw": torch.zeros(mean.shape[:-1]),
+  }
+
+
+def _drift_batch(err: float, b: int = 4, t: int = 30) -> dict[str, torch.Tensor]:
+  path = torch.zeros(b, t, 3)
+  return {
+    "cmd_path": path,
+    "pose": path + torch.tensor([0.0, err, 0.0]),
+    "valid": torch.ones(b, t, dtype=torch.bool),
+    "upright": torch.ones(b, t, dtype=torch.bool),
+  }
+
+
+def test_beta_nll_keeps_the_mean_learning_where_the_spread_is_wide():
+  batch = _drift_batch(err=1.0)
+
+  def grads(logvar: float, beta: float) -> tuple[float, float]:
+    mean = torch.zeros(4, 30, 3, requires_grad=True)
+    lv = torch.full((4, 30, 3), logvar, requires_grad=True)
+    w = LossWeights(nll_beta=beta)
+    impact_loss(_drift_pred(mean, lv), batch, w, 10)[0].backward()
+    assert mean.grad is not None and lv.grad is not None
+    return float(mean.grad[..., 1].abs().sum()), float(lv.grad[..., 1].sum())
+
+  # Plain NLL: a spread 10x wider (logvar +4.6) pulls the mean 100x less.
+  narrow, wide = grads(0.0, 0.0)[0], grads(math.log(100.0), 0.0)[0]
+  assert wide < narrow / 50
+  # beta 0.5: only sqrt as much less (10x); the spread still settles on the
+  # error, its gradient zero where variance = error^2.
+  narrow, wide = grads(0.0, 0.5)[0], grads(math.log(100.0), 0.5)[0]
+  assert narrow / 20 < wide < narrow / 5
+  assert abs(grads(0.0, 0.5)[1]) < 1e-6
+
+
+def _fault_shard(tmp_path, faults: list[torch.Tensor], name: str = "s0") -> None:
+  """A shard of ``len(faults)`` 30-step train samples with these faults."""
+  shard = tmp_path / name
+  shard.mkdir()
+  n, nb, cells = len(faults), 30, 64
+  arrays = {
+    "state": np.zeros((n, 33), np.float32),
+    "state_true_vel": np.zeros((n, 3), np.float32),
+    "him_latent": np.zeros((n, 16), np.float32),
+    "history": np.zeros((n, 20, 36), np.float32),
+    "cmd_seq": np.zeros((n, nb, 3), np.float32),
+    "fault": torch.stack(faults).numpy().astype(np.float32),
+    "dv": np.zeros((n, nb, 3), np.float32),
+    "pose": np.zeros((n, nb, 3), np.float32),
+    "cmd_path": np.zeros((n, nb, 3), np.float32),
+    "upright": np.ones((n, nb), bool),
+    "collision": np.zeros((n, nb), bool),
+    "valid": np.ones((n, nb), bool),
+    "contact_offmap": np.zeros((n, nb), bool),
+    "fault_family": np.zeros(n, np.uint8),
+    "plan_hold": np.zeros(n, bool),
+    "offset_s": np.zeros(n, np.float32),
+    "split": np.zeros(n, np.uint8),
+    "fallen_at_start": np.zeros(n, bool),
+    "map_clean": np.full((n, cells, cells), -0.3, np.float16),
+  }
+  for k, v in arrays.items():
+    np.save(shard / f"{k}.npy", v)
+  meta = {"num_bins": nb, "map_cells": cells, "terrain_id": 0}
+  (shard / "meta.json").write_text(json.dumps(meta))
+
+
+def _one_fault(joint: int, torque: float = 1.0, locked: float = 0.0) -> torch.Tensor:
+  p = torch.tensor(NOMINAL).repeat(12, 1)
+  p[joint] = torch.tensor([torque, locked])
+  return encode_fault(p)
+
+
+def test_fault_strata_split_by_family_and_joint_type():
+  faults = torch.stack(
+    [
+      encode_fault(torch.tensor(NOMINAL).repeat(12, 1)),
+      _one_fault(3, locked=1.0),  # FR hip seized
+      _one_fault(4, torque=0.3),  # FR thigh weak
+      _one_fault(3, torque=0.0),  # FR hip limp
+      _one_fault(8, torque=0.0),  # RL calf limp
+    ]
+  )
+  assert FAULT_GROUPS == ("healthy", "locked", "weak", "limp")
+  assert fault_group(faults).tolist() == [0, 1, 2, 3, 3]
+  assert fault_stratum(faults).tolist() == [0, 1, 5, 7, 9]
+
+
+def test_balanced_sampling_evens_out_rare_faults(tmp_path):
+  healthy = encode_fault(torch.tensor(NOMINAL).repeat(12, 1))
+  _fault_shard(tmp_path, [healthy] * 16 + [_one_fault(3, torque=0.0)] * 4)
+  ds = FailBenchDataset(tmp_path, SPLITS[0], "clean", contacts=False)
+  strata = ds.fault_strata()
+  assert strata.tolist() == [0] * 16 + [7] * 4
+  even = ds.sample_weights(power=1.0)
+  assert math.isclose(even[strata == 0].sum(), even[strata == 7].sum())
+  natural = ds.sample_weights(power=0.0)
+  assert np.allclose(natural, natural[0])
+  half = ds.sample_weights(power=0.5)  # Shares 16:4 -> 4:2.
+  assert math.isclose(half[strata == 0].sum() / half[strata == 7].sum(), 2.0)
+
+
+def test_evaluation_reports_each_faults_direction_per_joint():
+  torch.manual_seed(0)
+  model = _decoder_fault_model()
+  b = 24
+  batch = _fake_batch(b, t=30)
+  batch["fault"] = _one_fault(3, torque=0.0).repeat(b, 1)  # FR hip limp
+  batch["cmd_path"][..., 2] = 0.0
+  throw = -0.5 + 0.1 * torch.randn(b, 1)  # Thrown right, about 0.5 m.
+  batch["pose"] = batch["cmd_path"].clone()
+  batch["pose"][..., 1] += throw
+  batch["safe"] = batch["upright"].clone()
+  batch["terrain_id"] = torch.zeros(b, dtype=torch.long)
+  batch["prefault_mode"] = torch.zeros(b, dtype=torch.long)
+  batch["state_true_vel"] = torch.rand(b, 3)
+  samples = cast(Any, [{k: v[i] for k, v in batch.items()} for i in range(b)])
+  dyn = cast(Any, SimpleNamespace(model=model))
+  eval_cfg = EvalConfig(checkpoint="", root="", output_dir="", num_workers=0)
+  r = evaluate_split(dyn, samples, eval_cfg, "cpu", "safe")
+  hip = r["per_joint"]["limp/FR_hip"]
+  assert hip["samples"] == b
+  assert math.isclose(hip["real_y_3s"], float(throw.mean()), abs_tol=1e-4)
+  assert {"pred_y_3s", "explained_y_3s", "explained_x_3s", "cover2s_3s"} <= set(hip)
+  # The untrained model misses the throw: it explains none of it.
+  assert hip["explained_y_3s"] < 0.5

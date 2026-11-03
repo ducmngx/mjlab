@@ -22,6 +22,14 @@ family and terrain:
   long until the robot is really on the ground (``upright``, whatever the
   label), the share of falls warned. Comparable across models trained on
   either label;
+- per fault group and faulted joint (``per_joint``, e.g. ``limp/FR_hip``),
+  whether the model knows which way that fault throws the robot: the real
+  and predicted mean drift along and across the path (``real_y`` /
+  ``pred_y``), the share of the real drift's variance the predicted mean
+  explains (``explained_x`` / ``explained_y``: 1 perfect, 0 no better than
+  the group's average, below 0 worse) and 2 sigma coverage. Pooled
+  coverage can look right while a rare fault's mean is wrong and its
+  spread wide enough to hide it (the limp hips of the first 3 s model);
 - all of it, with drift (and velocity) error and 2 sigma coverage, per fault
   group
   (healthy, locked, weak, limp: torque 0), per pre-fault mode
@@ -50,8 +58,20 @@ from torch.utils.data import DataLoader
 from failbench.commands import PREFAULT_MODES
 from failbench.data.build import TERRAINS
 from failbench.data.dataset import FailBenchDataset, MapMode
-from failbench.faults import FaultFamily
-from failbench.model.losses import auroc, impact_metrics, summarize_metrics
+from failbench.faults import (
+  FAULT_GROUPS,
+  FAULT_PARAMS,
+  JOINT_NAMES,
+  FaultFamily,
+  fault_group,
+  faulted_joint,
+)
+from failbench.model.losses import (
+  auroc,
+  impact_metrics,
+  local_target,
+  summarize_metrics,
+)
 from failbench.mppi.models import ImpactDynamics
 
 matplotlib.use("Agg")
@@ -96,16 +116,29 @@ LEAD_BINS = ((0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0))
 """Time to the ground fall (s) the warned share is reported over."""
 SPEED_BINS = ((-9.0, 0.1), (0.1, 0.3), (0.3, 0.6), (0.6, 9.0))
 """Forward speed (m/s, true) at the sample's start."""
-GROUPS = ("healthy", "locked", "weak", "limp")
+MIN_JOINT_SAMPLES = 10
+"""Fewest samples a fault group and joint is scored on in ``per_joint``."""
 
 
-def fault_group(fault: torch.Tensor) -> torch.Tensor:
-  """Encoded faults ``[B, 24]`` -> group index into ``GROUPS``."""
-  p = fault.view(-1, 12, 2)
-  torque, lock = p[..., 0].amin(-1), p[..., 1].amax(-1)
-  return torch.where(
-    lock > 0.5, 1, torch.where(torque <= 1e-6, 3, torch.where(torque < 1, 2, 0))
-  )
+def direction(
+  real: np.ndarray, mean: np.ndarray, std: np.ndarray, valid: np.ndarray
+) -> dict[str, float]:
+  """At one step: ``real`` / ``mean`` / ``std`` ``[N, 2]`` (along, across the
+  path) and ``valid [N]``; the mean drifts, how much of the real variance
+  the predicted mean explains, and 2 sigma coverage."""
+  real, mean, std = real[valid], mean[valid], std[valid]
+  err = ((real - mean) ** 2).mean(0)
+  var = real.var(0)
+  explained = np.where(var > 0, 1 - err / np.maximum(var, 1e-12), np.nan)
+  return {
+    "real_x": float(real[:, 0].mean()),
+    "real_y": float(real[:, 1].mean()),
+    "pred_x": float(mean[:, 0].mean()),
+    "pred_y": float(mean[:, 1].mean()),
+    "explained_x": float(explained[0]),
+    "explained_y": float(explained[1]),
+    "cover2s": float((np.abs(real - mean) <= 2 * std).all(-1).mean()),
+  }
 
 
 def warning_lead(
@@ -143,7 +176,19 @@ def evaluate_split(
   dl = DataLoader(ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers)
   pooled: dict[str, list[torch.Tensor]] = {}
   extra: dict[str, list[np.ndarray]] = {
-    k: [] for k in ("terrain", "fall_t", "group", "prefault", "vx")
+    k: []
+    for k in (
+      "terrain",
+      "fall_t",
+      "group",
+      "joint",
+      "prefault",
+      "vx",
+      "real",
+      "mean",
+      "std",
+      "valid",
+    )
   }
   step_s = 0.1
   for batch in dl:
@@ -166,6 +211,12 @@ def evaluate_split(
     extra["terrain"].append(batch["terrain_id"].cpu().numpy())
     extra["fall_t"].append(fall_t.cpu().numpy())
     extra["group"].append(fault_group(batch["fault"]).cpu().numpy())
+    params = batch["fault"].unflatten(-1, (-1, len(FAULT_PARAMS)))
+    extra["joint"].append(faulted_joint(params).cpu().numpy())
+    extra["real"].append(local_target(pred, batch)[..., :2].cpu().numpy())
+    extra["mean"].append(pred["drift_local"][..., :2].cpu().numpy())
+    extra["std"].append(pred["drift_std"][..., :2].cpu().numpy())
+    extra["valid"].append(batch["valid"].bool().cpu().numpy())
     extra["prefault"].append(batch["prefault_mode"].cpu().numpy())
     extra["vx"].append(batch["state_true_vel"][:, 0].cpu().numpy())
   m = {k: torch.cat(v) for k, v in pooled.items()}
@@ -202,8 +253,28 @@ def evaluate_split(
       m["p_collided"].numpy(), m["collided"].numpy().astype(float), cfg.bins
     )
   out["per_group"] = {
-    g: falls(e["group"] == i) for i, g in enumerate(GROUPS) if (e["group"] == i).any()
+    g: falls(e["group"] == i)
+    for i, g in enumerate(FAULT_GROUPS)
+    if (e["group"] == i).any()
   }
+  horizons = [
+    (s, round(s / step_s) - 1)
+    for s in (1, 2, 3, 5)
+    if round(s / step_s) - 1 < e["real"].shape[1]
+  ]
+  out["per_joint"] = {}
+  for g, gname in enumerate(FAULT_GROUPS[1:], start=1):
+    for j, jname in enumerate(JOINT_NAMES):
+      sel = (e["group"] == g) & (e["joint"] == j)
+      if sel.sum() < MIN_JOINT_SAMPLES:
+        continue
+      r: dict[str, Any] = {"samples": int(sel.sum())}
+      for s, k in horizons:
+        d = direction(
+          e["real"][sel, k], e["mean"][sel, k], e["std"][sel, k], e["valid"][sel, k]
+        )
+        r |= {f"{name}_{s}s": v for name, v in d.items()}
+      out["per_joint"][f"{gname}/{jname.removesuffix('_joint')}"] = r
   out["per_prefault"] = {
     name: falls(e["prefault"] == i)
     for i, name in enumerate(PREFAULT_MODES)
@@ -292,6 +363,17 @@ def main():
           for k, v in r[key].items()
         )
       )
+    worst = sorted(
+      r["per_joint"].items(), key=lambda kv: kv[1].get(f"explained_y_{h}", 1.0)
+    )[:5]
+    print(
+      f"[INFO]   direction at {h}, least explained across the path: "
+      + ", ".join(
+        f"{k} n {v['samples']} real {v[f'real_y_{h}']:+.2f} pred"
+        f" {v[f'pred_y_{h}']:+.2f} explained {v[f'explained_y_{h}']:.2f}"
+        for k, v in worst
+      )
+    )
   (out_dir / "eval.json").write_text(json.dumps(results, indent=2))
   if not any("fall_calibration" in r for r in splits.values()):
     print(f"[INFO] -> {out_dir}")

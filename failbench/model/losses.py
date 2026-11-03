@@ -7,6 +7,14 @@
   every valid step for a model without a fall head (where the body goes
   matters whether or not it falls), over upright ones for the older models.
 - vel: the same NLL for the trunk's velocity ``vel`` (in the same frame).
+- both NLLs weighted per element by the (detached) predicted variance to the
+  power ``nll_beta`` (beta-NLL, Seitzer et al., "On the Pitfalls of
+  Heteroscedastic Uncertainty Estimation with Probabilistic Neural
+  Networks", ICLR 2022): plain NLL pulls the mean by 1/variance, so where
+  the spread is wide the mean stops learning and the spread soaks up the
+  error (the limp-hip throws: sideways spread ~0.7 m, the side of the throw
+  unlearned); beta 0.5 keeps the mean learning there, the spread still
+  settling on the error.
 - dv: Huber over upright, valid steps (auxiliary).
 - latent: squared error of HIM's predicted latent over upright, valid steps,
   per dimension in units of its dataset spread (``latent_std``, from
@@ -47,14 +55,22 @@ class LossWeights:
   pos_weight: float = 5.0
   """BCE weight on positive collision / offmap steps (both are rare)."""
   focal_gamma: float = 2.0
+  nll_beta: float = 0.5
+  """beta-NLL's exponent on the drift and velocity NLL: 0 is plain NLL, 1
+  pulls the mean as squared error does."""
 
 
-def _t_nll(err: torch.Tensor, logvar: torch.Tensor, nu: float) -> torch.Tensor:
-  """Per-axis NLL of ``err`` under a Gaussian (``nu`` 0) or Student-t."""
+def _t_nll(
+  err: torch.Tensor, logvar: torch.Tensor, nu: float, beta: float = 0.0
+) -> torch.Tensor:
+  """Per-axis NLL of ``err`` under a Gaussian (``nu`` 0) or Student-t,
+  weighted by the detached variance to the power ``beta`` (beta-NLL)."""
   z2 = err**2 * torch.exp(-logvar)
   if nu > 0:
-    return 0.5 * logvar + 0.5 * (nu + 1) * torch.log1p(z2 / nu)
-  return 0.5 * (z2 + logvar)
+    nll = 0.5 * logvar + 0.5 * (nu + 1) * torch.log1p(z2 / nu)
+  else:
+    nll = 0.5 * (z2 + logvar)
+  return nll * torch.exp(beta * logvar.detach()) if beta else nll
 
 
 def vel_local_target(
@@ -148,10 +164,12 @@ def impact_loss(
   up = batch["upright"].bool() & valid
   on = step_mask(pred, batch)
   err = local_target(pred, batch) - pred["drift_local"]
-  terms = {"drift": _masked_mean(_t_nll(err, pred["drift_logvar"], drift_nu), on)}
+  nll = _t_nll(err, pred["drift_logvar"], drift_nu, w.nll_beta)
+  terms = {"drift": _masked_mean(nll, on)}
   if "vel" in pred:
     err = vel_local_target(pred, batch) - pred["vel_local"]
-    terms["vel"] = _masked_mean(_t_nll(err, pred["vel_logvar"], drift_nu), on)
+    nll = _t_nll(err, pred["vel_logvar"], drift_nu, w.nll_beta)
+    terms["vel"] = _masked_mean(nll, on)
   if "dv" in pred:
     dv = F.huber_loss(pred["dv"], batch["dv"], reduction="none")
     terms["dv"] = _masked_mean(dv, up)
