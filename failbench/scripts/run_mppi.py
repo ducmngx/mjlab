@@ -76,7 +76,9 @@ from failbench.faults import (
   faulted_joint,
   inject_kinodynamic_fault,
 )
+from failbench.global_planner import plan_paths
 from failbench.goals import route_progress, sample_goal
+from failbench.house_terrain import HOUSE_TERRAINS, route_table
 from failbench.mppi.cbf import CbfCfg, CbfFilter, severity_fields
 from failbench.mppi.costmap import distance_field, drop_cells, obstacle_cells
 from failbench.mppi.dwb import Dwb, DwbCfg
@@ -85,10 +87,19 @@ from failbench.mppi.inputs import HistoryBuffer, crop_center
 from failbench.mppi.models import DynamicsModel, ImpactDynamics, ZeroDriftModel
 from failbench.mppi.nav2 import Nav2Mppi, Nav2MppiCfg, nav2_costmap
 from failbench.mppi.planner import VULNERABLE_FAULTS, Mppi, MppiCfg
+from failbench.mppi.profiles import PROFILES, apply_changes, changes_from_stock
 from failbench.mppi.risk_critic import RiskCritic, RiskCriticCfg, blank_obstacles
+from failbench.paths import local_path, resample
 from failbench.scripts.generate import policy_estimates
-from failbench.sensing import LidarCfg, NoiseCfg, corrupt_map
-from failbench.severity import DROP_SEVERITY, geom_severity
+from failbench.sensing import LidarCfg, MapMemory, NoiseCfg, corrupt_map
+from failbench.severity import (
+  DEFAULT_ENERGY_SCALE,
+  DROP_SEVERITY,
+  ENERGY_SCALE,
+  MASS_KG,
+  damage,
+  geom_severity,
+)
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.sensor import RayCastSensor
 from mjlab.sensor.raycast_sensor import RayCastData
@@ -175,7 +186,14 @@ class RunMppiConfig:
   ``failbench/scripts/explain_mppi.py``."""
   """Log the planning map and its obstacle cells every n cycles (0: never)."""
   """Planning map side (cells, 0.05 m): 8 m, about a 5 s plan at 0.8 m/s."""
-  sweep_map: Literal["lidar", "oracle"] = "lidar"
+  sweep_map: Literal["memory", "lidar", "oracle"] = "memory"
+  """The planners' map (costmap and the risk critic's object fields; the
+  impact model always gets the 1.5 s LiDAR crop it was trained on):
+  ``memory`` keeps what the LiDAR saw in a world grid until it is seen again
+  (``MapMemory``, as an elevation mapper or Nav2's obstacle layer), ``lidar``
+  only the last 1.5 s (tall objects drop out beside the robot, above the
+  head LiDAR's view), ``oracle`` the full clean map."""
+  memory_size_m: float = 40.0
   odom_xy_std: float = 0.02
   """Odometry position random walk (m per sqrt(s))."""
   odom_yaw_std: float = 0.005
@@ -186,11 +204,22 @@ class RunMppiConfig:
   within this distance of the current one (or once past it)."""
   mppi: MppiCfg = field(default_factory=MppiCfg)
   nav2: Nav2MppiCfg = field(default_factory=Nav2MppiCfg)
+  nav2_profile: str = "stock"
+  """A ``failbench.mppi.profiles.PROFILES`` entry, applied over ``nav2``
+  (and over any ``--nav2.*`` flag). The run's JSON lists every parameter
+  that differs from stock either way."""
   dwb: DwbCfg = field(default_factory=DwbCfg)
   risk_critic: bool = False
   """``nav2`` / ``dwb``: add the fault-risk critic (``risk``,
   ``failbench/mppi/risk_critic.py``), our method; its ``weight`` the knob."""
   risk: RiskCriticCfg = field(default_factory=RiskCriticCfg)
+  global_route: bool = False
+  """``nav2`` / ``dwb``: track a NavFn-style global path (``_global_route``)
+  instead of the straight line to the goal, as stock Nav2 runs its local
+  planner. Without one a block on the line leaves MPPI's left and right
+  samples to average out, straight into it."""
+  global_every_s: float = 1.0
+  """Replan the global path this often (Nav2's default navigator: 1 Hz)."""
   cbf: CbfCfg = field(default_factory=CbfCfg)
   """A CBF safety filter on MPPI's command (``failbench/mppi/cbf.py``), each
   cycle on the map MPPI plans on; off at ``margin`` 0."""
@@ -203,18 +232,20 @@ class RunMppiConfig:
   seed: int = 0
 
 
-def _touched_severity(
+def _touched_worst(
   touch: torch.Tensor,
   contact_w: torch.Tensor,
   rays: RayCastData,
-  geom_sev: torch.Tensor,
+  geom_value: torch.Tensor,
   reach_m: float = 0.08,
 ) -> torch.Tensor:
-  """Worst severity per env ``[n]`` of what its touching contacts
-  (``touch [n, N]`` at ``contact_w [n, N, 3]``) are on: the most severe
-  geom the map's rays hit within ``reach_m`` (xy) of each contact."""
+  """Worst value per env ``[n]`` of what its touching contacts (``touch [n,
+  N]`` at ``contact_w [n, N, 3]``) are on: the largest ``geom_value [n,
+  ngeom + 1]`` (a severity or a hit's damage) of the geoms the map's rays
+  hit within ``reach_m`` (xy) of each contact."""
   out = torch.zeros(touch.shape[0], device=touch.device)
-  sev = geom_sev[rays.hit_geom_id.long()]  # [n, R]
+  ids = rays.hit_geom_id.long()
+  sev = geom_value.expand(ids.shape[0], -1).gather(1, ids % geom_value.shape[-1])
   for b in touch.any(-1).nonzero()[:, 0].tolist():
     pts = contact_w[b, touch[b], :2]
     # Not cdist: on GPU it takes |a|^2 + |b|^2 - 2ab by a matmul, which in
@@ -235,6 +266,59 @@ def _to_yaw_frame_2d(xy: torch.Tensor, origin: torch.Tensor, yaw: torch.Tensor):
   return torch.stack([c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]], -1)
 
 
+def _global_route(
+  height: torch.Tensor,
+  goal: torch.Tensor,
+  pose_w: torch.Tensor,
+  pcfg: Nav2MppiCfg | DwbCfg,
+  severity: torch.Tensor | None,
+  max_m: float = 12.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Each robot's global path (``failbench/global_planner.py``, NavFn-style)
+  to its ``goal [n, 2]`` (yaw frame) on the costmap of the clean map
+  ``height [n, H, W]`` around it, the static map a deployed robot plans on:
+  points ``[n, P, 2]`` (world) every ``pcfg.path_resolution`` and how many
+  are its own ``[n]``. A goal beyond the map is pulled in to 0.3 m inside
+  its edge; where no path is found, the straight line."""
+  res = pcfg.path_resolution
+  cost = nav2_costmap(height, MAP_RESOLUTION, pcfg.costmap, severity).cpu().numpy()
+  edge = (height.shape[-1] - 1) / 2 * MAP_RESOLUTION - 0.3
+  scale = (edge / goal.abs().amax(-1).clamp(min=1e-6)).clamp(max=1.0)
+  target = (goal * scale[:, None]).cpu().numpy()
+  points = round(max_m / res) + 1
+  paths, reals = [], []
+  for k in range(len(goal)):
+    found = plan_paths(cost[k], MAP_RESOLUTION, np.zeros((1, 2)), target[k : k + 1])[0]
+    poly = found if found is not None else np.stack([np.zeros(2), target[k]])
+    poly_t = torch.as_tensor(poly, dtype=torch.float32, device=goal.device)
+    pts, real = resample(poly_t[None], res, points)
+    paths.append(pts[0])
+    reals.append(real[0])
+  path_b = torch.stack(paths)
+  return _to_world(path_b, pose_w[:, :2], pose_w[:, 2]), torch.stack(reals)
+
+
+def _house_routes(
+  name: str, origins: torch.Tensor, pcfg: Nav2MppiCfg | DwbCfg
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Robot ``i``'s global path on layout ``name``: route ``i % routes``
+  (``route_table``), world points ``[n, P, 2]`` every
+  ``pcfg.path_resolution`` and how many are its own ``[n]``."""
+  _, paths = route_table(name)
+  res = pcfg.path_resolution
+  longest = max(float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum()) for p in paths)
+  vmax = max(len(p) for p in paths)
+  polys = torch.stack(
+    [
+      torch.as_tensor(np.concatenate([p, np.repeat(p[-1:], vmax - len(p), 0)]))
+      for p in paths
+    ]
+  ).to(origins.device)
+  pts, real = resample(polys, res, round(longest / res) + 2)
+  idx = torch.arange(len(origins), device=origins.device) % len(paths)
+  return pts[idx] + origins[:, None, :2], real[idx]
+
+
 def _to_world(path: torch.Tensor, pos: torch.Tensor, yaw: torch.Tensor):
   """``path [n, T, 3]`` in each robot's yaw frame -> world (x, y)."""
   c, s = torch.cos(yaw)[:, None], torch.sin(yaw)[:, None]
@@ -245,6 +329,7 @@ def _to_world(path: torch.Tensor, pos: torch.Tensor, yaw: torch.Tensor):
 
 
 def run(cfg: RunMppiConfig) -> dict:
+  cfg = replace(cfg, nav2=apply_changes(cfg.nav2, PROFILES[cfg.nav2_profile]))
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
   torch.manual_seed(cfg.seed)
@@ -297,6 +382,9 @@ def run(cfg: RunMppiConfig) -> dict:
   assert isinstance(command, GoalVelocityCommand)
   elev = env.scene[MPPI_MAP_SENSOR]
   geom_sev = geom_severity(env.sim.mj_model, device=device)
+  geom_scale = geom_severity(
+    env.sim.mj_model, ENERGY_SCALE, DEFAULT_ENERGY_SCALE, device, ground=1.0
+  )
   assert isinstance(elev, RayCastSensor)
   sensor = env.scene[FAULT_CONTACT_SENSOR]
   cells = cfg.map_cells
@@ -310,6 +398,10 @@ def run(cfg: RunMppiConfig) -> dict:
   ).repeat_interleave(sensor.cfg.num_slots)
 
   planner: Mppi | Nav2Mppi | Dwb
+  risk_critic: RiskCritic | None = None
+  route_w: torch.Tensor | None = None
+  route_real = route_at = torch.zeros(n, dtype=torch.long, device=device)
+  route_t = -math.inf
   if cfg.planner in ("nav2", "dwb"):
     if cfg.explain or cfg.replan_every_s != cfg.nav2.model_dt:
       raise ValueError("Nav2 MPPI plans every model_dt and has no explain mode.")
@@ -317,7 +409,9 @@ def run(cfg: RunMppiConfig) -> dict:
     # more critic (``--mppi.fault-risk.p`` > 0; its weight the critic's).
     critics: list = []
     if cfg.risk_critic:
-      critics.append(RiskCritic(cfg.risk, model))
+      risk_critic = RiskCritic(cfg.risk, model)
+      if cfg.risk.weight > 0:  # At 0 it only logs the throws: stock MPPI.
+        critics.append(risk_critic)
     elif cfg.mppi.fault_risk.p > 0:
       engine = Mppi(cfg.mppi, model, n, device)
       critics.append(FaultRiskCritic(engine, cfg.mppi.weights.fault_risk))
@@ -327,6 +421,13 @@ def run(cfg: RunMppiConfig) -> dict:
       planner = Nav2Mppi(cfg.nav2, n, device, extra_critics=critics)
   else:
     planner = Mppi(cfg.mppi, model, n, device)
+  house = HOUSE_TERRAINS.get(cfg.terrain)
+  if house is not None:
+    # The household layouts: each robot tracks its route's global path,
+    # planned once on the layout's map (``failbench/house_terrain.py``).
+    if not isinstance(planner, (Nav2Mppi, Dwb)) or cfg.global_route:
+      raise ValueError("House terrains run nav2 or dwb on their own routes.")
+    route_w, route_real = _house_routes(house, env.scene.env_origins, planner.cfg)
   frozen = torch.zeros(n, 3, device=device)
   """Each robot's command when its fault fired (``post_fault`` hold)."""
   was_faulted = torch.zeros(n, dtype=torch.bool, device=device)
@@ -347,6 +448,7 @@ def run(cfg: RunMppiConfig) -> dict:
   back = [round(b / step_dt) for b in cfg.fuse_back_s]
   ring_len = max(back) + 1
   ring_pos = torch.zeros(n, ring_len, 3, device=device)
+  memory = MapMemory(n, cfg.memory_size_m, MAP_RESOLUTION, device)
   ring_quat = torch.zeros(n, ring_len, 4, device=device)
   odom_xy = torch.zeros(n, 2, device=device)
   odom_yaw = torch.zeros(n, device=device)
@@ -403,6 +505,8 @@ def run(cfg: RunMppiConfig) -> dict:
   obstacles = np.zeros((n, num_maps, cells, cells), bool)
   map_severity = np.zeros((n, num_maps, cells, cells), np.uint8)
   risk_log: dict[str, np.ndarray] = {}
+  risk_names: list[str] = planner.branch_names()
+  """The faults ``risk_log``'s branches are, for the replay."""
   ex: dict[str, np.ndarray] = {}
   if cfg.explain:
     K, sub = cfg.mppi.sampler.num_plans, T // 5
@@ -437,6 +541,10 @@ def run(cfg: RunMppiConfig) -> dict:
   incident = torch.zeros(n, device=device)
   """Worst severity a non-foot body part has touched (or a drop's, gone
   over one) from MPPI's start until arrival."""
+  hurt = torch.zeros(n, device=device)
+  """Worst damage done (``failbench.severity.damage``: the severity of what
+  was touched at the trunk's planar kinetic energy then; a drop's whole
+  severity), as the risk critic prices it."""
   start_z = torch.full((n,), float("nan"), device=device)
   plan_time = []
 
@@ -488,13 +596,17 @@ def run(cfg: RunMppiConfig) -> dict:
       fell_off |= (pos[:, 2] < start_z - FELL_OFF_M) & started & ~reached
       down |= fell_off
       incident = torch.where(fell_off, incident.clamp(min=DROP_SEVERITY), incident)
+      hurt = torch.where(fell_off, hurt.clamp(min=DROP_SEVERITY), hurt)
     touch = (
       valid & slot_body & (force_w.norm(dim=-1) >= 1.0) & (started & ~reached)[:, None]
     )
     if touch.any():
       incident = torch.maximum(
-        incident, _touched_severity(touch, contact_w, elev.data, geom_sev)
+        incident, _touched_worst(touch, contact_w, elev.data, geom_sev[None])
       )
+      energy = 0.5 * MASS_KG * data.root_link_lin_vel_w[:, :2].square().sum(-1)
+      hit = damage(geom_sev[None], energy[:, None], geom_scale[None])
+      hurt = torch.maximum(hurt, _touched_worst(touch, contact_w, elev.data, hit))
 
     state = torch.cat(
       [
@@ -598,6 +710,10 @@ def run(cfg: RunMppiConfig) -> dict:
     else:
       plan_known = noisy[:, 1] > 0.5
       plan_h = torch.where(plan_known, noisy[:, 0], float("nan"))
+      if cfg.sweep_map == "memory":
+        plan_h, plan_known = memory.update(
+          plan_h, plan_known, est_pos[:, :2], heading(est_quat), est_pos[:, 2]
+        )
     told = fault.faulted if cfg.fault_aware else torch.zeros_like(fault.faulted)
     params = torch.where(told[:, None, None], fault.params, nominal)
     inputs = {
@@ -652,7 +768,37 @@ def run(cfg: RunMppiConfig) -> dict:
           ),
           "exposed": ~told,  # Faults still to come.
         }
-      out = planner.step(costmap, MAP_RESOLUTION, goal, body_v, context)
+      path = None
+      if house is not None:
+        assert route_w is not None
+        pose_w = torch.cat([est_pos[:, :2], est_yaw[:, None]], -1)
+        path, route_at = local_path(route_w, route_real, route_at, pose_w, planner.cfg)
+      elif cfg.global_route:
+        pose_w = torch.cat([est_pos[:, :2], est_yaw[:, None]], -1)
+        if route_w is None or fresh.any() or t - route_t >= cfg.global_every_s - 1e-6:
+          route_w, route_real = _global_route(
+            height, goal, pose_w, planner.cfg, severity
+          )
+          route_at = torch.zeros_like(route_real)
+          route_t = t
+        path, route_at = local_path(route_w, route_real, route_at, pose_w, planner.cfg)
+      out = planner.step(costmap, MAP_RESOLUTION, goal, body_v, context, path)
+      if risk_critic is not None and context is not None:
+        # Where each imagined fault would throw the plan the robot runs, as
+        # the critic prices it (one firing point: now), for the replay.
+        shown = risk_critic.throws(
+          out["plan"][:, : cfg.nav2.time_steps],
+          context | {"resolution": MAP_RESOLUTION},
+        )
+        out |= {
+          "risk_branch": shown["cost"],
+          "risk_thrown": shown["pose"][:, None],
+          "risk_thrown_std": shown["std"][:, None],
+          "risk_p_fall": torch.zeros_like(shown["std"][:, None, ..., 0]),
+          "risk_damage": shown["damage"],
+          "risk_touch": shown["touch"],
+        }
+        risk_names = shown["names"]
     else:
       out = planner.step(
         inputs,
@@ -760,9 +906,14 @@ def run(cfg: RunMppiConfig) -> dict:
         "risk_thrown_w": thrown_w,
         "risk_thrown_std": out["risk_thrown_std"][..., :2].amax(-1),
         "risk_p_fall": out["risk_p_fall"][..., -1],
+        # Per imagined fault, unweighted: expected damage and the worst
+        # P(touch) of the run plan (fault calibration).
+        "risk_damage": out["risk_damage"],
+        "risk_touch": out["risk_touch"],
       }.items():
         if k not in risk_log:
-          risk_log[k] = np.full((n, num_cycles, *v.shape[1:]), np.nan, np.float16)
+          dtype = np.float32 if k in ("risk_damage", "risk_touch") else np.float16
+          risk_log[k] = np.full((n, num_cycles, *v.shape[1:]), np.nan, dtype)
         risk_log[k][on, c] = v[active].cpu().numpy()
     if "pred_contact" in out:
       probs = (out["pred_contact"][active].clamp(0, 1) * 255).round().byte()
@@ -802,6 +953,7 @@ def run(cfg: RunMppiConfig) -> dict:
       "trunk_contact": bool(collided[b]),
       "fell_off": bool(fell_off[b]),
       "incident_severity": float(incident[b]),
+      "damage": float(hurt[b]),
       "min_clearance_m": float(np.nanmin(after_fault[b]))
       if np.isfinite(after_fault[b]).any()
       else None,
@@ -820,6 +972,7 @@ def run(cfg: RunMppiConfig) -> dict:
   }
   t_goal = t_reach.cpu().numpy()
   incident_np = incident.cpu().numpy()
+  hurt_np = hurt.cpu().numpy()
   with np.errstate(all="ignore"):
     min_clear = np.nanmin(np.where(np.isfinite(after_fault), after_fault, np.inf), 1)
   min_clear[~np.isfinite(min_clear)] = np.nan
@@ -837,6 +990,7 @@ def run(cfg: RunMppiConfig) -> dict:
       else None,
       "close_calls": float((min_clear[sel] < CLOSE_CALL_M).mean()),
       "mean_incident_severity": float(incident_np[sel].mean()),
+      "mean_damage": float(hurt_np[sel].mean()),
     }
   summary["plan_ms_mean"] = 1e3 * float(np.mean(plan_time)) if plan_time else None
 
@@ -861,7 +1015,7 @@ def run(cfg: RunMppiConfig) -> dict:
     map_every=np.array(every),
     **{f"explain_{k}": v for k, v in ex.items()},
     fault_aware=np.array(cfg.fault_aware),
-    risk_faults=np.array(planner.branch_names() if risk_log else []),
+    risk_faults=np.array(risk_names if risk_log else []),
     goal_w=command.goal_w.cpu().numpy(),
     waypoints_w=goal_term.waypoints.cpu().numpy(),
     fault_params=fault.params.cpu().numpy(),
@@ -873,7 +1027,17 @@ def run(cfg: RunMppiConfig) -> dict:
     step_dt=np.array(step_dt),
     start_s=np.array(cfg.start_s),
   )
-  result = {"config": asdict(cfg), "summary": summary, "trials": trials}
+  reasons = {c.param: c.reason for c in PROFILES[cfg.nav2_profile]}
+  changes = [
+    c | {"reason": reasons.get(c["param"], "command line")}
+    for c in changes_from_stock(cfg.nav2)
+  ]
+  result = {
+    "config": asdict(cfg),
+    "planner_changes": changes,
+    "summary": summary,
+    "trials": trials,
+  }
   (out_path.parent / f"{out_path.name}.json").write_text(json.dumps(result, indent=2))
   env.close()
   return result

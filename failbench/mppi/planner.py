@@ -269,7 +269,7 @@ class InflationCfg:
   still; 0 turns the term off."""
   severity_ref: float | None = None
   """Each severity level's margin is ``margin * severity / severity_ref``
-  (25, glass: crates 0.2x, walls 0.4x, people 2x); None: one margin for
+  (25, glass: crates 0.32x, walls 0.16x, people 2x); None: one margin for
   all."""
   speed_ref: float | None = None
   """The margin grows by ``1 + speed / speed_ref`` with the plan's

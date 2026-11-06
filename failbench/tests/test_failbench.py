@@ -1,5 +1,6 @@
 """Tests for the FailBench fault sampler, LiDAR visibility and dataset."""
 
+import itertools
 import json
 import math
 import os
@@ -52,8 +53,12 @@ from failbench.model.losses import (
   summarize_metrics,
 )
 from failbench.model.model import ImpactModel, ImpactModelCfg, rotate_xy
+from failbench.mppi.nav2 import Nav2MppiCfg
 from failbench.plans import PlanCfg, SegmentPlan
 from failbench.scene_course import (
+  CHOICE_COURSE,
+  CHOICE_COURSE_TERRAIN,
+  CHOICE_SWAP,
   CLUSTER_COURSE,
   CLUSTER_COURSE_TERRAIN,
   CLUSTER_SWAP,
@@ -61,13 +66,27 @@ from failbench.scene_course import (
   CLUTTER_SWAP,
   GAP_COURSE,
   GAP_SWAP,
+  LONE_HAZARD,
+  LONE_HAZARD_MIRROR,
+  LONE_HAZARD_SWAP,
+  LONE_HAZARD_TERRAIN,
   PASS_COURSE,
   PASS_SWAP,
 )
 from failbench.scripts.evaluate import EvalConfig, evaluate_split
-from failbench.scripts.run_mppi import _touched_severity
+from failbench.scripts.run_mppi import _global_route, _touched_worst
 from failbench.sensing import LidarCfg, sensor_poses, visible_cells
-from failbench.severity import DEFAULT_SEVERITY, SEVERITY, geom_severity
+from failbench.severity import (
+  DEFAULT_SEVERITY,
+  ENERGY_SCALE,
+  SEVERITY,
+  damage,
+  geom_severity,
+)
+from failbench.severity_course import (
+  SEVERITY_PERSON_ONE,
+  SEVERITY_PERSON_ONE_TERRAIN,
+)
 
 
 def get_test_device() -> str:
@@ -485,7 +504,30 @@ def test_a_touch_takes_the_severity_of_what_is_under_it_far_from_the_origin():
   contact = torch.zeros(1, 2, 3, device=dev)
   contact[0, :, :2] = base
   touch = torch.tensor([[True, False]], device=dev)
-  assert _touched_severity(touch, contact, rays, geom_sev).item() == 5.0  # type: ignore[arg-type]
+  got = _touched_worst(touch, contact, rays, geom_sev[None])  # type: ignore[arg-type]
+  assert got.item() == 5.0
+
+
+def test_a_touch_does_damage_by_its_energy_against_the_objects_scale():
+  rays = SimpleNamespace(
+    hit_pos_w=torch.zeros(1, 1, 3), hit_geom_id=torch.tensor([[0]])
+  )
+  touch = torch.tensor([[True]])
+  contact = torch.zeros(1, 1, 3)
+  person = torch.tensor([SEVERITY["person"]])
+  scale = torch.tensor([ENERGY_SCALE["person"]])
+  for energy, want in ((0.0, 0.0), (100.0, SEVERITY["person"])):
+    hit = damage(person[None], torch.tensor([[energy]]), scale[None])
+    got = _touched_worst(touch, contact, rays, hit)  # type: ignore[arg-type]
+    assert torch.isclose(got, torch.tensor([want])).all()
+
+
+def test_damage_saturates_at_the_severity_by_the_objects_energy_scale():
+  e = torch.tensor(2.0)
+  person = damage(SEVERITY["person"], e, ENERGY_SCALE["person"])
+  box = damage(SEVERITY["box"], e, ENERGY_SCALE["box"])
+  assert person > 0.8 * SEVERITY["person"]  # Any knock hurts.
+  assert box < 0.2 * SEVERITY["box"]  # Only a hard one breaks it.
 
 
 def test_geom_names_map_to_severity():
@@ -506,13 +548,16 @@ def test_geom_names_map_to_severity():
     (GAP_COURSE, GAP_SWAP),
     (PASS_COURSE, PASS_SWAP),
     (CLUTTER_FIELD, CLUTTER_SWAP),
+    (CHOICE_COURSE, CHOICE_SWAP),
   ],
 )
 def test_scenes_keep_the_line_clear_and_their_twins_swap_glass_for_crates(scene, twin):
   def build(cfg, difficulty):
     spec = mujoco.MjSpec()
     spec.worldbody.add_body(name="terrain")
-    cfg = replace(cfg, size=CLUSTER_COURSE_TERRAIN.size)
+    long = isinstance(cfg, type(CHOICE_COURSE))
+    tile = CHOICE_COURSE_TERRAIN if long else CLUSTER_COURSE_TERRAIN
+    cfg = replace(cfg, size=tile.size)
     out = cfg.function(difficulty, spec, np.random.default_rng(0))
     model = spec.compile()
     data = mujoco.MjData(model)
@@ -539,6 +584,81 @@ def test_scenes_keep_the_line_clear_and_their_twins_swap_glass_for_crates(scene,
       assert len(glass) and len(boxes)
       gap = np.linalg.norm(glass[:, None] - boxes[None], axis=-1).min(1)
       assert (gap < 0.3).all()
+
+
+def test_each_choice_gate_has_glass_on_the_side_the_last_one_had_crates():
+  spec = mujoco.MjSpec()
+  spec.worldbody.add_body(name="terrain")
+  cfg = replace(CHOICE_COURSE, size=CHOICE_COURSE_TERRAIN.size)
+  out = cfg.function(0.0, spec, np.random.default_rng(0))
+  model = spec.compile()
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  names = [model.geom(i).name.split("_")[1] for i in range(model.ngeom)]
+  pos = data.geom_xpos[:, :2] - out.origin[:2]
+  sides = []
+  for x, _ in cfg.gates:
+    at = [(n, y) for n, (gx, y) in zip(names, pos, strict=True) if abs(gx - x) < 0.6]
+    glass = np.sign(np.mean([y for n, y in at if n == "glass"]))
+    crates = np.sign(np.mean([y for n, y in at if n == "box"]))
+    assert glass == -crates  # Facing each other across the line.
+    sides.append(glass)
+  assert len(sides) >= 2
+  assert all(a == -b for a, b in itertools.pairwise(sides))
+
+
+def test_the_lone_hazard_is_one_object_off_the_line_with_open_floor_opposite():
+  def objects(cfg, difficulty):
+    spec = mujoco.MjSpec()
+    spec.worldbody.add_body(name="terrain")
+    cfg = replace(cfg, size=LONE_HAZARD_TERRAIN.size)
+    out = cfg.function(difficulty, spec, np.random.default_rng(0))
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    names = [model.geom(i).name.split("_")[1] for i in range(model.ngeom)]
+    pos = data.geom_xpos[:, :2] - out.origin[:2]
+    keep = [n not in ("floor", "wall") for n in names]
+    return (
+      {n for n, k in zip(names, keep, strict=True) if k},
+      pos[keep],
+      (model.geom_size[keep, :2]),
+    )
+
+  for cfg, cls, side in (
+    (LONE_HAZARD, "glass", 1),
+    (LONE_HAZARD_MIRROR, "glass", -1),
+    (LONE_HAZARD_SWAP, "box", 1),
+  ):
+    faces = []
+    for difficulty in (0.0, 1.0):
+      names, pos, size = objects(cfg, difficulty)
+      assert names == {cls}
+      assert (np.sign(pos[:, 1]) == side).all()
+      faces.append((np.abs(pos[:, 1]) - size[:, 1]).min())
+    # A robot-wide strip (0.31 m) along the line stays clear, and the face
+    # closes in on the line down the rows.
+    assert faces[1] > 0.155
+    assert faces[1] < faces[0]
+
+
+def test_the_global_route_goes_round_a_block_on_the_line():
+  cells = 121  # 6 m at 0.05 m.
+  height = torch.zeros(1, cells, cells)
+  c = (cells - 1) // 2
+  height[0, c - 6 : c + 7, c + 30 : c + 43] = 0.6  # [row = y, col = x].
+  pose = torch.tensor([[5.0, -2.0, math.pi / 2]])  # Facing world +y.
+  goal = torch.tensor([[2.5, 0.0]])  # Robot frame, straight ahead.
+  path, real = _global_route(height, goal, pose, Nav2MppiCfg(), None)
+  pts = path[0, : int(real[0])]
+  side = -(pts[:, 0] - pose[0, 0])  # Robot frame y.
+  assert side.abs().max() > 0.4  # Round the block, not through it.
+  assert torch.allclose(pts[-1], torch.tensor([5.0, 0.5]), atol=0.06)
+  # A goal beyond the map is pulled in to it.
+  far, real = _global_route(
+    height, torch.tensor([[9.0, 0.0]]), pose, Nav2MppiCfg(), None
+  )
+  assert far[0, : int(real[0]), 1].max() - pose[0, 1] < 3.0
 
 
 def test_clutter_fields_differ_per_tile_and_keep_their_corridor():
@@ -705,7 +825,7 @@ def test_the_latent_head_starts_at_the_scale_of_its_target():
   assert terms["latent"] < 10
 
 
-def test_the_held_out_faults_go_to_test_fault_on_every_terrain_seed():
+def test_named_held_out_faults_go_to_test_fault_on_every_terrain_seed():
   joints = [
     f"{leg}_{p}_joint"
     for leg in ("FL", "FR", "RL", "RR")
@@ -725,10 +845,24 @@ def test_the_held_out_faults_go_to_test_fault_on_every_terrain_seed():
     j = joints.index(joint)
     family[i] = FaultFamily[fam]
     params[i, j] = (1.0, 1.0) if fam == "LOCK" else (0.0, 0.0)
-  cfg = BuildConfig(raw=(), output_dir="")
+  held_out = ("RL_calf_joint:LOCK", "FL_calf_joint:LOCK")
+  held_out += ("FR_thigh_joint:WEAK", "RR_hip_joint:WEAK")
+  cfg = BuildConfig(raw=(), output_dir="", held_out=held_out)
   for seed in (2, 10, 11):  # train, test_terrain and val seeds
     split = _split(seed, family, params, joints, cfg)
     assert [s == 3 for s in split] == [held for *_, held in cases]
+  # By default every fault trains; only terrain seeds are held out.
+  default = BuildConfig(raw=(), output_dir="")
+  assert _split(2, family, params, joints, default).tolist() == [0] * len(cases)
+  assert _split(10, family, params, joints, default).tolist() == [2] * len(cases)
+
+
+def test_a_dataset_can_read_several_splits_at_once(tmp_path):
+  healthy = encode_fault(torch.tensor(NOMINAL).repeat(12, 1))
+  _fault_shard(tmp_path, [healthy] * 4, split=[0, 3, 1, 2])
+  both = FailBenchDataset(tmp_path, ("train", "test_fault"), "clean", contacts=False)
+  assert both.index[:, 1].tolist() == [0, 1]
+  assert len(FailBenchDataset(tmp_path, "val", "clean", contacts=False)) == 1
 
 
 def test_priced_faults_draw_only_the_named_pairs():
@@ -930,8 +1064,11 @@ def test_beta_nll_keeps_the_mean_learning_where_the_spread_is_wide():
   assert abs(grads(0.0, 0.5)[1]) < 1e-6
 
 
-def _fault_shard(tmp_path, faults: list[torch.Tensor], name: str = "s0") -> None:
-  """A shard of ``len(faults)`` 30-step train samples with these faults."""
+def _fault_shard(
+  tmp_path, faults: list[torch.Tensor], name: str = "s0", split=None
+) -> None:
+  """A shard of ``len(faults)`` 30-step samples with these faults, all train
+  unless ``split`` gives each one's split code."""
   shard = tmp_path / name
   shard.mkdir()
   n, nb, cells = len(faults), 30, 64
@@ -952,7 +1089,7 @@ def _fault_shard(tmp_path, faults: list[torch.Tensor], name: str = "s0") -> None
     "fault_family": np.zeros(n, np.uint8),
     "plan_hold": np.zeros(n, bool),
     "offset_s": np.zeros(n, np.float32),
-    "split": np.zeros(n, np.uint8),
+    "split": np.zeros(n, np.uint8) if split is None else np.array(split, np.uint8),
     "fallen_at_start": np.zeros(n, bool),
     "map_clean": np.full((n, cells, cells), -0.3, np.float16),
   }
@@ -1021,3 +1158,23 @@ def test_evaluation_reports_each_faults_direction_per_joint():
   assert {"pred_y_3s", "explained_y_3s", "explained_x_3s", "cover2s_3s"} <= set(hip)
   # The untrained model misses the throw: it explains none of it.
   assert hip["explained_y_3s"] < 0.5
+
+
+def test_the_lone_person_is_one_object_beside_the_route():
+  spec = mujoco.MjSpec()
+  spec.worldbody.add_body(name="terrain")
+  scene = replace(SEVERITY_PERSON_ONE, size=SEVERITY_PERSON_ONE_TERRAIN.size)
+  out = scene.function(1.0, spec, np.random.default_rng(0))
+  geoms = [g.geom for g in out.geometries if g.geom is not None]
+  people = [g for g in geoms if "person" in g.name]
+  assert len(people) == 1
+  (x, y, _), origin = people[0].pos, out.origin
+  lo, hi = SEVERITY_PERSON_ONE.panel_x  # type: ignore[misc]
+  assert lo < x - origin[0] < hi  # Partway along, open floor before and after.
+  assert y < origin[1]  # On the right.
+
+
+def test_every_evaluation_scene_has_a_goal_mode():
+  from failbench.env_cfg import GOAL_MODES, WAYPOINT_TERRAINS
+
+  assert set(WAYPOINT_TERRAINS) <= set(GOAL_MODES)

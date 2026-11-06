@@ -52,6 +52,9 @@ class SeverityCourseTerrainCfg(SubTerrainCfg):
   """Panels along x, a 0.1 m gap between them (each its own geom)."""
   panel_thickness: float = 0.3
   panel_height: float = 0.5
+  panel_x: tuple[float, float] | None = None
+  """The stretch (m along the route from the spawn) the panels cover, as one
+  object each side; None: the whole corridor, as a row."""
   floor_depth: float = 1.0
 
   def function(
@@ -81,8 +84,13 @@ class SeverityCourseTerrainCfg(SubTerrainCfg):
     box("floor", 0, length, 0, width, -self.floor_depth, 0, FLOOR_RGBA)
     t, z1 = self.panel_thickness, self.panel_height
     pitch = self.panel_length + 0.1
-    for x0 in np.arange(0.0, x_end, pitch):
-      x1 = min(x0 + self.panel_length, x_end)
+    if self.panel_x is None:
+      spans = [
+        (x0, min(x0 + self.panel_length, x_end)) for x0 in np.arange(0.0, x_end, pitch)
+      ]
+    else:
+      spans = [(self.spawn_x + self.panel_x[0], self.spawn_x + self.panel_x[1])]
+    for x0, x1 in spans:
       for cls, y0, y1 in (
         (self.classes[0], yc + side, yc + side + t),
         (self.classes[1], yc - side - t, yc - side),
@@ -130,6 +138,12 @@ SEVERITY_PERSON_SIDE = replace(
 )
 """People close on the right, open floor on the left: room to give."""
 SEVERITY_PERSON_SIDE_TERRAIN = _terrain(SEVERITY_PERSON_SIDE)
-"""The severity ladder: boxes (5) against a wall (10), glass (25) or a
+SEVERITY_PERSON_ONE = replace(SEVERITY_PERSON_SIDE, panel_x=(4.75, 5.25))
+"""One person just right of the route halfway, open floor all round: the
+robot can give room and come back. A block as low as the other panels: the
+lidar model sees a cell only by its top, so a person-height block would stay
+unknown to the planner."""
+SEVERITY_PERSON_ONE_TERRAIN = _terrain(SEVERITY_PERSON_ONE)
+"""The severity ladder: boxes (8) against a wall (4), glass (25) or a
 person (50) at the same places, for the sideways offset against what the
 far row is."""

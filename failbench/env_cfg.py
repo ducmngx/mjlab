@@ -33,9 +33,18 @@ from failbench.door_course import DOOR_COURSE, DOOR_COURSE_TERRAIN, door_waypoin
 from failbench.driver import PlannerDriveCfg
 from failbench.faults import FAULT_TERM, FaultMixture, inject_kinodynamic_fault
 from failbench.goals import GoalMode, sample_goal
+from failbench.house_terrain import HOUSE_TERRAINS, house_terrain, route_table
 from failbench.l_course import L_CORRIDOR, L_COURSE_TERRAIN, corridor_waypoints
 from failbench.plans import PlanCfg
 from failbench.scene_course import (
+  CHOICE_COURSE,
+  CHOICE_COURSE_TERRAIN,
+  CHOICE_NARROW,
+  CHOICE_NARROW_SWAP,
+  CHOICE_NARROW_SWAP_TERRAIN,
+  CHOICE_NARROW_TERRAIN,
+  CHOICE_SWAP,
+  CHOICE_SWAP_TERRAIN,
   CLUSTER_COURSE,
   CLUSTER_COURSE_TERRAIN,
   CLUSTER_SWAP,
@@ -48,6 +57,12 @@ from failbench.scene_course import (
   GAP_COURSE_TERRAIN,
   GAP_SWAP,
   GAP_SWAP_TERRAIN,
+  LONE_HAZARD,
+  LONE_HAZARD_MIRROR,
+  LONE_HAZARD_MIRROR_TERRAIN,
+  LONE_HAZARD_SWAP,
+  LONE_HAZARD_SWAP_TERRAIN,
+  LONE_HAZARD_TERRAIN,
   PASS_COURSE,
   PASS_COURSE_TERRAIN,
   PASS_SWAP,
@@ -58,6 +73,8 @@ from failbench.severity_course import (
   SEVERITY_COURSE,
   SEVERITY_COURSE_TERRAIN,
   SEVERITY_PERSON,
+  SEVERITY_PERSON_ONE,
+  SEVERITY_PERSON_ONE_TERRAIN,
   SEVERITY_PERSON_SIDE,
   SEVERITY_PERSON_SIDE_TERRAIN,
   SEVERITY_PERSON_SWAP,
@@ -135,6 +152,7 @@ GOAL_MODES: dict[str, GoalMode] = {
   "severity_person": "waypoints",
   "severity_person_swap": "waypoints",
   "severity_person_side": "waypoints",
+  "severity_person_one": "waypoints",
   "cluster": "waypoints",
   "cluster_swap": "waypoints",
   "gap": "waypoints",
@@ -143,6 +161,14 @@ GOAL_MODES: dict[str, GoalMode] = {
   "pass_swap": "waypoints",
   "clutter": "waypoints",
   "clutter_swap": "waypoints",
+  "choice": "waypoints",
+  "choice_swap": "waypoints",
+  "choice_narrow": "waypoints",
+  "choice_narrow_swap": "waypoints",
+  "lone": "waypoints",
+  "lone_mirror": "waypoints",
+  "lone_swap": "waypoints",
+  **dict.fromkeys(HOUSE_TERRAINS, "route"),
 }
 WAYPOINT_TERRAINS = {
   "l_course": (L_COURSE_TERRAIN, corridor_waypoints(L_CORRIDOR)),
@@ -164,6 +190,10 @@ WAYPOINT_TERRAINS = {
     SEVERITY_PERSON_SIDE_TERRAIN,
     severity_waypoints(SEVERITY_PERSON_SIDE),
   ),
+  "severity_person_one": (
+    SEVERITY_PERSON_ONE_TERRAIN,
+    severity_waypoints(SEVERITY_PERSON_ONE),
+  ),
   "cluster": (CLUSTER_COURSE_TERRAIN, scene_waypoints(CLUSTER_COURSE)),
   "cluster_swap": (CLUSTER_SWAP_TERRAIN, scene_waypoints(CLUSTER_SWAP)),
   "gap": (GAP_COURSE_TERRAIN, scene_waypoints(GAP_COURSE)),
@@ -172,6 +202,16 @@ WAYPOINT_TERRAINS = {
   "pass_swap": (PASS_SWAP_TERRAIN, scene_waypoints(PASS_SWAP)),
   "clutter": (CLUTTER_FIELD_TERRAIN, scene_waypoints(CLUTTER_FIELD)),
   "clutter_swap": (CLUTTER_SWAP_TERRAIN, scene_waypoints(CLUTTER_SWAP)),
+  "choice": (CHOICE_COURSE_TERRAIN, scene_waypoints(CHOICE_COURSE)),
+  "choice_swap": (CHOICE_SWAP_TERRAIN, scene_waypoints(CHOICE_SWAP)),
+  "choice_narrow": (CHOICE_NARROW_TERRAIN, scene_waypoints(CHOICE_NARROW)),
+  "choice_narrow_swap": (
+    CHOICE_NARROW_SWAP_TERRAIN,
+    scene_waypoints(CHOICE_NARROW_SWAP),
+  ),
+  "lone": (LONE_HAZARD_TERRAIN, scene_waypoints(LONE_HAZARD)),
+  "lone_mirror": (LONE_HAZARD_MIRROR_TERRAIN, scene_waypoints(LONE_HAZARD_MIRROR)),
+  "lone_swap": (LONE_HAZARD_SWAP_TERRAIN, scene_waypoints(LONE_HAZARD_SWAP)),
 }
 """Evaluation scenes (no data is generated on them): the generator and the
 waypoints relative to the spawn, the last one the goal."""
@@ -235,6 +275,16 @@ def failbench_env_cfg(
     cfg.scene.terrain.terrain_generator = gen
     cfg.scene.terrain.max_init_terrain_level = None
     cfg.events["reset_base"].params["pose_range"] = dict(COURSE_SPAWN_POSE_RANGE)
+  elif terrain in HOUSE_TERRAINS:
+    # One tile, every robot on it at its route's start (``sample_goal``).
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_generator = house_terrain(HOUSE_TERRAINS[terrain])
+    cfg.scene.terrain.max_init_terrain_level = None
+    cfg.events["reset_base"].params["pose_range"] = {
+      **dict(COURSE_SPAWN_POSE_RANGE),
+      "x": (0.0, 0.0),
+      "y": (0.0, 0.0),
+    }
   elif terrain in TALL_STAIR_TERRAINS:
     # As use_fault_terrain: fresh layout per seed, spawns on every row.
     assert cfg.scene.terrain is not None
@@ -272,6 +322,11 @@ def failbench_env_cfg(
         if terrain in WAYPOINT_TERRAINS
         else {}
       ),
+      **(
+        {"routes": route_table(HOUSE_TERRAINS[terrain])[0].tolist()}
+        if terrain in HOUSE_TERRAINS
+        else {}
+      ),
     },
   )
   fault_params: dict = {
@@ -305,6 +360,10 @@ def failbench_env_cfg(
     # Course lanes run along +x through the goal at the lane end.
     lane_heading=0.0 if GOAL_MODES[terrain] == "lane" else None,
   )
+  if terrain in HOUSE_TERRAINS:
+    # On the household routes the straight line to the goal runs through
+    # furniture: stand until the runner's planner takes over.
+    cfg.commands["twist"].warmup_s = 1e9
 
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (
     fault_contact_sensor_cfg(),

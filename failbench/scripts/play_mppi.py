@@ -23,9 +23,18 @@ joint angles. Drawn into the scene:
   along the plan (one colour per fault, warm = limp, cool = seized; the
   ``risk_fire`` point drawn bold with its 2 sigma ring), and a panel with
   each fault's share of the plan's fault risk and P(fall) once fired.
+- with the risk critic (``run_mppi.py --risk-critic``), while the robot is
+  healthy: where each imagined fault would throw the plan if it fired now
+  (orange = limp, blue = seized, green = weak), the three that cost most
+  drawn bold with a 1 sigma ring at the end, and a panel of the eight
+  largest shares of the plan's risk.
 
 The caption gives the time, the fault, the command, the plan's predicted
 drift at 5 s, P(fall in 5 s), highest P(trunk contact) and cost terms.
+Predictions a log doesn't have aren't drawn: Nav2 runs log the plan itself
+(no predicted path, ghost trunk or spread rings), and models without fall
+or contact heads (since 2026-11-02) show no P(fall), P(contact) or contact
+cells.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import imageio.v2 as imageio
 import mujoco
@@ -74,6 +84,10 @@ class PlayMppiConfig:
   risk_fire: int = 1
   """Firing point (index along the route, ``fire_step_m`` apart, or into
   ``fire_m`` / ``fire_s``) whose throws are drawn bold."""
+  lighting: Literal["soft", "bright"] = "soft"
+  """``soft``: a dim headlight and one angled sun that casts shadows, so
+  floors aren't washed out; ``bright``: the scene's own lights (a strong
+  headlight and overhead suns)."""
   device: str = "cpu"
 
 
@@ -82,10 +96,38 @@ _LIMP = ((0.95, 0.3, 0.1), (1.0, 0.65, 0.0), (0.85, 0.1, 0.45), (0.95, 0.85, 0.2
 _SEIZED = ((0.1, 0.45, 0.95), (0.0, 0.75, 0.75), (0.45, 0.3, 0.95), (0.3, 0.8, 0.3))
 
 
+_WEAK = (0.3, 0.75, 0.3)
+
+
+def _soft_lighting(model: mujoco.MjModel) -> None:
+  """Render-only lighting: a dim headlight, the first directional light
+  angled from the side with soft shadows, the others off."""
+  model.vis.headlight.ambient[:] = 0.28
+  model.vis.headlight.diffuse[:] = 0.22
+  model.vis.headlight.specular[:] = 0.0
+  sun = np.array([0.35, 0.25, -0.9])
+  for i in range(model.nlight):
+    on = i == 0
+    model.light_dir[i] = sun / np.linalg.norm(sun)
+    model.light_diffuse[i] = 0.62 if on else 0.0
+    model.light_ambient[i] = 0.0
+    model.light_specular[i] = 0.08 if on else 0.0
+    model.light_castshadow[i] = on
+
+
+def _kind(name: str) -> str:
+  """``limp``, ``lock`` or ``weak`` from a fault name ``<joint>:<mode>``."""
+  mode = name.split(":")[1]
+  return "limp" if mode in ("free", "limp") else mode
+
+
 def _branch_colours(names: list[str]) -> list[tuple[float, float, float]]:
+  if len(names) > 12:  # The risk critic's faults: one colour per kind.
+    one = {"limp": _LIMP[0], "lock": _SEIZED[0], "weak": _WEAK}
+    return [one[_kind(n)] for n in names]
   limp = iter(_LIMP * 3)
   seized = iter(_SEIZED * 3)
-  return [next(limp) if n.endswith(":free") else next(seized) for n in names]
+  return [next(limp) if _kind(n) == "limp" else next(seized) for n in names]
 
 
 def main():
@@ -157,7 +199,17 @@ def main():
   cam.distance = cfg.distance
   cam.elevation = cfg.elevation_deg
   cam.azimuth = math.degrees(_yaw(quat[0])) + cfg.azimuth_offset_deg
+  if cfg.lighting == "soft":
+    _soft_lighting(model)
   renderer = mujoco.Renderer(model, h, w)
+  # What the log's model predicted for the executed plan: Nav2 runs log the
+  # plan itself (no drift), and models since 2026-11-02 have no fall or
+  # contact heads (their outputs are zeros); draw only what was predicted.
+  predicted = not np.allclose(cyc["pred_w"], cyc["path_w"], equal_nan=True)
+  heads = bool(
+    np.nan_to_num(cyc["pred_p_fallen"]).any()
+    or np.nan_to_num(cyc["pred_p_collision"]).any()
+  )
   lookat = pos[0].copy()
   frames = []
   # Planning cycles that ran, and the latest one at or before each step.
@@ -202,7 +254,7 @@ def main():
     if planned:
       z = ground + 0.05
       risk = np.maximum(cyc["pred_p_fallen"][c], cyc["pred_p_collision"][c])
-      for key in ("path_w", "pred_w"):
+      for key in ("path_w", "pred_w") if predicted else ("path_w",):
         pts = np.concatenate([pos[t : t + 1, :2], cyc[key][c]], axis=0)
         pts = np.concatenate([pts, np.full((len(pts), 1), z)], -1)
         for i, (a, e) in enumerate(zip(pts[:-1], pts[1:], strict=True)):
@@ -218,14 +270,15 @@ def main():
       end, yaw_end = cyc["pred_w"][c, -1], float(cyc["pred_yaw_w"][c, -1])
       cy, sy = math.cos(yaw_end), math.sin(yaw_end)
       rot = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
-      _add(
-        scene,
-        mujoco.mjtGeom.mjGEOM_BOX,
-        (0.35, 0.15, 0.06),
-        (end[0], end[1], cyc["origin_w"][c, 2]),
-        (1.0, 0.6, 0.0, 0.35),
-        rot,
-      )
+      if predicted:
+        _add(
+          scene,
+          mujoco.mjtGeom.mjGEOM_BOX,
+          (0.35, 0.15, 0.06),
+          (end[0], end[1], cyc["origin_w"][c, 2]),
+          (1.0, 0.6, 0.0, 0.35),
+          rot,
+        )
       # A fault-blind planner's plan as the model predicts it given the
       # true fault: path and ghost trunk in purple.
       blind = "true_pred_w" in cyc and not np.allclose(
@@ -253,7 +306,7 @@ def main():
           trot,
         )
       # Predicted body contact over the next 5 s.
-      if contact_prob is not None and contact_height is not None:
+      if heads and contact_prob is not None and contact_height is not None:
         p = contact_prob[c].max(axis=0) / 255.0
         hgt = contact_height[c].astype(np.float32)
         iy, ix = np.nonzero((p >= cfg.contact_min) & ~np.isnan(hgt))
@@ -275,7 +328,7 @@ def main():
             ),
             (0.85, 0.1, 0.85, 0.2 + 0.7 * q),
           )
-      for s in range(9, len(cyc["pred_w"][c]), 10):
+      for s in range(9, len(cyc["pred_w"][c]), 10) if predicted else ():
         r = 2 * float(np.linalg.norm(cyc["pred_std"][c, s, :2]))
         p = cyc["pred_w"][c, s]
         _add(
@@ -288,22 +341,25 @@ def main():
     risky = (
       planned
       and risk_names
-      and not dense["faulted"][t]
+      and not (dense["faulted"][t] and joint >= 0)  # A nominal "fault" is none.
       and not np.isnan(float(cyc["risk_branch"][c, 0]))
     )
     if risky:
       z = ground + 0.06
       thrown = cyc["risk_thrown_w"][c].astype(np.float32)  # [F, B, Tp, 2]
+      now = thrown.shape[0] == 1  # The risk critic: each fault fired now.
+      top = set(np.argsort(-cyc["risk_branch"][c].astype(np.float32))[:3].tolist())
       for f in range(thrown.shape[0]):
-        bold = f == cfg.risk_fire
         for i, rgb in enumerate(risk_rgb):
+          bold = i in top if now else f == cfg.risk_fire
           pts = thrown[f, i]
           pts = np.concatenate([pts, np.full((len(pts), 1), z)], -1)
           rgba = (*rgb, 0.95 if bold else 0.3)
           for a, e in zip(pts[:-1:2], pts[2::2], strict=False):
             _line(scene, a, e, 0.012 if bold else 0.005, rgba)
           if bold:
-            r = 2 * float(cyc["risk_thrown_std"][c, f, i, -1])
+            # The critic's: 1 sigma (its limp spreads are metres wide).
+            r = (1 if now else 2) * float(cyc["risk_thrown_std"][c, f, i, -1])
             _add(
               scene,
               mujoco.mjtGeom.mjGEOM_CYLINDER,
@@ -334,7 +390,7 @@ def main():
       when,
       f"cmd  vx {cmd[0]:+.2f}  vy {cmd[1]:+.2f}  wz {cmd[2]:+.2f}",
     ]
-    if planned:
+    if planned and predicted:
       d = cyc["drift_end"][c]
       lines.append(
         f"predicted drift at 5 s: dx {d[0]:+.2f} dy {d[1]:+.2f} m"
@@ -343,13 +399,15 @@ def main():
       if blind:
         dt_ = cyc["true_pred_w"][c, -1] - cyc["path_w"][c, -1]
         lines.append(
-          f"with the true fault (purple): drift {np.hypot(*dt_):.2f} m,"
-          f" P(fall in 5 s) {cyc['true_p_fallen'][c]:.2f}"
+          f"with the true fault (purple): drift {np.hypot(*dt_):.2f} m"
+          + (f", P(fall in 5 s) {cyc['true_p_fallen'][c]:.2f}" if heads else "")
         )
-      lines.append(
-        f"P(fall in 5 s) {cyc['p_fallen'][c]:.2f}, highest P(trunk contact)"
-        f" {np.nanmax(cyc['pred_p_collision'][c]):.2f}"
-      )
+      if heads:
+        lines.append(
+          f"P(fall in 5 s) {cyc['p_fallen'][c]:.2f}, highest P(trunk contact)"
+          f" {np.nanmax(cyc['pred_p_collision'][c]):.2f}"
+        )
+    if planned:
       costs = [
         f"{k[5:]} {cyc[k][c]:.2f}"
         for k in cyc
@@ -369,25 +427,27 @@ def main():
       draw.text((16, 14 + 18 * i), line, fill=fill)
     if risky:
       share = cyc["risk_branch"][c].astype(np.float32)
-      fall = cyc["risk_p_fall"][c, cfg.risk_fire].astype(np.float32)
+      now = cyc["risk_thrown_w"].shape[1] == 1
+      fall = cyc["risk_p_fall"][c, 0 if now else cfg.risk_fire].astype(np.float32)
+      rows = np.argsort(-share)[:8] if now else np.arange(len(risk_names))
       x0, y0 = w - 350, 8
-      draw.rectangle((x0, y0, w - 8, y0 + 34 + 18 * len(risk_names)), fill=(0, 0, 0))
+      draw.rectangle((x0, y0, w - 8, y0 + 34 + 18 * len(rows)), fill=(0, 0, 0))
       fire = cfg_fire[cfg.risk_fire] if cfg.risk_fire < len(cfg_fire) else 0
-      draw.text(
-        (x0 + 8, y0 + 6),
-        f"fault risk {share.sum():.2f} (bold: fired at {fire:g} {fire_unit})",
-        fill=(255, 255, 255),
+      title = (
+        f"fault risk {share.sum():.2f}: {len(share)} faults now, top 8"
+        if now
+        else f"fault risk {share.sum():.2f} (bold: fired at {fire:g} {fire_unit})"
       )
+      draw.text((x0 + 8, y0 + 6), title, fill=(255, 255, 255))
       top = max(float(share.max()), 1e-6)
-      for i, (name, rgb) in enumerate(zip(risk_names, risk_rgb, strict=True)):
-        y = y0 + 26 + 18 * i
+      for row, i in enumerate(rows.tolist()):
+        name, rgb = risk_names[i], risk_rgb[i]
+        y = y0 + 26 + 18 * row
         col = tuple(round(255 * v) for v in rgb)
         draw.rectangle((x0 + 8, y + 3, x0 + 18, y + 13), fill=col)
-        joint_, mode = name.split(":")
-        label = (
-          f"{joint_.removesuffix('_joint')} {'limp' if mode == 'free' else 'lock'}"
-        )
-        draw.text((x0 + 24, y), f"{label:13} P(fall) {fall[i]:.2f}", fill=col)
+        label = f"{name.split(':')[0].removesuffix('_joint')} {_kind(name)}"
+        tail = "" if now else f" P(fall) {fall[i]:.2f}"
+        draw.text((x0 + 24, y), f"{label:13}{tail}", fill=col)
         bar = round(70 * float(share[i]) / top)
         draw.rectangle((x0 + 232, y + 3, x0 + 232 + bar, y + 13), fill=col)
         draw.text((x0 + 236 + bar, y), f"{share[i]:.2f}", fill=(220, 220, 220))

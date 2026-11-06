@@ -16,6 +16,11 @@ env's goal (``goal_w``) by terrain kind (``GoalMode``):
   one; ``advance`` moves on once the robot is within a radius of it or has
   passed it, and ``final`` says whether the current one is the last.
 
+- ``route`` (the household layouts, ``failbench/house_terrain.py``): robot
+  ``i`` takes route ``i % len(routes)``; it is placed at the route's start
+  (raised by the ground there), facing along its global path, and its goal
+  is the route's end.
+
 For ``pyramid`` and ``free`` the robot is turned to face its goal; on the
 course it keeps the lane-facing spawn jitter.
 
@@ -36,7 +41,7 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.managers.event_manager import EventTermCfg
 
-GoalMode = Literal["pyramid", "free", "lane", "waypoints"]
+GoalMode = Literal["pyramid", "free", "lane", "waypoints", "route"]
 
 
 class sample_goal:
@@ -83,6 +88,7 @@ class sample_goal:
     free_goal_distance: float = 5.0,
     lane_goal_x: float = 13.0,
     waypoints: list | None = None,
+    routes: list | None = None,
     asset_cfg: SceneEntityCfg | None = None,
   ) -> None:
     del asset_cfg
@@ -103,6 +109,22 @@ class sample_goal:
       self.waypoints[env_ids] = wp
       self.index[env_ids] = 0
       self.goal_w[env_ids] = wp[:, 0]
+      return
+    if mode == "route":
+      assert routes is not None
+      table = torch.tensor(routes, dtype=torch.float32, device=dev)  # [R, 6]
+      row = table[env_ids % len(table)]
+      goal[:, :2] += row[:, 4:6]
+      self.goal_w[env_ids] = goal
+      self.waypoints[env_ids] = goal[:, None]
+      xyz = torch.cat([origin[:, :2] + row[:, :2], pose[:, 2:3] + row[:, 3:4]], dim=-1)
+      self.start[env_ids] = torch.cat([xyz[:, :2], origin[:, 2:]], dim=-1)
+      yaw = row[:, 2]
+      zero = torch.zeros_like(yaw)
+      quat = torch.stack([torch.cos(yaw / 2), zero, zero, torch.sin(yaw / 2)], dim=-1)
+      self._asset.write_root_link_pose_to_sim(
+        torch.cat([xyz, quat], dim=-1), env_ids=env_ids
+      )
       return
     if mode == "lane":
       goal[:, 0] += lane_goal_x

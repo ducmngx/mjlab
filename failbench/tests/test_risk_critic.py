@@ -19,6 +19,7 @@ from failbench.mppi.risk_critic import (
   blank_obstacles,
   imagined_faults,
 )
+from failbench.severity import SEVERITY
 from failbench.tests.test_mppi import _Thrown
 from failbench.tests.test_nav2 import RES, _local_heights
 
@@ -57,9 +58,11 @@ def test_the_imagined_faults_carry_the_evaluation_mixtures_odds():
 def test_a_candidate_in_the_open_costs_nothing():
   h = _local_heights([], torch.zeros(1, 3))
   critic = RiskCritic(RiskCriticCfg(), _Thrown())
-  cost = critic(_data(h, torch.full_like(h, 25.0), _walk(1.0)))
+  data = _data(h, torch.full_like(h, 25.0), _walk(1.0))
+  cost = critic(data)
   assert cost.shape == (1, 1)
   assert cost.item() == 0.0
+  assert (critic.throws(_walk(1.0)[:, 0], data)["cost"] == 0).all()
 
 
 def test_a_throw_costs_more_beside_worse_objects_and_at_speed():
@@ -67,11 +70,75 @@ def test_a_throw_costs_more_beside_worse_objects_and_at_speed():
   h = _local_heights([(0.5, 3.0, -0.9, -0.6)], torch.zeros(1, 3))
   critic = RiskCritic(RiskCriticCfg(), _Thrown(side=-1.0))
   walk = _walk(torch.tensor([0.6, 1.0]).view(1, 2, 1), k=2)
-  box = critic(_data(h, torch.full_like(h, 5.0), walk))
-  glass = critic(_data(h, torch.full_like(h, 25.0), walk))
+  box = critic(_data(h, torch.full_like(h, SEVERITY["box"]), walk))
+  person = critic(_data(h, torch.full_like(h, SEVERITY["person"]), walk))
   assert (box > 0).all()
-  assert torch.allclose(glass, 5 * box)
-  assert glass[0, 1] > glass[0, 0]  # Kinetic energy at the hit.
+  assert (person > box).all()
+  assert (person[0, 1] > person[0, 0]) & (box[0, 1] > box[0, 0])  # Energy.
+  # A person is hurt by any knock, a box only by a hard one: speed matters
+  # less beside the person, so there keeping away does more than slowing.
+  assert person[0, 1] / person[0, 0] < 0.9 * box[0, 1] / box[0, 0]
+
+
+def test_the_throws_shown_are_the_ones_the_critic_prices():
+  # A panel right of the line; faults on even joints throw the robot right.
+  h = _local_heights([(0.5, 3.0, -0.9, -0.6)], torch.zeros(1, 3))
+  critic = RiskCritic(RiskCriticCfg(), _Thrown(side=-1.0))
+  walk = _walk(1.0)
+  data = _data(h, torch.full_like(h, SEVERITY["person"]), walk)
+  shown = critic.throws(walk[:, 0], data)
+  params, _ = imagined_faults(RiskCriticCfg(), 12)
+  assert shown["pose"].shape == (1, len(params), 30, 3)
+  assert len(shown["names"]) == len(params)
+  assert torch.allclose(shown["cost"].sum(-1), critic(data)[:, 0])
+  # Each fault's throw: an even joint 0.8 m right by the end, as the model.
+  even = shown["names"].index("FL_hip_joint:limp")
+  assert torch.isclose(shown["pose"][0, even, -1, 1], torch.tensor(-0.8))
+
+
+def test_the_throws_report_each_faults_touch_chance_and_damage_at_any_weight():
+  # Panel on the right; side=+1: even joints throw right into it, odd left.
+  h = _local_heights([(0.5, 3.0, -0.9, -0.6)], torch.zeros(1, 3))
+  critic = RiskCritic(RiskCriticCfg(weight=0.0), _Thrown(side=1.0))
+  walk = _walk(1.0)
+  shown = critic.throws(walk[:, 0], _data(h, torch.full_like(h, 25.0), walk))
+  right = shown["names"].index("FL_hip_joint:limp")
+  left = shown["names"].index("FR_hip_joint:limp")
+  assert shown["touch"].shape == shown["damage"].shape == (1, len(shown["names"]))
+  assert shown["touch"][0, right] > 0.9
+  assert shown["touch"][0, left] < 0.01
+  # Unweighted: the expected damage given that fault, even at weight 0.
+  assert 0 < shown["damage"][0, right] <= 25.0
+  assert (shown["cost"] == 0).all()
+
+
+def test_cvar_prices_the_worst_tail_of_the_imagined_faults():
+  # A panel right of the line: only even joints' faults (thrown right) hit.
+  h = _local_heights([(0.5, 3.0, -0.9, -0.6)], torch.zeros(1, 3))
+  data = _data(h, torch.full_like(h, SEVERITY["person"]), _walk(1.0))
+  mean = RiskCritic(RiskCriticCfg(), _Thrown(side=1.0))
+  cvar = RiskCritic(RiskCriticCfg(measure="cvar", cvar_alpha=0.01), _Thrown(side=1.0))
+  everything = RiskCritic(RiskCriticCfg(measure="cvar", cvar_alpha=1.0), _Thrown())
+  _, prior = imagined_faults(RiskCriticCfg(), 12)
+  worst = mean.throws(_walk(1.0)[:, 0], data)["cost"] / prior  # Per fault.
+  assert torch.isclose(cvar(data)[0, 0], worst.max())  # The worst 1%: one fault.
+  assert torch.isclose(everything(data)[0, 0], mean(data)[0, 0])  # All: the mean.
+  shown = cvar.throws(_walk(1.0)[:, 0], data)["cost"]
+  assert torch.isclose(shown.sum(), cvar(data)[0, 0])
+
+
+def test_max_prices_the_single_worst_imagined_fault_whatever_its_prior():
+  h = _local_heights([(0.5, 3.0, -0.9, -0.6)], torch.zeros(1, 3))
+  data = _data(h, torch.full_like(h, SEVERITY["person"]), _walk(1.0))
+  mean = RiskCritic(RiskCriticCfg(), _Thrown(side=1.0))
+  # Whatever alpha says: max is not a CVaR.
+  cfg = RiskCriticCfg(measure="max", cvar_alpha=1.0)
+  worst = RiskCritic(cfg, _Thrown(side=1.0))
+  _, prior = imagined_faults(RiskCriticCfg(), 12)
+  per_fault = mean.throws(_walk(1.0)[:, 0], data)["cost"] / prior
+  assert torch.isclose(worst(data)[0, 0], per_fault.max())
+  shown = worst.throws(_walk(1.0)[:, 0], data)["cost"]
+  assert torch.isclose(shown.sum(), worst(data)[0, 0])
 
 
 def test_a_robot_already_faulted_is_charged_nothing():
@@ -135,7 +202,7 @@ def test_the_critic_keeps_the_robot_off_the_side_a_fault_would_throw_it():
         ys.append(pose[0, 1].item())
     return sum(ys) / len(ys)
 
-  assert beside(0.01) > beside(0.0) + 0.1
+  assert beside(0.3) > beside(0.0) + 0.1
 
 
 def test_with_top_m_only_the_best_samples_are_priced_and_the_rest_pay_their_worst():
