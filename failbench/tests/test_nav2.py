@@ -144,6 +144,66 @@ def test_offset_candidates_step_the_mean_sideways_and_carry_on_parallel():
   assert torch.allclose(y[:, -1], y[:, -5], atol=1e-4)  # Parallel by the end.
 
 
+def test_steady_candidates_take_the_place_of_the_last_noise_samples():
+  grid = ((1.0, 0.2, 0.0), (0.6, -0.3, 0.1))
+  planner = Nav2Mppi(Nav2MppiCfg(batch_size=8, steady_candidates=grid), 1, "cpu")
+  out = planner.step(
+    torch.zeros(1, 80, 80), RES, torch.tensor([[3.0, 0.0]]), torch.zeros(1, 3)
+  )
+  steady = torch.tensor(grid)[:, None].expand(-1, planner.cfg.time_steps, -1)
+  assert torch.equal(out["cv"][0, -2:], steady)
+
+
+class _WantsSidestep:
+  """Charges each sample for how far its mean sideways command is from 0.3."""
+
+  __name__ = "wants_sidestep"
+
+  def __call__(self, data):
+    return 200.0 * (data["cv"][..., 1].mean(-1) - 0.3).square()
+
+
+def test_more_iterations_settle_the_plan_nearer_what_the_critics_want():
+  def plan_vy(iterations):
+    torch.manual_seed(0)
+    cfg = Nav2MppiCfg(iteration_count=iterations)
+    planner = Nav2Mppi(cfg, 4, "cpu", extra_critics=[_WantsSidestep()])
+    out = planner.step(
+      torch.zeros(4, 80, 80),
+      RES,
+      torch.tensor([[3.0, 0.0]]).expand(4, 2),
+      torch.zeros(4, 3),
+    )
+    return out["plan"][:, : cfg.time_steps - 1, 1].mean()
+
+  one, four = plan_vy(1), plan_vy(4)
+  assert abs(four - 0.3) < 0.5 * abs(one - 0.3)
+
+
+def test_log_mppi_noise_keeps_each_axis_spread_with_heavier_tails():
+  torch.manual_seed(0)
+  cfg = Nav2MppiCfg(batch_size=4000, log_normal_std=0.8)
+  noise = Nav2Mppi(cfg, 2, "cpu")._noise()  # [n, K, T, 3]
+  std = torch.tensor([cfg.vx_std, cfg.vy_std, cfg.wz_std])
+  flat = noise.reshape(-1, 3)
+  assert torch.allclose(flat.std(0), std, rtol=0.1)
+  kurtosis = (flat / flat.std(0)).pow(4).mean(0)
+  assert (kurtosis > 5.0).all()  # A Gaussian's is 3: more far-out samples.
+
+
+def test_correlated_noise_keeps_each_axis_spread_and_carries_on_along_the_horizon():
+  torch.manual_seed(0)
+  cfg = Nav2MppiCfg(batch_size=4000, noise_corr=(0.0, 0.97, 0.0))
+  noise = Nav2Mppi(cfg, 2, "cpu")._noise()  # [n, K, T, 3]
+  std = torch.tensor([cfg.vx_std, cfg.vy_std, cfg.wz_std])
+  assert torch.allclose(noise.reshape(-1, 3).std(0), std, rtol=0.1)
+  a, b = noise[:, :, :-1], noise[:, :, 1:]
+  lag1 = (a * b).mean((0, 1, 2)) / (a.std((0, 1, 2)) * b.std((0, 1, 2)))
+  assert lag1[1] > 0.9 and lag1[0].abs() < 0.05 and lag1[2].abs() < 0.05
+  # A sample keeps its sideways drift: its 3 s mean spreads 5x the iid one's.
+  assert noise[..., 1].mean(-1).std() > 4 * cfg.vy_std / cfg.time_steps**0.5
+
+
 def test_the_plain_planner_walks_to_a_goal_in_the_open_within_its_limits():
   poses, cmds, hit = _drive([], (4.0, 0.0), cycles=70)
   cfg = Nav2MppiCfg()

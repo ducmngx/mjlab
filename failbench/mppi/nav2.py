@@ -150,7 +150,7 @@ class CostmapCfg:
   collision check doesn't."""
   severity_ref: float | None = None
   """Semantic inflation: each obstacle's margin is ``margin * severity /
-  severity_ref`` (25, glass: crates 0.2x, walls 0.4x, people 2x); None: one
+  severity_ref`` (25, glass: crates 0.32x, walls 0.16x, people 2x); None: one
   margin for all."""
 
 
@@ -196,11 +196,31 @@ class Nav2MppiCfg:
   place of as many noise samples (FailBench's own sampler's ``OFFSET_M``).
   Independent per-step noise rarely keeps a sustained sidestep."""
   strafe_vy: float = 0.25
+  steady_candidates: tuple[tuple[float, float, float], ...] = ()
+  """Not Nav2: constant (vx, vy, wz) commands held for the whole horizon, in
+  place of the last noise samples (like DWB's velocity grid). Noise about
+  the mean rarely holds one course for 3 s; these always offer it."""
+  iteration_count: int = 1
+  """Nav2's ``iteration_count``: optimisation passes per cycle, each sampling
+  about the last pass's mean (Nav2's default 1)."""
   gap_quantile: float | None = None
   """Not Nav2: weigh samples by ``softmax(-(cost - min) / (temperature *
   (q - min)))``, ``q`` this cost quantile, as FailBench's own planner, so
   the temperature is relative to the batch's cost gap. None: Nav2's
   absolute ``temperature``."""
+  log_normal_std: float = 0.0
+  """Not Nav2: log-MPPI's sampling (Mohamed, Allibert, Martin, "Autonomous
+  navigation of AGVs in unknown cluttered environments: log-MPPI control
+  strategy", RA-L 2022): each noise value is the Gaussian one times a
+  log-normal factor ``exp(z)``, ``z ~ N(-s^2, s^2)`` with ``s`` this, so each
+  axis keeps its spread (E[exp(2z)] = 1) but far-out samples are more common
+  (kurtosis ``3 exp(4 s^2)``). 0: Nav2's Gaussian."""
+  noise_corr: tuple[float, float, float] = (0.0, 0.0, 0.0)
+  """Not Nav2: each axis's (vx, vy, wz) noise is an AR(1) process along the
+  horizon with this step-to-step correlation, each step keeping its std.
+  Independent noise averages a sample's sideways speed out over 30 steps
+  (sd ``vy_std / sqrt(30)``); correlated noise keeps a sample drifting one
+  way, so the batch holds sustained sidesteps at full speed. 0: Nav2's."""
   critics: CriticsCfg = field(default_factory=CriticsCfg)
   costmap: CostmapCfg = field(default_factory=CostmapCfg)
 
@@ -467,11 +487,63 @@ class Nav2Mppi:
     pose0[:, 2] = speed[:, 2] * dt
     # The mean, pinned to the current speed at step 0, within limits.
     self.seq = self._constrain(self.seq, v0)
+    # Nav2's ``iteration_count``: sample, score and average again about the
+    # new mean before sending anything.
+    args = (costmap, resolution, goal, v0, pose0, context, path)
+    mean, weight, cost, terms, fail, traj, cv = self._iterate(*args)
+    for _ in range(c.iteration_count - 1):
+      mean, weight, cost, terms, fail, traj, cv = self._iterate(*args)
+    cmd = mean[:, 1]
+    self.hist = torch.cat([self.hist[:, 1:], cmd[:, None]], 1)
+    self.last_cmd = cmd
+    # The plan the runner plays out: the sequence from the command sent on,
+    # its last command held to ``plan_steps``.
+    rest = mean[:, 1:]
+    hold = rest[:, -1:].expand(-1, c.plan_steps - rest.shape[1], -1)
+    self.plan = torch.cat([rest, hold], 1)
+    plan_v = self._predict(self.plan[:, None], v0)[:, 0]
+    plan_path = self._integrate(plan_v[:, None], pose0)[:, 0]
+    # Shift the sequence for next cycle's mean.
+    self.seq = torch.cat([mean[:, 1:], mean[:, -1:]], 1)
+    best = weight.argmax(-1)
+    rows = torch.arange(n, device=dev)
+    zeros = torch.zeros(n, c.plan_steps, device=dev)
+    return {
+      "cmd": cmd,
+      "plan": self.plan,
+      "path": plan_path,
+      "pred_path": plan_path,
+      "pred_std": torch.zeros(n, c.plan_steps, 3, device=dev),
+      "p_fallen": torch.zeros(n, device=dev),
+      "pred_p_fallen": zeros,
+      "pred_p_collision": zeros,
+      "p_fall_soon": torch.zeros(n, device=dev),
+      "ess": 1.0 / weight.square().sum(-1),
+      "cost_best": cost[rows, best],
+      **{f"cost_{k}": t[rows, best] for k, t in terms.items()},
+      # How much each critic tells the samples apart (the softmax sees only
+      # differences, at ``temperature``).
+      **{f"spread_{k}": t.std(-1) for k, t in terms.items()},
+      "nav2_fail": fail,
+      "traj": traj,
+      "cv": cv,
+      "weight": weight,
+      "cost": cost,
+      "terms": terms,
+    }
+
+  def _iterate(self, costmap, resolution, goal, v0, pose0, context, path):
+    """One optimisation pass about ``self.seq``: sample, roll out, score,
+    average; leaves the new mean in ``self.seq`` and returns it with the
+    pass's ``weight``, ``cost``, ``terms``, ``fail``, ``traj`` and ``cv``."""
+    c, dev = self.cfg, self.device
     std = torch.tensor([c.vx_std, c.vy_std, c.wz_std], device=dev)
-    noise = torch.randn(n, c.batch_size, c.time_steps, 3, device=dev) * std
-    cv = self.seq[:, None] + noise  # [n, K, T, 3]
+    cv = self.seq[:, None] + self._noise()  # [n, K, T, 3]
     if c.offset_m:
       cv[:, -len(c.offset_m) :] = self._offsets()
+    if c.steady_candidates:
+      steady = torch.tensor(c.steady_candidates, device=dev)
+      cv[:, -len(steady) :] = steady[:, None]
     v = self._predict(cv, v0)
     traj = self._integrate(v, pose0)
     track = path if path is not None else self._path(pose0[:, :2], goal)
@@ -516,44 +588,27 @@ class Nav2Mppi:
     # Nav2 resets when every trajectory collides; the robot stops.
     mean = torch.where(fail[:, None, None], 0.0, mean)
     self.seq = mean
-    cmd = mean[:, 1]
-    self.hist = torch.cat([self.hist[:, 1:], cmd[:, None]], 1)
-    self.last_cmd = cmd
-    # The plan the runner plays out: the sequence from the command sent on,
-    # its last command held to ``plan_steps``.
-    rest = mean[:, 1:]
-    hold = rest[:, -1:].expand(-1, c.plan_steps - rest.shape[1], -1)
-    self.plan = torch.cat([rest, hold], 1)
-    plan_v = self._predict(self.plan[:, None], v0)[:, 0]
-    plan_path = self._integrate(plan_v[:, None], pose0)[:, 0]
-    # Shift the sequence for next cycle's mean.
-    self.seq = torch.cat([mean[:, 1:], mean[:, -1:]], 1)
-    best = weight.argmax(-1)
-    rows = torch.arange(n, device=dev)
-    zeros = torch.zeros(n, c.plan_steps, device=dev)
-    return {
-      "cmd": cmd,
-      "plan": self.plan,
-      "path": plan_path,
-      "pred_path": plan_path,
-      "pred_std": torch.zeros(n, c.plan_steps, 3, device=dev),
-      "p_fallen": torch.zeros(n, device=dev),
-      "pred_p_fallen": zeros,
-      "pred_p_collision": zeros,
-      "p_fall_soon": torch.zeros(n, device=dev),
-      "ess": 1.0 / weight.square().sum(-1),
-      "cost_best": cost[rows, best],
-      **{f"cost_{k}": t[rows, best] for k, t in terms.items()},
-      # How much each critic tells the samples apart (the softmax sees only
-      # differences, at ``temperature``).
-      **{f"spread_{k}": t.std(-1) for k, t in terms.items()},
-      "nav2_fail": fail,
-      "traj": traj,
-      "cv": cv,
-      "weight": weight,
-      "cost": cost,
-      "terms": terms,
-    }
+    return mean, weight, cost, terms, fail, traj, cv
+
+  def _noise(self) -> torch.Tensor:
+    """Sampling noise ``[n, K, T, 3]``: Gaussian at ``vx_std``, ``vy_std``,
+    ``wz_std``, or log-MPPI's normal times log-normal (``log_normal_std``),
+    correlated along the horizon by ``noise_corr``."""
+    c = self.cfg
+    std = torch.tensor([c.vx_std, c.vy_std, c.wz_std], device=self.device)
+    shape = (self.n, c.batch_size, c.time_steps, 3)
+    noise = torch.randn(shape, device=self.device) * std
+    s = c.log_normal_std
+    if s > 0:
+      noise = noise * torch.exp(torch.randn(shape, device=self.device) * s - s * s)
+    if any(c.noise_corr):
+      rho = torch.tensor(c.noise_corr, device=self.device)
+      keep = (1 - rho * rho).sqrt()
+      steps = [noise[:, :, 0]]
+      for t in range(1, c.time_steps):
+        steps.append(rho * steps[-1] + keep * noise[:, :, t])
+      noise = torch.stack(steps, 2)
+    return noise
 
   def _offsets(self) -> torch.Tensor:
     """The mean sequence stepped sideways by each ``offset_m`` ``[n, O, T,

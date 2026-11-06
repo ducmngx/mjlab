@@ -145,3 +145,57 @@ def corrupt_map(
   keep = known & ~drop & ~torch.isnan(height)
   noisy = torch.where(keep, noisy, 0.0)
   return torch.stack([noisy, keep.to(height.dtype)], dim=-3)
+
+
+class MapMemory:
+  """A world-frame memory for a robot-centred local map, as an elevation
+  mapper (or Nav2's obstacle layer) keeps one: each cell holds the last
+  height the LiDAR saw there until a later scan sees that cell again, so an
+  object stays on the map after it leaves the field of view (a 1.1 m glass
+  case beside the Go2 is above everything its head LiDAR can see).
+
+  The grid is ``size_m`` across, centred where each robot first updates it;
+  cells outside it are neither written nor remembered. Heights are kept
+  against the world (local height + trunk ``z``), so the trunk bobbing
+  doesn't move what was seen. Poses are the robot's own estimate, so its
+  odometry drift smears the memory as it would on the robot."""
+
+  def __init__(self, n: int, size_m: float, resolution: float, device):
+    self.res = resolution
+    self.cells = round(size_m / resolution)
+    g = self.cells
+    self.z = torch.full((n, g * g), float("nan"), device=device)
+    self.origin = torch.full((n, 2), float("nan"), device=device)
+
+  def update(
+    self,
+    height: torch.Tensor,
+    known: torch.Tensor,
+    pos_xy: torch.Tensor,
+    yaw: torch.Tensor,
+    z: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write what ``known [n, H, W]`` cells of ``height`` (relative to the
+    trunk at ``z [n]``, local frame at ``pos_xy [n, 2]``, ``yaw [n]``) show,
+    and return the local map with the rest filled from memory: ``(height,
+    known)``, unknown height NaN."""
+    n, h, w = height.shape
+    fresh = self.origin.isnan().any(-1)
+    self.origin[fresh] = pos_xy[fresh]
+    local = cell_centres(h, self.res, height.device).view(1, h * w, 2)
+    c, s = torch.cos(yaw)[:, None], torch.sin(yaw)[:, None]
+    lx, ly = local[..., 0], local[..., 1]
+    wx = pos_xy[:, None, 0] + c * lx - s * ly - self.origin[:, None, 0]
+    wy = pos_xy[:, None, 1] + s * lx + c * ly - self.origin[:, None, 1]
+    col = torch.floor(wx / self.res + self.cells / 2).long()
+    row = torch.floor(wy / self.res + self.cells / 2).long()
+    inside = (col >= 0) & (col < self.cells) & (row >= 0) & (row < self.cells)
+    idx = (row * self.cells + col).clamp(0, self.cells * self.cells - 1)
+    flat_h, flat_k = height.view(n, -1), known.view(n, -1)
+    write = flat_k & inside & ~flat_h.isnan()
+    env = torch.arange(n, device=height.device)[:, None].expand_as(idx)
+    self.z[env[write], idx[write]] = (flat_h + z[:, None])[write]
+    seen = self.z.gather(1, idx) - z[:, None]
+    seen = torch.where(inside, seen, float("nan"))
+    out = torch.where(write, flat_h, seen)
+    return out.view(n, h, w), ~out.isnan().view(n, h, w)

@@ -12,6 +12,10 @@ one that weighs what a fault would throw the robot into mirrors itself:
   straight line, glass panes on one side of it and crates on the other.
 - ``PassAroundCourseTerrainCfg``: a pillar on the line to go round, glass
   beyond one side and crates beyond the other.
+- ``ChoiceCourseTerrainCfg``: gates across the line one after another,
+  glass on one side of each and crates facing it, swapping sides.
+- ``LoneHazardTerrainCfg``: one big object just off the line, open floor
+  all round: the simplest check that the planner gives room by severity.
 - ``ClutterFieldTerrainCfg``: a fresh random field of crates and glass
   cases per tile, either side of a clear corridor along the line.
 
@@ -209,6 +213,65 @@ class PassAroundCourseTerrainCfg(_RoomCfg):
 
 
 @dataclass(kw_only=True)
+class ChoiceCourseTerrainCfg(_RoomCfg):
+  """Gates across the route, one after another: glass on one side of the
+  line and crates facing it on the other, the glass side alternating. The
+  line stays clear (a local planner on the straight line to the goal has
+  nothing to get stuck on), and at every gate only what stands either side
+  says which side of the opening to take."""
+
+  gates: tuple[tuple[float, int], ...] = ((3.0, 1), (8.0, -1))
+  """(gate x from the spawn, side of its glass: +1 left) per gate. 5 m
+  apart: more than the 3 s a plan looks ahead at 1.2 m/s, so a plan priced
+  near one gate doesn't also weigh the next one's glass on the other side."""
+  goal_x: float = 11.0
+  face_range: tuple[float, float] = (0.7, 0.5)
+  """Centre line to both objects' near face at difficulty 0 and 1: a 1.4 m
+  opening, closing to 1.0 m."""
+  object_size: tuple[float, float] = (1.0, 0.5)
+
+  def function(
+    self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator
+  ) -> TerrainOutput:
+    del rng
+    box, out, origin = self._room(spec)
+    lo, hi = self.face_range
+    face = lo + (hi - lo) * difficulty
+    for x, glass in self.gates:
+      for side, cls in ((glass, "glass"), (-glass, "box")):
+        y = side * (face + self.object_size[1] / 2)
+        OBJECTS[self._cls(cls)](box, x, y, self.object_size)
+    return TerrainOutput(origin=origin, geometries=out)
+
+
+@dataclass(kw_only=True)
+class LoneHazardTerrainCfg(_RoomCfg):
+  """One big object beside the line, open floor everywhere else: a planner
+  that weighs what a fault would throw the robot into should give glass
+  room as it passes (mirrored with ``side``) and crates (``swap``) less."""
+
+  cls: str = "glass"
+  side: int = 1
+  """+1 left of the line."""
+  x: float = 4.0
+  """Object centre from the spawn."""
+  face_range: tuple[float, float] = (0.6, 0.3)
+  """Centre line to the object's near face at difficulty 0 and 1."""
+  object_size: tuple[float, float] = (2.0, 0.8)
+
+  def function(
+    self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator
+  ) -> TerrainOutput:
+    del rng
+    box, out, origin = self._room(spec)
+    lo, hi = self.face_range
+    face = lo + (hi - lo) * difficulty
+    y = self.side * (face + self.object_size[1] / 2)
+    OBJECTS[self._cls(self.cls)](box, self.x, y, self.object_size)
+    return TerrainOutput(origin=origin, geometries=out)
+
+
+@dataclass(kw_only=True)
 class ClutterFieldTerrainCfg(_RoomCfg):
   """Crates and glass cases scattered either side of a clear corridor on the
   line, a new layout per tile from the generator's rng. The draws don't
@@ -264,12 +327,14 @@ def scene_waypoints(cfg: _RoomCfg) -> np.ndarray:
   return np.array([[cfg.goal_x, 0.0]])
 
 
-def _terrain(cfg: _RoomCfg, num_cols: int = 1) -> TerrainGeneratorCfg:
+def _terrain(
+  cfg: _RoomCfg, num_cols: int = 1, length: float = 11.0
+) -> TerrainGeneratorCfg:
   """One difficulty per row; ``num_cols`` copies of the scene side by side
   (curriculum mode gives each sub-terrain one column), which differ only
   if the scene draws from the rng."""
   return TerrainGeneratorCfg(
-    size=(11.0, 4.8),
+    size=(length, 4.8),
     border_width=10.0,
     num_rows=10,
     num_cols=num_cols,
@@ -296,6 +361,25 @@ PASS_COURSE_TERRAIN = _terrain(PASS_COURSE)
 """A pillar on the line; glass beyond its left, crates beyond its right."""
 PASS_SWAP = replace(PASS_COURSE, swap=True)
 PASS_SWAP_TERRAIN = _terrain(PASS_SWAP)
+CHOICE_COURSE = ChoiceCourseTerrainCfg(proportion=1.0)
+CHOICE_COURSE_TERRAIN = _terrain(CHOICE_COURSE, length=14.0)
+"""Two gates, glass left then right; 1.4 m openings closing to 1.0 m."""
+CHOICE_SWAP = replace(CHOICE_COURSE, swap=True)
+CHOICE_SWAP_TERRAIN = _terrain(CHOICE_SWAP, length=14.0)
+CHOICE_NARROW = replace(CHOICE_COURSE, face_range=(0.5, 0.4))
+CHOICE_NARROW_TERRAIN = _terrain(CHOICE_NARROW, length=14.0)
+"""The same gates, 1.0 m openings closing to 0.8 m: the glass within a hip
+limp's throw of a robot on the line."""
+CHOICE_NARROW_SWAP = replace(CHOICE_NARROW, swap=True)
+CHOICE_NARROW_SWAP_TERRAIN = _terrain(CHOICE_NARROW_SWAP, length=14.0)
+LONE_HAZARD = LoneHazardTerrainCfg(proportion=1.0)
+LONE_HAZARD_TERRAIN = _terrain(LONE_HAZARD)
+"""A 2.0 x 0.8 m glass case left of the line, its face 0.6 m off it closing
+to 0.3 m."""
+LONE_HAZARD_MIRROR = replace(LONE_HAZARD, side=-1)
+LONE_HAZARD_MIRROR_TERRAIN = _terrain(LONE_HAZARD_MIRROR)
+LONE_HAZARD_SWAP = replace(LONE_HAZARD, swap=True)
+LONE_HAZARD_SWAP_TERRAIN = _terrain(LONE_HAZARD_SWAP)
 CLUTTER_FIELD = ClutterFieldTerrainCfg(proportion=1.0)
 CLUTTER_FIELD_TERRAIN = _terrain(CLUTTER_FIELD, num_cols=4)
 """40 random fields, 1.6 m corridors narrowing to 0.8 m down the rows."""
