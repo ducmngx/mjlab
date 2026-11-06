@@ -52,7 +52,7 @@ committed to at its fault (an index into ``failbench.driver.SOURCES``;
 ``NO_SOURCE`` for the follower-driven data).
 
 ``split``: 0 train, 1 val, 2 test_terrain (unseen terrain seeds), 3
-test_fault (the ``held_out`` joint and family pairs, never trained on).
+test_fault (the ``held_out`` joint and family pairs, none by default).
 
 Each shard is a directory of ``.npy`` files (memory-mappable) plus
 ``meta.json``.
@@ -224,16 +224,12 @@ class BuildConfig:
   """``safe``'s fall is at most this long before the robot is down."""
   fuse_back_s: tuple[float, ...] = (0.5, 1.0, 1.5)
   history_s: float = 2.0
-  held_out: tuple[str, ...] = (
-    "RL_calf_joint:LOCK",
-    "FL_calf_joint:LOCK",
-    "FR_thigh_joint:WEAK",
-    "RR_hip_joint:WEAK",
-  )
-  """``joint:FAMILY`` pairs held out as test_fault, one per leg: two seized
-  calves (the locks that fell most) and two weak or limp joints, one a hip
-  that throws the robot sideways. One pair gave too few falls to tell
-  models apart."""
+  held_out: tuple[str, ...] = ()
+  """``joint:FAMILY`` pairs held out as test_fault. None by default: every
+  fault the critic prices trains, and generalisation is tested on unseen
+  terrain seeds (test_terrain) and the planner's evaluation scenes. Shards
+  built before this held out RL/FL calf LOCK, FR thigh WEAK and RR hip WEAK
+  (``TrainConfig.splits`` trains on them too)."""
   val_seed_mod: int = 1
   test_seed_mod: int = 0
   """Terrain seeds with ``seed % 10`` equal to these go to val / test_terrain."""

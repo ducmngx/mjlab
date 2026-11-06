@@ -42,6 +42,9 @@ class TrainConfig:
   """Built sample shards (with ``stats.json``)."""
   output_dir: str
   map_mode: MapMode = "clean"
+  splits: tuple[str, ...] = ("train", "test_fault")
+  """Splits to train on: every fault (older shards hold some out as
+  test_fault); val and test_terrain stay out."""
   init_from: str | None = None
   """Checkpoint to start from (phase 2 starts from phase 1's best)."""
   epochs: int = 20
@@ -135,7 +138,7 @@ def main():
   latent_std = torch.tensor(stats["him_latent"]["std"], device=device)
 
   contacts = cfg.model.contact_heads
-  train_ds = FailBenchDataset(root, "train", cfg.map_mode, contacts=contacts)
+  train_ds = FailBenchDataset(root, cfg.splits, cfg.map_mode, contacts=contacts)
 
   def loader(ds: FailBenchDataset, train: bool) -> DataLoader:
     sampler = None

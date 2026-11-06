@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Evaluate a trained FailBench impact model on the held-out splits (val,
-# test_terrain, test_fault) on one GPU of the Hopper cluster. Submit from the
+# test_terrain) on one GPU of the Hopper cluster. Submit from the
 # repo root:
 #
 #   sbatch failbench/cluster/evaluate.sbatch                       # phase 1

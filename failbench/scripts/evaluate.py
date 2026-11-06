@@ -1,8 +1,8 @@
 """Evaluate a trained impact model on the held-out splits.
 
-For each split (``val``, ``test_terrain``: unseen terrain seeds,
-``test_fault``: the held-out joint and fault pair), pooled and per fault
-family and terrain:
+For each split (``val``, ``test_terrain``: unseen terrain seeds; and
+``test_fault`` for shards built with held-out fault pairs), pooled and per
+fault family and terrain:
 
 - drift error at 1, 2, 3 and 5 s (those within the model's window) against
   the zero-drift baseline, and the share of true drifts inside the predicted
@@ -84,7 +84,7 @@ class EvalConfig:
   root: str
   """Built sample shards."""
   output_dir: str
-  splits: tuple[str, ...] = ("val", "test_terrain", "test_fault")
+  splits: tuple[str, ...] = ("val", "test_terrain")
   map_mode: MapMode | None = None
   batch_size: int = 512
   num_workers: int = 8

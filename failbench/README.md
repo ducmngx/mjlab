@@ -160,7 +160,7 @@ Each covers 5 s at 10 Hz (50 bins).
 |---|---|
 | val | terrain seeds ending in 1 |
 | test_terrain | terrain seeds ending in 0 |
-| test_fault | four joint and fault pairs never trained on: locked `RL_calf_joint` and `FL_calf_joint`, weak or limp `FR_thigh_joint` and `RR_hip_joint` |
+| test_fault | `BuildConfig.held_out` joint and fault pairs; none by default, so every fault the critic prices trains. Shards built before held out locked `RL_calf_joint` and `FL_calf_joint`, weak or limp `FR_thigh_joint` and `RR_hip_joint`; training (`TrainConfig.splits`) uses them too. |
 
 ## Sensor realism
 

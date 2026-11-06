@@ -60,7 +60,7 @@ class FailBenchDataset(Dataset):
   def __init__(
     self,
     root: str | Path,
-    split: str = "train",
+    split: str | tuple[str, ...] = "train",
     map_mode: MapMode = "fused",
     noise: NoiseCfg | None = None,
     drop_fallen_at_start: bool = True,
@@ -70,12 +70,12 @@ class FailBenchDataset(Dataset):
     """``noise`` defaults to ``NoiseCfg()``. ``seed`` fixes each item's map
     noise (for val/test); ``None`` draws fresh noise every time. ``contacts``
     rasterises the contact maps (only a model with contact heads needs
-    them)."""
+    them). ``split`` is one split's name or several."""
     self.contacts = contacts
     self.map_mode = map_mode
     self.noise = noise or NoiseCfg()
     self.seed = seed
-    code = SPLITS.index(split)
+    codes = [SPLITS.index(s) for s in ((split,) if isinstance(split, str) else split)]
     self.shards: list[dict[str, np.ndarray]] = []
     self.metas: list[dict] = []
     index = []
@@ -84,7 +84,7 @@ class FailBenchDataset(Dataset):
       raise FileNotFoundError(f"No built shards under {root}.")
     for s, d in enumerate(dirs):
       arrays = {p.stem: np.load(p, mmap_mode="r") for p in d.glob("*.npy")}
-      sel = arrays["split"] == code
+      sel = np.isin(arrays["split"], codes)
       if drop_fallen_at_start:
         sel &= ~arrays["fallen_at_start"]
       rows = np.flatnonzero(sel)
