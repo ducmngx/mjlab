@@ -18,14 +18,20 @@ import numpy as np
 import tyro
 
 NEAR_MISS_M = 0.1
+CLOSE_PERSON_M = 0.2
+HARD_SPEED = 0.25  # m/s: a touch faster than this is a hit, not a graze.
 
 METRICS = {
   "collided": "collision rate",
   "collided_person": "person collision rate",
   "collided_glass": "glass collision rate",
+  "hard_collided": f"hard collision rate (>= {HARD_SPEED} m/s)",
+  "hard_collided_person": f"hard person collision rate (>= {HARD_SPEED} m/s)",
+  "impact_speed_hit": "impact speed, robots that touched (m/s)",
   "end_dist_m": "distance to nearest object at 3 s (m)",
   "end_dist_person_m": "distance to nearest person at 3 s (m)",
   "min_dist_person_m": "closest to a person in the window (m)",
+  "close_person": f"came within {CLOSE_PERSON_M} m of a person",
   "peak_force_n": "peak contact force on an object (N)",
   "peak_force_person_n": "peak contact force on a person (N)",
   "impulse_ns": "contact impulse on objects (N s)",
@@ -42,6 +48,23 @@ class ReportConfig:
   baseline: str = "normal"
 
 
+def derived(w: dict) -> dict:
+  """Metrics read off one robot's window: a hit is a touch at ``HARD_SPEED``
+  or faster (the trunk's speed at its first touch of any object, so a person
+  hit after a graze elsewhere reads that graze's speed), a near miss a pass
+  within ``NEAR_MISS_M`` of a person without touching one."""
+  speed = float(w.get("impact_speed", float("nan")))
+  hard = bool(w["collided"]) and speed >= HARD_SPEED
+  dist = float(w["min_dist_person_m"])
+  return {
+    "hard_collided": hard,
+    "hard_collided_person": hard and bool(w["collided_person"]),
+    "impact_speed_hit": speed if w["collided"] else float("nan"),
+    "near_miss": dist < NEAR_MISS_M and not w["collided_person"],
+    "close_person": dist < CLOSE_PERSON_M,
+  }
+
+
 def _rows(root: Path) -> dict[str, dict[tuple, dict]]:
   """``{arm: {(layout, seed, robot): window metrics}}``."""
   out: dict[str, dict[tuple, dict]] = {}
@@ -53,10 +76,7 @@ def _rows(root: Path) -> dict[str, dict[tuple, dict]]:
         w = t.get("window")
         if not w or not w["complete"]:
           continue
-        w = dict(w)
-        w["near_miss"] = (
-          w["min_dist_person_m"] < NEAR_MISS_M and not w["collided_person"]
-        )
+        w = dict(w) | derived(w)
         rows[(layout, int(seed), t["env"])] = w
     out[arm_dir.name] = rows
   return out
@@ -96,18 +116,18 @@ def main(cfg: ReportConfig) -> None:
       report[arm][lay] = _stats(rows, b, lambda k, lay=lay: k[0] == lay)
   json.dump(report, open(Path(cfg.out).with_suffix(".json"), "w"), indent=1)
   arms = list(data)
-  print(f"{'metric':44s}" + "".join(f"{a:>22s}" for a in arms))
+  print(f"{'metric':44s}" + "".join(f"{a:>26s}" for a in arms))
   for m, label in METRICS.items():
     cells = []
     for a in arms:
       s = report[a]["all"][m]
       if s["mean"] is None:
-        cells.append(f"{'-':>22s}")
+        cells.append(f"{'-':>26s}")
         continue
       txt = f"{s['mean']:.3f}"
       if "diff" in s:
         txt += f" ({s['diff']:+.3f}±{s['se']:.3f})"
-      cells.append(f"{txt:>22s}")
+      cells.append(f"{txt:>26s}")
     print(f"{label:44s}" + "".join(cells))
   print("robots:", {a: report[a]["all"]["n"] for a in arms})
 

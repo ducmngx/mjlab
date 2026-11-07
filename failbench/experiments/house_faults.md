@@ -104,7 +104,18 @@ Also recorded, recommended for the paper:
 6. **Fall** (`fell`): the robot went down in the window.
 7. **Near miss**: `min_dist_person_m` under 0.1 m without a person
    collision (from the recorded distances).
-8. **Efficiency**, from the fault-free weight sweep on the same layouts:
+8. **Hard collision** (`hard_collided`, `hard_collided_person`): a collision
+   at 0.25 m/s or faster. The collision flag counts a 5 cm/s graze the same
+   as a hit, and the critic's job after a fault is to make what can't be
+   avoided gentle, so this and the impact speed of the robots that touched
+   (`impact_speed_hit`) say how hard. The speed is the trunk's at its first
+   touch of any object.
+9. **Close to a person** (`close_person`): came within 0.2 m of one in the
+   window, whether or not it touched.
+
+Items 7-9 are derived by `house_report` from the recorded window, so they
+apply to every finished run.
+10. **Efficiency**, from the fault-free weight sweep on the same layouts:
    time to goal against `normal`, success rate, path error.
 
 Aggregation (per arm, pooled and per layout): rates and means over robots,
