@@ -78,6 +78,7 @@ from failbench.faults import (
 )
 from failbench.global_planner import plan_paths
 from failbench.goals import route_progress, sample_goal
+from failbench.house import LAYOUTS
 from failbench.house_terrain import HOUSE_TERRAINS, route_table
 from failbench.mppi.cbf import CbfCfg, CbfFilter, severity_fields
 from failbench.mppi.costmap import distance_field, drop_cells, obstacle_cells
@@ -90,6 +91,7 @@ from failbench.mppi.planner import VULNERABLE_FAULTS, Mppi, MppiCfg
 from failbench.mppi.profiles import PROFILES, apply_changes, changes_from_stock
 from failbench.mppi.risk_critic import RiskCritic, RiskCriticCfg, blank_obstacles
 from failbench.paths import local_path, resample
+from failbench.replay import FaultWindow, ObjectBoxes
 from failbench.scripts.generate import policy_estimates
 from failbench.sensing import LidarCfg, MapMemory, NoiseCfg, corrupt_map
 from failbench.severity import (
@@ -100,6 +102,7 @@ from failbench.severity import (
   damage,
   geom_severity,
 )
+from failbench.sim_state import snapshot
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.sensor import RayCastSensor
 from mjlab.sensor.raycast_sensor import RayCastData
@@ -171,6 +174,15 @@ class RunMppiConfig:
   meet its fault further back than a faster one, and by distance walked,
   metres wasted in the open would use it up harmlessly. None: by
   ``fault_time_s``."""
+  fault_place_frac: tuple[float, float] | None = None
+  """Overrides ``fault_place_m`` (house terrains): fire once the robot has
+  got this fraction of its route's straight start-to-goal length along it,
+  stratified over each route's robots (``i % routes``) and the same for
+  every planner of a seed."""
+  fault_window_s: float = 3.0
+  """House terrains: safety metrics over this long after each fault (the
+  risk critic's horizon; ``failbench.replay.FaultWindow``), in each trial's
+  ``window``."""
   fault_timeout_s: float = 20.0
   """With ``fault_place_m``: a robot that hasn't got that far by then faults
   anyway, so hanging back doesn't dodge faults."""
@@ -194,6 +206,10 @@ class RunMppiConfig:
   only the last 1.5 s (tall objects drop out beside the robot, above the
   head LiDAR's view), ``oracle`` the full clean map."""
   memory_size_m: float = 40.0
+  save_state_every_s: float = 0.0
+  """Snapshot every env's full state this often (``failbench/sim_state.py``)
+  into the log (``snap_*``, with ``snap_step``), so faults can be replayed
+  from any moment (``replay_faults.py``); 0: never."""
   odom_xy_std: float = 0.02
   """Odometry position random walk (m per sqrt(s))."""
   odom_yaw_std: float = 0.005
@@ -340,7 +356,7 @@ def run(cfg: RunMppiConfig) -> dict:
     cfg.terrain_seed,
     fault_time_s=(
       cfg.fault_time_s
-      if cfg.fault_place_m is None
+      if cfg.fault_place_m is None and cfg.fault_place_frac is None
       else (cfg.fault_timeout_s, cfg.fault_timeout_s)
     ),
     mixture=mixture,
@@ -377,6 +393,21 @@ def run(cfg: RunMppiConfig) -> dict:
     lo, hi = cfg.fault_place_m
     u = (torch.randperm(n, generator=gen) + torch.rand(n, generator=gen)) / n
     place = (lo + (hi - lo) * u).to(device)
+  frac = None
+  if cfg.fault_place_frac is not None:
+    if cfg.terrain not in HOUSE_TERRAINS:
+      raise ValueError("fault_place_frac is for house terrains.")
+    gen = torch.Generator().manual_seed(cfg.seed)
+    routes = len(route_table(HOUSE_TERRAINS[cfg.terrain])[1])
+    group = torch.arange(n) % routes
+    u = torch.empty(n)
+    for r in range(routes):
+      rows = (group == r).nonzero()[:, 0]
+      k = len(rows)
+      u[rows] = (torch.randperm(k, generator=gen) + torch.rand(k, generator=gen)) / k
+    lo, hi = cfg.fault_place_frac
+    frac = (lo + (hi - lo) * u).to(device)
+  placed = cfg.fault_place_m is not None or frac is not None
   spawn_xy = torch.zeros(n, 2, device=device)
   assert isinstance(goal_term, sample_goal)
   assert isinstance(command, GoalVelocityCommand)
@@ -428,6 +459,17 @@ def run(cfg: RunMppiConfig) -> dict:
     if not isinstance(planner, (Nav2Mppi, Dwb)) or cfg.global_route:
       raise ValueError("House terrains run nav2 or dwb on their own routes.")
     route_w, route_real = _house_routes(house, env.scene.env_origins, planner.cfg)
+  window = (
+    None
+    if house is None
+    else FaultWindow(
+      ObjectBoxes.from_layout(LAYOUTS[house], device),
+      cfg.fault_window_s,
+      n,
+      device,
+      step_s=step_dt,
+    )
+  )
   frozen = torch.zeros(n, 3, device=device)
   """Each robot's command when its fault fired (``post_fault`` hold)."""
   was_faulted = torch.zeros(n, dtype=torch.bool, device=device)
@@ -548,6 +590,9 @@ def run(cfg: RunMppiConfig) -> dict:
   start_z = torch.full((n,), float("nan"), device=device)
   plan_time = []
 
+  snap_every = round(cfg.save_state_every_s / step_dt) if cfg.save_state_every_s else 0
+  snaps: list[dict[str, np.ndarray]] = []
+  snap_steps: list[int] = []
   obs, _ = wrapped.reset()
   for i in range(num_steps):
     if cfg.post_fault == "hold":
@@ -566,6 +611,9 @@ def run(cfg: RunMppiConfig) -> dict:
       vel_est, latent = policy_estimates(actor, obs, n, device)
     step = i + 1
     t = step * step_dt
+    if snap_every and step % snap_every == 0:
+      snaps.append(snapshot(env, dict(obs)))
+      snap_steps.append(step)
     data = robot.data
     pos, quat = data.root_link_pos_w, data.root_link_quat_w
 
@@ -589,7 +637,10 @@ def run(cfg: RunMppiConfig) -> dict:
     if i == 0:
       start_z = pos[:, 2].clone()
       spawn_xy = pos[:, :2].clone()
-    if cfg.fault_place_m is not None:
+      if frac is not None:
+        span = (goal_term.waypoints[:, -1, :2] - spawn_xy).norm(dim=-1)
+        place = frac * span
+    if placed:
       got = route_progress(pos[:, :2], spawn_xy, goal_term.waypoints[..., :2])
       fault.fire_now((got >= place) & started)
     if cfg.terrain == "cliff":
@@ -607,6 +658,22 @@ def run(cfg: RunMppiConfig) -> dict:
       energy = 0.5 * MASS_KG * data.root_link_lin_vel_w[:, :2].square().sum(-1)
       hit = damage(geom_sev[None], energy[:, None], geom_scale[None])
       hurt = torch.maximum(hurt, _touched_worst(touch, contact_w, elev.data, hit))
+    if window is not None:
+      real = fault.faulted & (faulted_joint(fault.params) >= 0)
+      since = torch.where(
+        real, (step - fault.fault_step).float() * step_dt, float("nan")
+      )
+      org = env.scene.env_origins[:, None, :3]
+      fnorm = force_w.norm(dim=-1)
+      window.update(
+        since,
+        data.body_link_pos_w - org,
+        contact_w - org,
+        valid & (fnorm >= 1.0),  # Feet too: the boxes tell floor from object.
+        fnorm,
+        data.root_link_lin_vel_w[:, :2].square().sum(-1),
+        down,
+      )
 
     state = torch.cat(
       [
@@ -936,6 +1003,7 @@ def run(cfg: RunMppiConfig) -> dict:
     if terrain is None or terrain.terrain_levels is None
     else torch.stack([terrain.terrain_levels, terrain.terrain_types], -1).tolist()
   )
+  win = window.results() if window is not None else None
   trials = [
     {
       "env": b,
@@ -946,7 +1014,7 @@ def run(cfg: RunMppiConfig) -> dict:
       "fault_time_s": float(fault.fault_step[b]) * step_dt
       if fault.faulted[b]
       else None,
-      "fault_place_m": None if cfg.fault_place_m is None else float(place[b]),
+      "fault_place_m": float(place[b]) if placed else None,
       "reached": bool(reached[b]),
       "time_to_goal_s": None if torch.isnan(t_reach[b]) else float(t_reach[b]),
       "fell": bool(down[b]),
@@ -957,6 +1025,7 @@ def run(cfg: RunMppiConfig) -> dict:
       "min_clearance_m": float(np.nanmin(after_fault[b]))
       if np.isfinite(after_fault[b]).any()
       else None,
+      "window": None if win is None else {k: v[b] for k, v in win.items()},
     }
     for b in range(n)
   ]
@@ -1002,6 +1071,10 @@ def run(cfg: RunMppiConfig) -> dict:
     **{f"cycle_{k}": v for k, v in cost_logs.items()},
     **{f"cycle_{k}": v for k, v in risk_log.items()},
   }
+  if snaps:
+    # [n, K, ...]: env first, as the dense logs.
+    arrays |= {f"snap_{k}": np.stack([s[k] for s in snaps], 1) for k in snaps[0]}
+    arrays["snap_step"] = np.array(snap_steps)
   np.savez_compressed(
     out_path.parent / f"{out_path.name}.npz",
     allow_pickle=False,
