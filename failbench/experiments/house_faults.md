@@ -115,8 +115,11 @@ Also recorded, recommended for the paper:
 
 Items 7-9 are derived by `house_report` from the recorded window, so they
 apply to every finished run.
-10. **Efficiency**, from the fault-free weight sweep on the same layouts:
-   time to goal against `normal`, success rate, path error.
+10. **Efficiency**, from fault-free runs of every arm (`MODE=clean`, below;
+   `house_clean_report`): success rate, time to goal against `normal`
+   (paired, robots that reached the goal in both), distance from the global
+   path, how often the robot passed within 0.5 m of a person or 0.3 m of
+   glass, falls and touches, and planning time.
 
 Aggregation (per arm, pooled and per layout): rates and means over robots,
 with the paired difference to `normal` (same layout, seed and robot) and its
@@ -134,6 +137,19 @@ ARMS="normal ours_w0.5 ours_w1" sbatch --array=0-23 failbench/cluster/house_faul
 Task `i` runs layout `i % 8` with arm `i // 8` for every seed; finished
 runs are skipped, so resubmitting fills gaps. Outputs:
 `/scratch/mnguy21/failbench/mppi/house_faults/<arm>/<layout>_s<seed>.{json,npz}`.
+`LPT=<n>` gives each task `n` layouts (`LPT=8`: one task per arm, for cheap
+arms or to stay under the 40-job submit limit).
+
+Fault-free efficiency, the same arms with no fault (`--family nominal`),
+seeds 1-2, 60 s, into `house_clean/`:
+
+```
+MODE=clean ARMS="normal inflate_0.2" LPT=8 sbatch --array=0-1 failbench/cluster/house_faults.sbatch
+uv run python -m failbench.scripts.house_clean_report --root house_clean --out eff
+```
+
+Baselines run so far: `inflate_0.1`, `inflate_0.2`, `inflate_0.4` and
+`semantic_0.2`, `semantic_0.4`; ours at weights 0.5, 1, 3 and 4.
 
 ## Adding an arm
 
