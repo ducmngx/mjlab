@@ -61,6 +61,7 @@ case "$arm" in
   inflate_*) extra=(--risk.weight 0 --nav2.costmap.margin "${arm#inflate_}") ;;
   semantic_*) extra=(--risk.weight 0 --nav2.costmap.margin "${arm#semantic_}"
                      --nav2.costmap.severity-ref 25) ;;
+  cbf_*) extra=(--risk.weight 0 --cbf.margin "${arm#cbf_}") ;;
   *) echo "unknown arm $arm"; exit 2 ;;
 esac
 mkdir -p "$OUT/$arm"
