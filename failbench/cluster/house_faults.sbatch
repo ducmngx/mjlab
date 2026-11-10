@@ -9,7 +9,8 @@
 #
 #   ARMS="inflate_0.3" sbatch --array=0-7 failbench/cluster/house_faults.sbatch
 #
-# LPT=8 runs all eight layouts in one task (cheap arms: one task per arm,
+# FAULT_FRAC="lo hi" places faults on that share of the route (probes: just
+# before the hazard at its middle). LPT=8 runs all eight layouts in one task (cheap arms: one task per arm,
 # --array=0-<arms-1>). MODE=clean runs fault-free for time to goal and success
 # (seeds 1 2, 60 s, into house_clean), with the same arms and pairing.
 #
@@ -37,13 +38,14 @@ R=/scratch/$USER/failbench
 MODE=${MODE:-faults}
 case "$MODE" in
   faults) OUT=$R/mppi/${FAULT_DIR:-house_faults}; SEEDS=${FAULT_SEEDS:-1 2 3 4}
-          run=(--family priced --fault-place-frac 0.15 0.85 --fault-timeout-s 30
+          run=(--family priced --fault-place-frac ${FAULT_FRAC:-0.15 0.85} --fault-timeout-s 30
                --fault-window-s 3.0 --post-fault replan --duration-s 40) ;;
   clean) OUT=$R/mppi/${FAULT_DIR:-house_clean}; SEEDS=${FAULT_SEEDS:-1 2}
          run=(--family nominal --duration-s 60) ;;
   *) echo "unknown mode $MODE"; exit 2 ;;
 esac
-all=(apartment loft garden townhouse lobby crowd hall side_crowd)
+# LAYOUT_SET picks other layouts, e.g. the probes (failbench/house.py).
+read -r -a all <<< "${LAYOUT_SET:-apartment loft garden townhouse lobby crowd hall side_crowd}"
 read -r -a arms <<< "${ARMS:-normal ours_w0.5 ours_w1}"
 LPT=${LPT:-1}
 chunks=$(( ${#all[@]} / LPT ))
@@ -62,6 +64,12 @@ case "$arm" in
   semantic_*) extra=(--risk.weight 0 --nav2.costmap.margin "${arm#semantic_}"
                      --nav2.costmap.severity-ref 25) ;;
   cbf_*) extra=(--risk.weight 0 --cbf.margin "${arm#cbf_}") ;;
+  # Severity-scaled: the margin at glass (25), twice it at people.
+  cbfsem_*) extra=(--risk.weight 0 --cbf.margin "${arm#cbfsem_}"
+                   --cbf.severity-ref 25) ;;
+  # Ours with the filter after it: ourscbf_w<weight>_m<margin>.
+  ourscbf_w*_m*) w=${arm#ourscbf_w}; extra=(--risk.weight "${w%%_m*}"
+                                            --cbf.margin "${arm##*_m}") ;;
   *) echo "unknown arm $arm"; exit 2 ;;
 esac
 mkdir -p "$OUT/$arm"

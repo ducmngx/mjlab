@@ -169,6 +169,7 @@ def main(cfg: CleanReportConfig) -> None:
       if lk:
         report[arm][lay] = _stats(rows, base, lk)
   json.dump(report, open(Path(cfg.out).with_suffix(".json"), "w"), indent=1)
+  lays = [lay for lay in LAYOUTS if lay in report[cfg.baseline]]
   print(f"{'arm':14s}" + "".join(f"{lab:>14s}" for lab, _ in COLUMNS.values()))
   for arm in data:
     s = report[arm]["all"]
@@ -176,15 +177,13 @@ def main(cfg: CleanReportConfig) -> None:
       f"{arm:14s}" + "".join(f"{_fmt(s[k], f):>14s}" for k, (_, f) in COLUMNS.items())
     )
   print("\nslowdown per layout (mean, robots that reached in both)")
-  print(f"{'arm':14s}" + "".join(f"{lay:>11s}" for lay in LAYOUTS))
+  print(f"{'arm':14s}" + "".join(f"{lay:>11s}" for lay in lays))
   for arm in data:
-    cells = [
-      _fmt(report[arm].get(lay, {}).get("slow_mean"), "{:.2f}") for lay in LAYOUTS
-    ]
+    cells = [_fmt(report[arm].get(lay, {}).get("slow_mean"), "{:.2f}") for lay in lays]
     print(f"{arm:14s}" + "".join(f"{c:>11s}" for c in cells))
   print("\nsuccess per layout")
   for arm in data:
-    cells = [_fmt(report[arm].get(lay, {}).get("reached"), "{:.2f}") for lay in LAYOUTS]
+    cells = [_fmt(report[arm].get(lay, {}).get("reached"), "{:.2f}") for lay in lays]
     print(f"{arm:14s}" + "".join(f"{c:>11s}" for c in cells))
 
 

@@ -69,7 +69,7 @@ FORCES = [
 def tables(f: dict, e: dict, baseline: str = "normal") -> str:
   others = (a for a in f if a in e and a != baseline)
   arms = [baseline] + sorted(others, key=lambda a: (not a.startswith("ours"), a))
-  lays = list(LAYOUTS)
+  lays = [lay for lay in LAYOUTS if lay in f[baseline]]
   out = ["### Safety after a fault (3 s window), all layouts\n"]
   out.append(_head([c[1] for c in SAFETY] + ["n"]))
   for a in arms:

@@ -539,9 +539,224 @@ SIDE_CROWD = Layout(
   ),
 )
 
+# Probes: small scenes of parallel walled lanes, one route each way per lane,
+# that ask whether one fixed distance margin can be right everywhere. A
+# doorway beside a person is passable only with a small margin; a person on
+# the downhill side of a slope, or at the foot of open stairs, is reached by
+# a fault's throw from further than a small margin keeps. Each probe has a
+# twin lane or layout that changes only the thing under test.
+PROBE_DOOR_X = 4.0
+PROBE_DOOR_GAPS = (0.6, 0.7, 0.8, 1.0)
+"""Free width beside the person (or box) standing in each lane's door."""
+PROBE_SLOPE_RISE = 0.4
+"""Across a 2.4 m lane: about 9.5 degrees."""
+PROBE_SLOPE_OFFSET = 0.6
+"""From the route (the lane's centre line) to the object's near edge."""
+PROBE_SLOPE_LANES = (
+  ("person", "down"),
+  ("person", "up"),
+  ("glass", "down"),
+  ("glass", "up"),
+)
+PROBE_MIXED_GAP = 0.75
+PROBE_CORRIDOR_WIDTHS = (0.7, 0.9, 1.2, 1.6)
+"""Free width between the glass and the wood along each corridor lane."""
+PROBE_CORRIDOR_X = (3.0, 9.0)
+_DOOR_LANE = 1.8
+_SLOPE_LANE = 2.4
+_STAIR_LANE = 3.4
+_PERSON = (0.4, 0.3)
+"""A standing person's footprint (m): across the lane, along it."""
+
+
+def _lanes(n: int, width: float) -> list[tuple[float, float]]:
+  return [(i * width, (i + 1) * width) for i in range(n)]
+
+
+def _lane_walls(length: float, lanes) -> list[Item]:
+  h = lanes[-1][1]
+  out = [*shell(length, h)]
+  for _, y1 in lanes[:-1]:
+    out += wall_y(y1, 0, length)
+  return out
+
+
+def _end_routes(lanes, length: float, ys=None):
+  """Places at each lane's two ends (on its centre line, or at ``ys`` per
+  lane) and a route each way."""
+  places, routes = {}, []
+  for i, (y0, y1) in enumerate(lanes):
+    for j, y in enumerate((ys or {}).get(i, [(y0 + y1) / 2])):
+      w, e = f"w{i}{'abc'[j]}", f"e{i}{'abc'[j]}"
+      places[w], places[e] = (0.8, y), (length - 0.8, y)
+      routes += [(w, e), (e, w)]
+  return places, tuple(routes)
+
+
+def _door(x: float, lane, gap: float, cls: str, z: float = 0.0) -> list[Item]:
+  """A wall across ``lane`` at ``x`` with a door centred in it, ``cls``
+  standing in the door against its lower jamb, leaving ``gap`` free."""
+  y0, y1 = lane
+  c, pw, pd = (y0 + y1) / 2, *_PERSON
+  lo, hi = c - (gap + pw) / 2, c + (gap + pw) / 2
+  height = 1.7 if cls == "person" else 0.8
+  return [
+    *wall_x(x, y0, y1, doors=[(lo, hi)], z0=z),
+    on(z, cls, x - pd / 2, x + pd / 2, lo, lo + pw, height, f"{cls} in the door"),
+  ]
+
+
+def _ramp_z(lane, y: float) -> float:
+  y0, y1 = lane
+  return PROBE_SLOPE_RISE * (y - y0) / (y1 - y0)
+
+
+def _off_slope(lane, cls: str, side: str, x: float) -> Item:
+  """``cls`` beside the lane's centre line at ``x``, ``PROBE_SLOPE_OFFSET``
+  off it on the ``side`` of the cross slope, standing on the ground at its
+  lower edge."""
+  c = (lane[0] + lane[1]) / 2
+  across, along = _PERSON if cls == "person" else (0.45, 0.6)
+  height = 1.7 if cls == "person" else 1.2
+  if side == "down":
+    y0, y1 = c - PROBE_SLOPE_OFFSET - across, c - PROBE_SLOPE_OFFSET
+  else:
+    y0, y1 = c + PROBE_SLOPE_OFFSET, c + PROBE_SLOPE_OFFSET + across
+  return on(_ramp_z(lane, y0), cls, x - along / 2, x + along / 2, y0, y1, height)
+
+
+def _probe_door(name: str, cls: str) -> Layout:
+  lanes = _lanes(len(PROBE_DOOR_GAPS), _DOOR_LANE)
+  items = _lane_walls(8.0, lanes)
+  for lane, gap in zip(lanes, PROBE_DOOR_GAPS, strict=True):
+    items += _door(PROBE_DOOR_X, lane, gap, cls)
+  places, routes = _end_routes(lanes, 8.0)
+  return Layout(name, (8.0, lanes[-1][1]), tuple(items), places, routes)
+
+
+def _probe_slope() -> Layout:
+  lanes = _lanes(len(PROBE_SLOPE_LANES), _SLOPE_LANE)
+  items = []
+  for (y0, y1), (cls, side) in zip(lanes, PROBE_SLOPE_LANES, strict=True):
+    items.append(Item("floor", 0, 10.0, y0, y1, 0, PROBE_SLOPE_RISE, "slope", "+y"))
+    items.append(_off_slope((y0, y1), cls, side, 5.0))
+  items += _lane_walls(10.0, lanes)
+  places, routes = _end_routes(lanes, 10.0)
+  return Layout("probe_slope", (10.0, lanes[-1][1]), tuple(items), places, routes)
+
+
+def _probe_stairs() -> Layout:
+  """Lanes along a landing (+0.45 m) whose open edge drops by two steps to
+  a person (lane 0) or a box (lane 1) at their foot; routes 0.35 and
+  0.6 m in from the edge."""
+  lanes = _lanes(2, _STAIR_LANE)
+  items, ys = [], {}
+  for i, ((y0, y1), cls) in enumerate(zip(lanes, ("person", "box"), strict=True)):
+    edge = y0 + 1.0 + 2 * STEP_RUN
+    items += stairs(0, 12.0, y0 + 1.0, edge, "+y", 0.0, 2)
+    items.append(platform(0, 12.0, edge, y1, 3 * STEP_RISE, "landing"))
+    pw, pd = _PERSON
+    height = 1.7 if cls == "person" else 0.5
+    items.append(on(0, cls, 6 - pw / 2, 6 + pw / 2, y0 + 0.6, y0 + 0.6 + pd, height))
+    ys[i] = [edge + 0.35, edge + 0.6]
+  items += _lane_walls(12.0, lanes)
+  places, routes = _end_routes(lanes, 12.0, ys)
+  return Layout("probe_stairs", (12.0, lanes[-1][1]), tuple(items), places, routes)
+
+
+def _probe_mixed() -> Layout:
+  """One route meeting both: a door beside a person (``PROBE_MIXED_GAP``
+  free), then a cross slope with a person downhill (lane 0) or uphill
+  (lane 1). The door's floor is level at the slope's centre-line height."""
+  lanes = _lanes(2, _SLOPE_LANE)
+  mid = PROBE_SLOPE_RISE / 2
+  items = []
+  for lane, side in zip(lanes, ("down", "up"), strict=True):
+    y0, y1 = lane
+    items.append(platform(0, 5.5, y0, y1, mid, "level floor"))
+    items.append(Item("floor", 5.5, 14.0, y0, y1, 0, PROBE_SLOPE_RISE, "slope", "+y"))
+    items += _door(2.8, lane, PROBE_MIXED_GAP, "person", z=mid)
+    items.append(_off_slope(lane, "person", side, 10.0))
+  items += _lane_walls(14.0, lanes)
+  places, routes = _end_routes(lanes, 14.0)
+  return Layout("probe_mixed", (14.0, lanes[-1][1]), tuple(items), places, routes)
+
+
+def _probe_corridor(name: str, glass_below: bool) -> Layout:
+  """Lanes whose middle stretch (``PROBE_CORRIDOR_X``) runs between glass
+  cabinets on one side and wooden ones on the other,
+  ``PROBE_CORRIDOR_WIDTHS`` apart, centred on the lane: glass on the lower
+  side (``probe_corridor``) or the upper (``probe_corridor_swap``)."""
+  depth, side = 0.4, 0.3
+  lanes, y = [], 0.0
+  for width in PROBE_CORRIDOR_WIDTHS:
+    lanes.append((y, y + width + 2 * (depth + side)))
+    y = lanes[-1][1]
+  x0, x1 = PROBE_CORRIDOR_X
+  items = _lane_walls(12.0, lanes)
+  for (a, b), width in zip(lanes, PROBE_CORRIDOR_WIDTHS, strict=True):
+    c = (a + b) / 2
+    lo, hi = (
+      (c - width / 2 - depth, c - width / 2),
+      (c + width / 2, c + width / 2 + depth),
+    )
+    below, above = ("glass", "box") if glass_below else ("box", "glass")
+    for cls, (y0, y1) in ((below, lo), (above, hi)):
+      label = "glass cabinets" if cls == "glass" else "wooden cabinets"
+      items.append(on(0, cls, x0, x1, y0, y1, 1.0, label))
+  places, routes = _end_routes(lanes, 12.0)
+  return Layout(name, (12.0, lanes[-1][1]), tuple(items), places, routes)
+
+
+PROBE_CORRIDOR = _probe_corridor("probe_corridor", glass_below=True)
+PROBE_CORRIDOR_SWAP = _probe_corridor("probe_corridor_swap", glass_below=False)
+PROBE_DOOR = _probe_door("probe_door", "person")
+PROBE_DOOR_BOX = _probe_door("probe_door_box", "box")
+PROBE_SLOPE = _probe_slope()
+PROBE_STAIRS = _probe_stairs()
+PROBE_MIXED = _probe_mixed()
+_PROBE_LANES = {
+  "probe_door": _lanes(len(PROBE_DOOR_GAPS), _DOOR_LANE),
+  "probe_door_box": _lanes(len(PROBE_DOOR_GAPS), _DOOR_LANE),
+  "probe_slope": _lanes(len(PROBE_SLOPE_LANES), _SLOPE_LANE),
+  "probe_stairs": _lanes(2, _STAIR_LANE),
+  "probe_mixed": _lanes(2, _SLOPE_LANE),
+}
+
+
+def probe_lanes(layout: Layout) -> list[tuple[float, float]]:
+  """A probe's lanes, ``(y0, y1)`` each, bottom to top."""
+  if layout.name.startswith("probe_corridor"):
+    ys = sorted(
+      {it.y0 for it in layout.items if it.cls == "wall" and it.x1 - it.x0 > 1}
+    )
+    ys = [y + WALL_T / 2 for y in ys]
+    return list(zip(ys[:-1], ys[1:], strict=True))
+  return _PROBE_LANES[layout.name]
+
+
+HOUSEHOLD = ("apartment", "loft", "garden", "townhouse", "lobby", "crowd", "hall")
+HOUSEHOLD += ("side_crowd",)
+"""The household experiment's layouts; the rest of ``LAYOUTS`` are probes."""
 LAYOUTS: dict[str, Layout] = {
   lay.name: lay
-  for lay in (APARTMENT, LOFT, GARDEN, TOWNHOUSE, LOBBY, CROWD, HALL, SIDE_CROWD)
+  for lay in (
+    APARTMENT,
+    LOFT,
+    GARDEN,
+    TOWNHOUSE,
+    LOBBY,
+    CROWD,
+    HALL,
+    SIDE_CROWD,
+    PROBE_DOOR,
+    PROBE_DOOR_BOX,
+    PROBE_SLOPE,
+    PROBE_STAIRS,
+    PROBE_MIXED,
+    PROBE_CORRIDOR,
+    PROBE_CORRIDOR_SWAP,
+  )
 }
 
 
