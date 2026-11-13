@@ -101,6 +101,7 @@ from failbench.mppi.nav2 import Nav2Mppi, Nav2MppiCfg, nav2_costmap
 from failbench.mppi.planner import VULNERABLE_FAULTS, Mppi, MppiCfg
 from failbench.mppi.profiles import PROFILES, apply_changes, changes_from_stock
 from failbench.mppi.risk_critic import RiskCritic, RiskCriticCfg, blank_obstacles
+from failbench.mppi.site_fields import SiteFields, scan_site, site_bounds
 from failbench.paths import local_path, resample
 from failbench.replay import FaultWindow, ObjectBoxes
 from failbench.scripts.generate import policy_estimates
@@ -180,6 +181,11 @@ class RunMppiConfig:
   """Show robot 0 in a MuJoCo window paced to the wall clock, with its plan
   and global path."""
   live_brightness: float = 1.0
+  prebuilt_fields: bool = False
+  """The risk critic's distance fields built once from a scan of the whole
+  site and cropped at the robot's pose each cycle (``mppi/site_fields.py``),
+  not rebuilt from its own scan; drops still per cycle. Static site and
+  ``--sweep-map oracle`` only."""
   """``--live``: the light, as a fraction of the environment figure's."""
   fault_aware: bool = True
   """Tell the dynamics model the fault once it fires; off, it is always given
@@ -518,6 +524,8 @@ def run(cfg: RunMppiConfig) -> dict:
   route_t = -math.inf
   if cfg.realtime and cfg.planner not in ("nav2", "dwb"):
     raise ValueError("--realtime is for --planner nav2 / dwb.")
+  if cfg.prebuilt_fields and not (cfg.risk_critic and cfg.sweep_map == "oracle"):
+    raise ValueError("--prebuilt-fields needs --risk-critic and --sweep-map oracle.")
   if cfg.planner in ("nav2", "dwb"):
     if cfg.explain or cfg.replan_every_s != cfg.nav2.model_dt:
       raise ValueError("Nav2 MPPI plans every model_dt and has no explain mode.")
@@ -698,12 +706,28 @@ def run(cfg: RunMppiConfig) -> dict:
   rt_new: torch.Tensor | None = None
   rt_land, rt_j0 = 0, 0
   rt_ms: list[float] = []
+  rt_at: list[float] = []  # Sim time (s) each plan started.
   live = (
     LiveView(env.sim.mj_model, brightness=cfg.live_brightness) if cfg.live else None
   )
   live_new: np.ndarray | None = None
   live_t0: list[float] = []
   obs, _ = wrapped.reset()
+  site: SiteFields | None = None
+  if cfg.prebuilt_fields:
+    t_site = time.perf_counter()
+    mjm = env.sim.mj_model
+    if mjm.nmocap:
+      raise ValueError("--prebuilt-fields needs a static site (this one has mocap).")
+    fp = cfg.risk.footprint
+    # From the scanner's height above the trunk (fault_elevation_sensor_cfg).
+    z0 = float(robot.data.root_link_pos_w[:, 2].max()) + 2.0
+    scan = scan_site(mjm, site_bounds(mjm, fp.max_dist_m), MAP_RESOLUTION, z0)
+    site = SiteFields(scan, map_sev, MAP_RESOLUTION, fp)
+    print(
+      f"[INFO] Site fields: {tuple(scan.height.shape)} cells, levels "
+      f"{site.values}, built in {time.perf_counter() - t_site:.1f} s"
+    )
   for i in range(num_steps):
     if live is not None and not live.running():
       break
@@ -951,8 +975,18 @@ def run(cfg: RunMppiConfig) -> dict:
         # map, and priced by the critic from the severity map.
         objects = crop_center(severity > 0, MAP_CELLS)
         critic_inputs = inputs | {"map": blank_obstacles(model_map, objects)}
-        level = severity_levels(plan_h, severity, MAP_RESOLUTION, cfg.risk.footprint)
-        risk_fields = fields_of_levels(level, MAP_RESOLUTION, cfg.risk.footprint)
+        fp = cfg.risk.footprint
+        if site is not None:
+          risk_fields = site.sample(pos[:, :2], heading(quat), plan_h.shape[-1])
+          drops = drop_cells(plan_h, fp, MAP_RESOLUTION)
+          if drops.any():  # From the floor the robot is on: per cycle.
+            risk_fields.append(
+              (DROP_SEVERITY, distance_field(drops, MAP_RESOLUTION, fp.max_dist_m))
+            )
+          level = None
+        else:
+          level = severity_levels(plan_h, severity, MAP_RESOLUTION, fp)
+          risk_fields = fields_of_levels(level, MAP_RESOLUTION, fp)
         context = {
           "inputs": critic_inputs,
           "risk_fields": risk_fields,
@@ -995,9 +1029,11 @@ def run(cfg: RunMppiConfig) -> dict:
         torch.cuda.synchronize()
         ms = 1e3 * (time.perf_counter() - rt_t0)
         rt_ms.append(ms)
+        rt_at.append(i * step_dt)
         lag = max(1, math.ceil(ms / 1e3 / step_dt - 1e-9))  # Control steps.
         rt_new = planner.plan
-        rt_land = i + 1 + lag
+        # Started at step i, ready by the start of step i + lag.
+        rt_land = i + lag
         rt_j0 = int(lag * step_dt / cfg.nav2.model_dt + 1e-9)
         if fresh.any():  # Nothing to run before the first plan.
           rt_land, rt_j0 = i + 1, 0
@@ -1244,7 +1280,9 @@ def run(cfg: RunMppiConfig) -> dict:
   if rt_ms:
     summary["realtime_plan_ms_mean"] = float(np.mean(rt_ms))
     summary["realtime_plan_ms_p95"] = float(np.percentile(rt_ms, 95))
-    summary["realtime_plans_per_s"] = len(rt_ms) / cfg.duration_s
+    # Over the time actually run: a run can end early (goal, window closed).
+    span = rt_at[-1] - rt_at[0]
+    summary["realtime_plans_per_s"] = (len(rt_at) - 1) / span if span > 0 else 0.0
 
   out_path = Path(cfg.output)
   out_path.parent.mkdir(parents=True, exist_ok=True)
