@@ -74,6 +74,21 @@ class CbfCfg:
   footprint: FootprintCfg = field(default_factory=FootprintCfg)
 
 
+def severity_levels(
+  height: torch.Tensor,
+  severity: torch.Tensor | None,
+  resolution: float,
+  fp: FootprintCfg,
+) -> torch.Tensor:
+  """The severity ``[n, H, W]`` of each cell there is something to hit in
+  (0 elsewhere): obstacle cells of ``height`` at their ``severity``
+  (``DEFAULT_SEVERITY`` without one), drops at ``DROP_SEVERITY``."""
+  obst = obstacle_cells(height, fp.wall_jump_m)
+  level = torch.where(obst, DEFAULT_SEVERITY if severity is None else severity, 0.0)
+  drops = drop_cells(height, fp, resolution)
+  return torch.where(drops, level.clamp(min=DROP_SEVERITY), level)
+
+
 def severity_fields(
   height: torch.Tensor,
   severity: torch.Tensor | None,
@@ -83,10 +98,16 @@ def severity_fields(
   """(severity, distance field) per severity level of the map ``height [n,
   H, W]`` (``severity`` per cell; ``DEFAULT_SEVERITY`` without), drops at
   ``DROP_SEVERITY``, as the planner's fault-risk fields."""
-  obst = obstacle_cells(height, fp.wall_jump_m)
-  level = torch.where(obst, DEFAULT_SEVERITY if severity is None else severity, 0.0)
-  drops = drop_cells(height, fp, resolution)
-  level = torch.where(drops, level.clamp(min=DROP_SEVERITY), level)
+  return fields_of_levels(
+    severity_levels(height, severity, resolution, fp), resolution, fp
+  )
+
+
+def fields_of_levels(
+  level: torch.Tensor, resolution: float, fp: FootprintCfg
+) -> list[tuple[float, torch.Tensor]]:
+  """(severity, distance field) per severity in ``level [n, H, W]``
+  (``severity_levels``)."""
   return [
     (v, distance_field(level == v, resolution, fp.max_dist_m))
     for v in level.unique().tolist()

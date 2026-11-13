@@ -45,10 +45,10 @@ from failbench.mppi.costmap import FootprintCfg, hit_prob
 from failbench.mppi.inputs import deadband, integrate_plan
 from failbench.mppi.models import DynamicsModel
 from failbench.severity import (
-  DEFAULT_ENERGY_SCALE,
   LEVEL_ENERGY_SCALE,
   MASS_KG,
   damage,
+  energy_scale_for,
 )
 
 
@@ -81,8 +81,9 @@ class RiskCriticCfg:
   energy_scale: dict[float, float] = field(
     default_factory=lambda: dict(LEVEL_ENERGY_SCALE)
   )
-  """Energy scale (J) per severity level (``failbench.severity``); levels
-  not listed take ``DEFAULT_ENERGY_SCALE``."""
+  """Energy scale (J) per severity level (``failbench.severity``); a
+  severity not listed takes ``energy_scale_for`` (interpolated between the
+  known classes)."""
   footprint: FootprintCfg = field(default_factory=FootprintCfg)
   zero_below: float = 0.2
   """The command term's deadband (``GoalVelocityCommand``)."""
@@ -255,28 +256,14 @@ class RiskCritic:
       pred = self.model.predict(rep, seq, cp)
       parts.append(self._damage(pred, cp, fields, data["resolution"]))
     cost = torch.cat(parts, 1).unflatten(0, (n, nf)).permute(0, 2, 1)
-    self.last = {"per_fault": cost}
+    # The labels the distilled critic learns from (failbench/distill).
+    self.last = {"per_fault": cost, "commands": cmd}
+    if "stock_cost" in data:
+      self.last["stock_cost"] = data["stock_cost"]
     return c.weight * self._shares(cost, prior).sum(-1)
 
   def _shares(self, cost: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
-    """Each fault's share ``[..., F]`` of the combined damage of per-fault
-    damages ``cost [..., F]`` under ``prior [F]`` (``measure``)."""
-    prior = prior.to(cost)
-    if self.cfg.measure == "mean":
-      return cost * prior
-    if self.cfg.measure == "max":
-      # The worst fault alone, however unlikely.
-      worst = cost.argmax(-1, keepdim=True)
-      return cost * torch.zeros_like(cost).scatter(-1, worst, 1.0)
-    # CVaR: the worst faults first, each weighted by the part of its prior
-    # inside the worst alpha.
-    alpha = self.cfg.cvar_alpha
-    order = cost.argsort(-1, descending=True)
-    p = prior.expand_as(cost).gather(-1, order)
-    before = p.cumsum(-1) - p
-    inside = (alpha - before).clamp(min=0).minimum(p) / alpha
-    weight = torch.zeros_like(cost).scatter(-1, order, inside)
-    return cost * weight
+    return fault_shares(cost, prior, self.cfg)
 
   def _damage(
     self,
@@ -315,7 +302,31 @@ class RiskCritic:
       touch = hit_prob(
         dist.repeat_interleave(nf, 0), pose, pred["drift_std"], resolution, c.footprint
       )
-      scale = c.energy_scale.get(severity, DEFAULT_ENERGY_SCALE)
+      # A severity of no known class: its scale by the rule.
+      scale = c.energy_scale.get(severity) or energy_scale_for(severity)
       cost = cost + (touch * damage(severity, energy, scale)).amax(-1)
       worst = worst.maximum(touch.amax(-1))
     return cost, worst
+
+
+def fault_shares(
+  cost: torch.Tensor, prior: torch.Tensor, cfg: RiskCriticCfg
+) -> torch.Tensor:
+  """Each fault's share ``[..., F]`` of the combined damage of per-fault
+  damages ``cost [..., F]`` under ``prior [F]`` (``cfg.measure``)."""
+  prior = prior.to(cost)
+  if cfg.measure == "mean":
+    return cost * prior
+  if cfg.measure == "max":
+    # The worst fault alone, however unlikely.
+    worst = cost.argmax(-1, keepdim=True)
+    return cost * torch.zeros_like(cost).scatter(-1, worst, 1.0)
+  # CVaR: the worst faults first, each weighted by the part of its prior
+  # inside the worst alpha.
+  alpha = cfg.cvar_alpha
+  order = cost.argsort(-1, descending=True)
+  p = prior.expand_as(cost).gather(-1, order)
+  before = p.cumsum(-1) - p
+  inside = (alpha - before).clamp(min=0).minimum(p) / alpha
+  weight = torch.zeros_like(cost).scatter(-1, order, inside)
+  return cost * weight

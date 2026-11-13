@@ -60,6 +60,9 @@ from heat_bench.scripts.policy_loading import load_runner
 
 from failbench.commands import GOAL_TERM, GoalVelocityCommand
 from failbench.data.build import FallMonitor, _yaw_rotate_quat, lidar_known
+from failbench.distill.dump import LabelDump
+from failbench.distill.layers import map_layers
+from failbench.distill.relabel import RelabelSet, relabel_values
 from failbench.env_cfg import (
   DEFAULT_TASK,
   GOAL_MODES,
@@ -80,8 +83,16 @@ from failbench.global_planner import plan_paths
 from failbench.goals import route_progress, sample_goal
 from failbench.house import LAYOUTS
 from failbench.house_terrain import HOUSE_TERRAINS, route_table
-from failbench.mppi.cbf import CbfCfg, CbfFilter, severity_fields
+from failbench.live_view import LiveView
+from failbench.mppi.cbf import (
+  CbfCfg,
+  CbfFilter,
+  fields_of_levels,
+  severity_fields,
+  severity_levels,
+)
 from failbench.mppi.costmap import distance_field, drop_cells, obstacle_cells
+from failbench.mppi.distilled_critic import DistilledCritic, ImpactContext, load_student
 from failbench.mppi.dwb import Dwb, DwbCfg
 from failbench.mppi.fault_critic import FaultRiskCritic
 from failbench.mppi.inputs import HistoryBuffer, crop_center
@@ -155,6 +166,21 @@ class RunMppiConfig:
   """Replan this often; in between, the robot plays the current plan out
   open loop (goal and fall checks still run every 0.1 s). Longer commitments
   show how good each plan is, since feedback can't fix it as fast."""
+  realtime: bool = False
+  """Plan as a robot does live (Nav2 / DWB): a plan takes effect only once
+  the planner's measured compute time (costmap, critic context and
+  ``planner.step``) has passed in sim time, the robot playing its previous
+  plan meanwhile, and no new plan starts until it has (a planner slower
+  than ``replan_every_s`` skips cycles)."""
+  house_route: str | None = None
+  """A household layout's one route, ``FROM:TO``, each a place of the layout
+  (``failbench/house.py``) or ``x,y`` in metres in its frame; the global
+  path is planned between them. Default: the layout's own routes."""
+  live: bool = False
+  """Show robot 0 in a MuJoCo window paced to the wall clock, with its plan
+  and global path."""
+  live_brightness: float = 1.0
+  """``--live``: the light, as a fraction of the environment figure's."""
   fault_aware: bool = True
   """Tell the dynamics model the fault once it fires; off, it is always given
   the healthy vector (a planner that ignores the fault, same model)."""
@@ -229,6 +255,24 @@ class RunMppiConfig:
   """``nav2`` / ``dwb``: add the fault-risk critic (``risk``,
   ``failbench/mppi/risk_critic.py``), our method; its ``weight`` the knob."""
   risk: RiskCriticCfg = field(default_factory=RiskCriticCfg)
+  distilled_critic: str | None = None
+  """With ``risk_critic``: plan with the distilled critic in this
+  checkpoint (``failbench/distill``) instead of the impact model's; the
+  teacher still logs the chosen plan's throws."""
+  distill_dump: str | None = None
+  """With ``risk_critic`` on ``nav2``: record the critic's labels for the
+  distilled critic (``failbench/distill/dump.py``) into
+  ``<this>_<i>.npz``, every ``distill_every`` cycles, robots not yet
+  faulted. The critic prices every cycle even at weight 0."""
+  distill_every: int = 10
+  distill_relabel: float = 0.0
+  """Give this share of the objects, per robot, a random severity on the
+  planner's map (physics and the safety metrics keep the true class), so
+  the distillation data ties no shape, room or class to a severity."""
+  distill_relabel_set: RelabelSet = "train"
+  """The severities relabelled objects draw from (``relabel_values``):
+  ``train``, or ``held_out``, values between them, to check the student on
+  severities it never saw."""
   global_route: bool = False
   """``nav2`` / ``dwb``: track a NavFn-style global path (``_global_route``)
   instead of the straight line to the goal, as stock Nav2 runs its local
@@ -344,8 +388,33 @@ def _to_world(path: torch.Tensor, pos: torch.Tensor, yaw: torch.Tensor):
   )
 
 
+def _set_house_route(terrain: str, spec: str) -> None:
+  """Give household layout ``terrain`` the one route ``spec`` (``FROM:TO``)."""
+  if terrain not in HOUSE_TERRAINS:
+    raise ValueError("--house-route is for the household layouts (house_*).")
+  name = HOUSE_TERRAINS[terrain]
+  lay = LAYOUTS[name]
+  places = dict(lay.places)
+  ends = spec.split(":")
+  if len(ends) != 2:
+    raise ValueError(f"--house-route wants FROM:TO, got {spec!r}.")
+  for end in ends:
+    if end in places:
+      continue
+    try:
+      x, y = (float(v) for v in end.split(","))
+    except ValueError:
+      known = ", ".join(sorted(places))
+      raise ValueError(f"{end!r}: not x,y nor a place of {name} ({known}).") from None
+    places[end] = (x, y)
+  LAYOUTS[name] = replace(lay, places=places, routes=((ends[0], ends[1]),))
+  route_table.cache_clear()
+
+
 def run(cfg: RunMppiConfig) -> dict:
   cfg = replace(cfg, nav2=apply_changes(cfg.nav2, PROFILES[cfg.nav2_profile]))
+  if cfg.house_route:
+    _set_house_route(cfg.terrain, cfg.house_route)
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
   torch.manual_seed(cfg.seed)
@@ -413,6 +482,20 @@ def run(cfg: RunMppiConfig) -> dict:
   assert isinstance(command, GoalVelocityCommand)
   elev = env.scene[MPPI_MAP_SENSOR]
   geom_sev = geom_severity(env.sim.mj_model, device=device)
+  map_sev = geom_sev.expand(n, -1).clone()
+  """Severity per env and geom on the planner's map (``distill_relabel``)."""
+  if cfg.distill_relabel > 0:
+    gen = torch.Generator(device=device).manual_seed(cfg.seed)
+    levels = torch.tensor(
+      relabel_values(cfg.distill_relabel_set), device=device, dtype=map_sev.dtype
+    )
+    draw = levels[
+      torch.randint(len(levels), map_sev.shape, generator=gen, device=device)
+    ]
+    swap = (geom_sev > 0) & (
+      torch.rand(map_sev.shape, generator=gen, device=device) < cfg.distill_relabel
+    )
+    map_sev = torch.where(swap, draw, map_sev)
   geom_scale = geom_severity(
     env.sim.mj_model, ENERGY_SCALE, DEFAULT_ENERGY_SCALE, device, ground=1.0
   )
@@ -433,15 +516,25 @@ def run(cfg: RunMppiConfig) -> dict:
   route_w: torch.Tensor | None = None
   route_real = route_at = torch.zeros(n, dtype=torch.long, device=device)
   route_t = -math.inf
+  if cfg.realtime and cfg.planner not in ("nav2", "dwb"):
+    raise ValueError("--realtime is for --planner nav2 / dwb.")
   if cfg.planner in ("nav2", "dwb"):
     if cfg.explain or cfg.replan_every_s != cfg.nav2.model_dt:
       raise ValueError("Nav2 MPPI plans every model_dt and has no explain mode.")
     # Our method: the fault risk, priced by the legacy planner's code, as one
     # more critic (``--mppi.fault-risk.p`` > 0; its weight the critic's).
     critics: list = []
+    if (cfg.distilled_critic or cfg.distill_dump) and not cfg.risk_critic:
+      raise ValueError("The distilled critic and its dump need --risk-critic.")
     if cfg.risk_critic:
       risk_critic = RiskCritic(cfg.risk, model)
-      if cfg.risk.weight > 0:  # At 0 it only logs the throws: stock MPPI.
+      if cfg.distilled_critic:
+        if not isinstance(model, ImpactDynamics):
+          raise ValueError("The distilled critic needs the impact model's encoder.")
+        student = load_student(cfg.distilled_critic, device)
+        critics.append(DistilledCritic(cfg.risk, student, ImpactContext(model)))
+      # At 0 it only logs the throws (stock MPPI), unless it labels.
+      elif cfg.risk.weight > 0 or cfg.distill_dump:
         critics.append(risk_critic)
     elif cfg.mppi.fault_risk.p > 0:
       engine = Mppi(cfg.mppi, model, n, device)
@@ -452,6 +545,13 @@ def run(cfg: RunMppiConfig) -> dict:
       planner = Nav2Mppi(cfg.nav2, n, device, extra_critics=critics)
   else:
     planner = Mppi(cfg.mppi, model, n, device)
+  dump = None
+  if cfg.distill_dump:
+    if not isinstance(planner, Nav2Mppi):
+      raise ValueError("The distillation labels are recorded on nav2.")
+    if cfg.risk.top_m is not None:
+      raise ValueError("The labels need every sample priced (no top_m).")
+    dump = LabelDump(cfg.distill_dump, seed=cfg.seed)
   house = HOUSE_TERRAINS.get(cfg.terrain)
   if house is not None:
     # The household layouts: each robot tracks its route's global path,
@@ -593,8 +693,31 @@ def run(cfg: RunMppiConfig) -> dict:
   snap_every = round(cfg.save_state_every_s / step_dt) if cfg.save_state_every_s else 0
   snaps: list[dict[str, np.ndarray]] = []
   snap_steps: list[int] = []
+  # --realtime: the plan being computed, the control step it lands at and
+  # the plan index running then; each plan's compute time (ms).
+  rt_new: torch.Tensor | None = None
+  rt_land, rt_j0 = 0, 0
+  rt_ms: list[float] = []
+  live = (
+    LiveView(env.sim.mj_model, brightness=cfg.live_brightness) if cfg.live else None
+  )
+  live_new: np.ndarray | None = None
+  live_t0: list[float] = []
   obs, _ = wrapped.reset()
   for i in range(num_steps):
+    if live is not None and not live.running():
+      break
+    if rt_new is not None and i >= rt_land:
+      # The plan computed rt_land steps ago is ready: run it from where it
+      # has got to by now.
+      planner.plan = torch.cat(
+        [rt_new[:, rt_j0:], rt_new[:, -1:].expand(-1, rt_j0, -1)], 1
+      )
+      command.external[:] = torch.where(active[:, None], planner.plan[:, 0], 0.0)
+      rt_new = None
+      if live is not None:
+        live.set_path("plan", live_new, (0.1, 0.9, 0.2, 1.0))
+        live.set_path("computing", None, None)
     if cfg.post_fault == "hold":
       # The robot hasn't noticed: the command running when the fault fired,
       # held for hold_s, then a stop. Nothing is replanned.
@@ -611,6 +734,8 @@ def run(cfg: RunMppiConfig) -> dict:
       vel_est, latent = policy_estimates(actor, obs, n, device)
     step = i + 1
     t = step * step_dt
+    if live is not None:
+      live.update(env.sim.data, t, every=2, step=step)
     if snap_every and step % snap_every == 0:
       snaps.append(snapshot(env, dict(obs)))
       snap_steps.append(step)
@@ -626,7 +751,8 @@ def run(cfg: RunMppiConfig) -> dict:
 
     z = elev.data.hit_pos_w[..., 2] - pos[:, 2:3]
     height = torch.where(elev.data.distances < 0, float("nan"), z).view(n, cells, cells)
-    severity = geom_sev[elev.data.hit_geom_id.long()].view(n, cells, cells)
+    hit = elev.data.hit_geom_id.long().view(n, -1) % len(geom_sev)  # -1: miss.
+    severity = map_sev.gather(1, hit).view(n, cells, cells)
     base_height = -height[:, mid, mid].flatten(1).nanmedian(dim=-1).values
     tilt = tilt_angle(data.projected_gravity_b)
     _, _, contact_w, force_w, valid = contacts_in_base_frame(sensor, robot)
@@ -741,7 +867,8 @@ def run(cfg: RunMppiConfig) -> dict:
       command.external[:] = torch.where(active[:, None], follow, 0.0)
       command.use_external |= started
       continue
-    if not (fresh.any() or c % replan_k == 0):
+    busy = rt_new is not None and not fresh.any()
+    if busy or not (fresh.any() or c % replan_k == 0):
       cmd = torch.where(active[:, None], planner.advance(), 0.0)
       command.external[:] = cmd
       # The committed plan stays where it was drawn in the world.
@@ -809,19 +936,32 @@ def run(cfg: RunMppiConfig) -> dict:
       body_v = torch.cat(
         [(vel_est / LIN_VEL_SCALE)[:, :2], data.root_link_ang_vel_b[:, 2:3]], -1
       )
+      rt_t0, rt_held, rt_cur = 0.0, None, None
+      if cfg.realtime:
+        torch.cuda.synchronize()
+        rt_t0 = time.perf_counter()
+        # What the robot runs while this plan is computed: the last plan on.
+        rt_held = planner.advance()
+        rt_cur = planner.plan.clone()
       costmap = nav2_costmap(plan_h, MAP_RESOLUTION, planner.cfg.costmap, severity)
       context = None
+      critic_inputs = None
       if cfg.risk_critic:
         # The model knows terrain only: objects are flattened out of its
         # map, and priced by the critic from the severity map.
         objects = crop_center(severity > 0, MAP_CELLS)
+        critic_inputs = inputs | {"map": blank_obstacles(model_map, objects)}
+        level = severity_levels(plan_h, severity, MAP_RESOLUTION, cfg.risk.footprint)
+        risk_fields = fields_of_levels(level, MAP_RESOLUTION, cfg.risk.footprint)
         context = {
-          "inputs": inputs | {"map": blank_obstacles(model_map, objects)},
-          "risk_fields": severity_fields(
-            plan_h, severity, MAP_RESOLUTION, cfg.risk.footprint
-          ),
+          "inputs": critic_inputs,
+          "risk_fields": risk_fields,
           "exposed": ~told,  # Faults still to come.
         }
+        if cfg.distilled_critic:
+          context["distill_layers"] = map_layers(
+            plan_h, severity, MAP_RESOLUTION, cfg.risk.footprint, level
+          )
       elif planner.extra_critics:
         fp = cfg.mppi.footprint
         engine = planner.extra_critics[0].engine
@@ -850,6 +990,30 @@ def run(cfg: RunMppiConfig) -> dict:
           route_t = t
         path, route_at = local_path(route_w, route_real, route_at, pose_w, planner.cfg)
       out = planner.step(costmap, MAP_RESOLUTION, goal, body_v, context, path)
+      if cfg.realtime:
+        assert rt_held is not None and rt_cur is not None
+        torch.cuda.synchronize()
+        ms = 1e3 * (time.perf_counter() - rt_t0)
+        rt_ms.append(ms)
+        lag = max(1, math.ceil(ms / 1e3 / step_dt - 1e-9))  # Control steps.
+        rt_new = planner.plan
+        rt_land = i + 1 + lag
+        rt_j0 = int(lag * step_dt / cfg.nav2.model_dt + 1e-9)
+        if fresh.any():  # Nothing to run before the first plan.
+          rt_land, rt_j0 = i + 1, 0
+        planner.plan = rt_cur
+        out["cmd"] = rt_held if not fresh.any() else rt_new[:, 0]
+      if dump is not None and c % cfg.distill_every == 0:
+        assert risk_critic is not None and critic_inputs is not None
+        dump.record(
+          risk_critic.last,
+          -out["weight"],
+          critic_inputs,
+          plan_h,
+          severity,
+          active & ~told,
+          {"step": np.full(n, step), "env": np.arange(n)},
+        )
       if risk_critic is not None and context is not None:
         # Where each imagined fault would throw the plan the robot runs, as
         # the critic prices it (one firing point: now), for the replay.
@@ -941,6 +1105,21 @@ def run(cfg: RunMppiConfig) -> dict:
     command.external[:] = cmd
     command.use_external |= started
     yaw = heading(quat)
+    if live is not None:
+      live_new = _to_world(out["path"], pos, yaw)[0].cpu().numpy()
+      live.set_path(
+        "computing" if cfg.realtime else "plan",
+        live_new,
+        (1.0, 0.85, 0.1, 0.8) if cfg.realtime else (0.1, 0.9, 0.2, 1.0),
+      )
+      if route_w is not None:
+        live.set_path(
+          "route", route_w[0, : int(route_real[0])].cpu().numpy(), (0.2, 0.4, 1.0, 0.8)
+        )
+      live_t0.append(t)
+      rate = sum(t - x < 2.0 - 1e-9 for x in live_t0) / min(2.0, max(t, 0.1))
+      ms = f"{rt_ms[-1]:4.0f} ms" if rt_ms else "-"
+      live.text = f"t {t:5.1f} s\nplan compute {ms}\nplans/s {rate:4.1f}"
     for k, v in {
       "path_w": _to_world(out["path"], pos, yaw),
       "pred_w": _to_world(out["pred_path"], pos, yaw),
@@ -1062,9 +1241,18 @@ def run(cfg: RunMppiConfig) -> dict:
       "mean_damage": float(hurt_np[sel].mean()),
     }
   summary["plan_ms_mean"] = 1e3 * float(np.mean(plan_time)) if plan_time else None
+  if rt_ms:
+    summary["realtime_plan_ms_mean"] = float(np.mean(rt_ms))
+    summary["realtime_plan_ms_p95"] = float(np.percentile(rt_ms, 95))
+    summary["realtime_plans_per_s"] = len(rt_ms) / cfg.duration_s
 
   out_path = Path(cfg.output)
   out_path.parent.mkdir(parents=True, exist_ok=True)
+  distill_shards = []
+  if dump is not None:
+    dump.flush()
+    distill_shards = [str(p) for p in dump.written]
+    print(f"[INFO] distill_shards: {distill_shards}")
   arrays: dict[str, np.ndarray] = {
     **{f"dense_{k}": v for k, v in log.items()},
     **{f"cycle_{k}": v for k, v in cyc.items()},
@@ -1110,8 +1298,11 @@ def run(cfg: RunMppiConfig) -> dict:
     "planner_changes": changes,
     "summary": summary,
     "trials": trials,
+    "distill_shards": distill_shards,
   }
   (out_path.parent / f"{out_path.name}.json").write_text(json.dumps(result, indent=2))
+  if live is not None:
+    live.close()
   env.close()
   return result
 

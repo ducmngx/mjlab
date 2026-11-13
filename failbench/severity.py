@@ -70,6 +70,21 @@ LEVEL_ENERGY_SCALE: dict[float, float] = {
 which carry only the severity: classes sharing a severity share a scale."""
 
 
+def energy_scale_for(severity: float) -> float:
+  """The energy scale (J) of an object known only by its severity: the
+  known classes' own (``LEVEL_ENERGY_SCALE``), linearly interpolated in
+  severity between them, the nearest class's outside their range. A new
+  entity is defined by its severity alone: e.g. 37.5, halfway between glass
+  (25, 5 J) and a person (50, 1 J), takes 3 J."""
+  known = sorted(LEVEL_ENERGY_SCALE.items())
+  if severity <= known[0][0]:
+    return known[0][1]
+  for (s0, e0), (s1, e1) in zip(known, known[1:], strict=False):
+    if severity <= s1:
+      return e0 + (e1 - e0) * (severity - s0) / (s1 - s0)
+  return known[-1][1]
+
+
 def damage(severity, energy, scale):
   """The damage of a hit at kinetic ``energy`` (J) on an object of
   ``severity`` and energy ``scale``: ``severity * (1 - exp(-energy /
