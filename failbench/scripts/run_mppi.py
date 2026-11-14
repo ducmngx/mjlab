@@ -181,10 +181,12 @@ class RunMppiConfig:
   """Show robot 0 in a MuJoCo window paced to the wall clock, with its plan
   and global path."""
   live_brightness: float = 1.0
-  live_map: bool = False
-  """``--live``: draw the planner's scan, each cell it counts as something to
-  hit (``severity_levels``) as a tile on top, coloured by severity: what
-  the planner and critic actually see."""
+  live_map: Literal["none", "model", "scan"] = "none"
+  """``--live``: ``model`` draws the impact model's elevation map input (the
+  3.2 m crop round the robot, objects flattened, as the critic gives it) as
+  tiles at their height, coloured by height; ``scan`` draws each cell of
+  the planner's scan it counts as something to hit (``severity_levels``),
+  coloured by severity."""
   decor: bool | None = None
   """Household objects drawn as stylised figures (``failbench/decor.py``),
   look only: the boxes stay and are all that is checked. None: on with
@@ -438,6 +440,31 @@ def _scan_tiles(
   keys = torch.tensor(list(_TILE_RGBA), device=level.device)
   pick = (level[j, i, None] - keys).abs().argmin(-1).cpu().numpy()
   colours = np.array(list(_TILE_RGBA.values()))[pick]
+  return world.cpu().numpy(), colours, MAP_RESOLUTION / 2
+
+
+def _model_tiles(
+  model_map: torch.Tensor, pos: torch.Tensor, yaw: torch.Tensor
+) -> tuple[np.ndarray, np.ndarray, float]:
+  """Robot 0's impact-model map ``[1, 2, H, W]`` (height relative to the
+  trunk, known) as tiles for ``LiveView.set_cells``: each known cell at its
+  height, blue 0.5 m or more below the robot's floor (the map's median),
+  white at it, orange 0.5 m or more above."""
+  height, known = model_map[0, 0].float(), model_map[0, 1] > 0.5
+  j, i = torch.nonzero(known, as_tuple=True)
+  h, w = height.shape
+  x = (i.float() - (w - 1) / 2) * MAP_RESOLUTION
+  y = (j.float() - (h - 1) / 2) * MAP_RESOLUTION
+  z = height[j, i]
+  c, s = torch.cos(yaw[0]), torch.sin(yaw[0])
+  world = torch.stack(
+    [pos[0, 0] + c * x - s * y, pos[0, 1] + s * x + c * y, pos[0, 2] + z + 0.01], -1
+  )
+  f = ((z - z.median()) / 0.5).clamp(-1, 1).cpu().numpy()[:, None]
+  white = np.array([0.95, 0.95, 0.95])
+  blue, orange = np.array([0.16, 0.47, 0.84]), np.array([0.92, 0.41, 0.20])
+  rgb = np.where(f < 0, white + (blue - white) * -f, white + (orange - white) * f)
+  colours = np.concatenate([rgb, np.full((len(rgb), 1), 0.85)], 1)
   return world.cpu().numpy(), colours, MAP_RESOLUTION / 2
 
 
@@ -767,6 +794,7 @@ def run(cfg: RunMppiConfig) -> dict:
   live_t0: list[float] = []
   obs, _ = wrapped.reset()
   site: SiteFields | None = None
+  critic_inputs: dict | None = None
   if cfg.prebuilt_fields:
     t_site = time.perf_counter()
     mjm = env.sim.mj_model
@@ -1205,8 +1233,11 @@ def run(cfg: RunMppiConfig) -> dict:
         live.set_path(
           "route", route_w[0, : int(route_real[0])].cpu().numpy(), (0.2, 0.4, 1.0, 0.8)
         )
-      if cfg.live_map:
+      if cfg.live_map == "scan":
         live.set_cells(*_scan_tiles(plan_h[:1], severity[:1], pos[:1], yaw[:1], cfg))
+      elif cfg.live_map == "model":
+        model_in = (critic_inputs or inputs)["map"]
+        live.set_cells(*_model_tiles(model_in[:1], pos[:1], yaw[:1]))
       live_t0.append(t)
       rate = sum(t - x < 2.0 - 1e-9 for x in live_t0) / min(2.0, max(t, 0.1))
       ms = f"{rt_ms[-1]:4.0f} ms" if rt_ms else "-"
