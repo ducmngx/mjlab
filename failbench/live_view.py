@@ -33,8 +33,11 @@ CLASS_HEX = {
   "box": "#1baf7a",
   "wall": "#52514e",
 }
-ROUGH_HEX = "#dcc89a"  # Rough ground: sand.
-FLOOR_LOW, FLOOR_HIGH = "#ececec", "#a3a3a3"  # Floor at 0 m and 1 m up.
+ROUGH_HEX = "#c9b78f"  # Rough ground: muted sand.
+# Floor at 0 m and 1 m up: a warm mid grey, not white, so the scene
+# prints without glare and the objects stand out.
+FLOOR_LOW, FLOOR_HIGH = "#b8b2a6", "#8a857b"
+BORDER_HEX = "#9e9a91"  # The ground round the tile.
 
 
 def _rgba(h: str, a: float = 1.0) -> list[float]:
@@ -58,9 +61,9 @@ def _paper_style(model: mujoco.MjModel, brightness: float) -> None:
   for g in range(model.ngeom):
     name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
     if name.startswith("terrain"):
-      model.geom_rgba[g] = _rgba("#ffffff")  # The border round the tile.
-    if not name.startswith("course_"):
-      continue
+      model.geom_rgba[g] = _rgba(BORDER_HEX)
+    if not name.startswith("course_") or model.geom_rgba[g][3] < 0.01:
+      continue  # Hidden boxes stay hidden: a decor figure is drawn instead.
     cls = name[len("course_") :].rsplit("_", 1)[0]
     if cls in CLASS_HEX:
       model.geom_rgba[g] = _rgba(CLASS_HEX[cls], 0.8 if cls == "glass" else 1.0)
@@ -103,6 +106,7 @@ class LiveView:
     self.viewer.cam.elevation = -55.0
     self.viewer.cam.azimuth = 90.0
     self.paths: dict[str, tuple[np.ndarray, tuple]] = {}
+    self.cells: tuple[np.ndarray, np.ndarray, float] | None = None
     self.text = ""
     self.wall0: float | None = None
     self.sim_t = 0.0
@@ -115,6 +119,13 @@ class LiveView:
       self.paths.pop(name, None)
     else:
       self.paths[name] = (np.asarray(pts, np.float64), rgba)
+
+  def set_cells(
+    self, pos: np.ndarray | None, rgba: np.ndarray | None = None, half: float = 0.0
+  ) -> None:
+    """Flat square tiles ``half`` (m) wide at world points ``pos [N, 3]``,
+    coloured ``rgba [N, 4]`` (None: none)."""
+    self.cells = None if pos is None or rgba is None else (pos, rgba, half)
 
   def update(self, sim_data, sim_t: float, every: int = 1, step: int = 0) -> None:
     """Show the sim at ``sim_t`` (s), sleeping so it runs no faster than the
@@ -148,6 +159,17 @@ class LiveView:
           rgba,
           0.02 if name != "route" else 0.012,
         )
+      if self.cells is not None:
+        pos, rgba, half = self.cells
+        size = np.array([half, half, 0.004])
+        eye = np.eye(3).flatten()
+        for p, c in zip(pos, rgba, strict=True):
+          if scn.ngeom >= scn.maxgeom:
+            break
+          mujoco.mjv_initGeom(
+            scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_BOX, size, p, eye, c
+          )
+          scn.ngeom += 1
       self.viewer.set_texts(
         (
           mujoco.mjtFontScale.mjFONTSCALE_150.value,

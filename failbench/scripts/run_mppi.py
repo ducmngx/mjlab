@@ -82,7 +82,7 @@ from failbench.faults import (
 from failbench.global_planner import plan_paths
 from failbench.goals import route_progress, sample_goal
 from failbench.house import LAYOUTS
-from failbench.house_terrain import HOUSE_TERRAINS, route_table
+from failbench.house_terrain import HOUSE_TERRAINS, HouseTerrainCfg, route_table
 from failbench.live_view import LiveView
 from failbench.mppi.cbf import (
   CbfCfg,
@@ -181,6 +181,14 @@ class RunMppiConfig:
   """Show robot 0 in a MuJoCo window paced to the wall clock, with its plan
   and global path."""
   live_brightness: float = 1.0
+  live_map: bool = False
+  """``--live``: draw the planner's scan, each cell it counts as something to
+  hit (``severity_levels``) as a tile on top, coloured by severity: what
+  the planner and critic actually see."""
+  decor: bool | None = None
+  """Household objects drawn as stylised figures (``failbench/decor.py``),
+  look only: the boxes stay and are all that is checked. None: on with
+  ``--live``."""
   prebuilt_fields: bool = False
   """The risk critic's distance fields built once from a scan of the whole
   site and cropped at the robot's pose each cycle (``mppi/site_fields.py``),
@@ -394,6 +402,45 @@ def _to_world(path: torch.Tensor, pos: torch.Tensor, yaw: torch.Tensor):
   )
 
 
+# --live-map tile colours by severity (the live view's class colours).
+_TILE_RGBA = {
+  4.0: (0.32, 0.32, 0.31, 0.9),  # Wall.
+  8.0: (0.11, 0.69, 0.48, 0.9),  # Box.
+  25.0: (0.16, 0.47, 0.84, 0.9),  # Glass.
+  50.0: (0.92, 0.41, 0.20, 0.9),  # Person, or a drop.
+}
+
+
+def _scan_tiles(
+  height: torch.Tensor,
+  severity: torch.Tensor,
+  pos: torch.Tensor,
+  yaw: torch.Tensor,
+  cfg: RunMppiConfig,
+) -> tuple[np.ndarray, np.ndarray, float]:
+  """Robot 0's scan as tiles for ``LiveView.set_cells``: every cell the
+  planner counts as something to hit, at its scanned height (world frame),
+  coloured by its severity (the nearest of ``_TILE_RGBA``)."""
+  level = severity_levels(height, severity, MAP_RESOLUTION, cfg.mppi.footprint)[0]
+  j, i = torch.nonzero(level > 0, as_tuple=True)
+  h, w = level.shape
+  x = (i.float() - (w - 1) / 2) * MAP_RESOLUTION
+  y = (j.float() - (h - 1) / 2) * MAP_RESOLUTION
+  c, s = torch.cos(yaw[0]), torch.sin(yaw[0])
+  world = torch.stack(
+    [
+      pos[0, 0] + c * x - s * y,
+      pos[0, 1] + s * x + c * y,
+      pos[0, 2] + height[0, j, i].nan_to_num(0.0) + 0.01,
+    ],
+    -1,
+  )
+  keys = torch.tensor(list(_TILE_RGBA), device=level.device)
+  pick = (level[j, i, None] - keys).abs().argmin(-1).cpu().numpy()
+  colours = np.array(list(_TILE_RGBA.values()))[pick]
+  return world.cpu().numpy(), colours, MAP_RESOLUTION / 2
+
+
 def _set_house_route(terrain: str, spec: str) -> None:
   """Give household layout ``terrain`` the one route ``spec`` (``FROM:TO``)."""
   if terrain not in HOUSE_TERRAINS:
@@ -437,6 +484,12 @@ def run(cfg: RunMppiConfig) -> dict:
     mixture=mixture,
   )
   env_cfg.scene.num_envs = cfg.num_envs
+  if cfg.live if cfg.decor is None else cfg.decor:
+    assert env_cfg.scene.terrain is not None
+    gen = env_cfg.scene.terrain.terrain_generator
+    house = gen.sub_terrains.get("house") if gen is not None else None
+    if isinstance(house, HouseTerrainCfg):
+      house.decor = True
   if (cfg.map_cells - MAP_CELLS) % 2:
     raise ValueError("map_cells - 64 must be even to share the model's grid.")
   side = (cfg.map_cells - 1) * MAP_RESOLUTION
@@ -1152,10 +1205,28 @@ def run(cfg: RunMppiConfig) -> dict:
         live.set_path(
           "route", route_w[0, : int(route_real[0])].cpu().numpy(), (0.2, 0.4, 1.0, 0.8)
         )
+      if cfg.live_map:
+        live.set_cells(*_scan_tiles(plan_h[:1], severity[:1], pos[:1], yaw[:1], cfg))
       live_t0.append(t)
       rate = sum(t - x < 2.0 - 1e-9 for x in live_t0) / min(2.0, max(t, 0.1))
       ms = f"{rt_ms[-1]:4.0f} ms" if rt_ms else "-"
-      live.text = f"t {t:5.1f} s\nplan compute {ms}\nplans/s {rate:4.1f}"
+      arm = f"ours (risk w{cfg.risk.weight:g})" if cfg.risk_critic else "nominal MPPI"
+      if cfg.risk_critic and cfg.risk.faults == ("healthy",):
+        arm = f"nominal + learned healthy model (w{cfg.risk.weight:g})"
+      elif cfg.risk_critic:
+        arm += f", top {cfg.risk.top_m}" if cfg.risk.top_m else ", full critic"
+      if any(cfg.nav2.noise_corr):
+        arm += f" + turn noise corr {cfg.nav2.noise_corr[2]:g}"
+      speed = float(data.root_link_lin_vel_w[0, :2].norm())
+      vx, vy, wz = (float(v) for v in cmd[0])
+      live.text = (
+        f"{arm}\nt {t:5.1f} s\nplan compute {ms}\nplans/s {rate:4.1f}\n"
+        f"speed {speed:4.2f} m/s\ncmd vx {vx:+.2f} vy {vy:+.2f} m/s\n"
+        f"cmd turn {wz:+.2f} rad/s"
+      )
+      clear = risk_critic.last.get("clear") if risk_critic is not None else None
+      if clear is not None and cfg.risk.clear_m is not None:
+        live.text += f"\nclear {int(clear[0].sum())}/{clear.shape[1]} candidates"
     for k, v in {
       "path_w": _to_world(out["path"], pos, yaw),
       "pred_w": _to_world(out["pred_path"], pos, yaw),

@@ -41,7 +41,7 @@ from failbench.faults import (
   FaultMixture,
   encode_fault,
 )
-from failbench.mppi.costmap import FootprintCfg, hit_prob
+from failbench.mppi.costmap import FootprintCfg, _sample, hit_prob
 from failbench.mppi.inputs import deadband, integrate_plan
 from failbench.mppi.models import DynamicsModel
 from failbench.severity import (
@@ -72,7 +72,8 @@ class RiskCriticCfg:
   faults: tuple[str, ...] | None = None
   """Imagine only these ``<joint>:<lock|limp|weak>`` faults (e.g.
   ``REPRESENTATIVE_FAULTS``), each at its mixture odds, renormalised over
-  the set; None: every kind on ``joints``."""
+  the set; None: every kind on ``joints``. ``healthy`` adds the robot with
+  no fault (where it really goes), alone or beside faults."""
   weak_torque: float = 0.25
   """The torque scale standing for a weak (not limp) joint: the mean of
   ``mixture.weak_torque``."""
@@ -97,6 +98,11 @@ class RiskCriticCfg:
   (``data["stock_cost"]``); the rest pay the worst of theirs. The model
   costs about 11 us per candidate and fault on a desktop GPU, so pricing
   all of MPPI's 1000 samples against 36 faults takes 0.4 s a cycle."""
+  clear_m: float | None = None
+  """A candidate whose commanded path stays this far (m) from every object
+  and drop costs nothing, unpriced, and ``top_m`` is taken from the rest.
+  Exact while no imagined throw carries the footprint this far off the
+  path (up to the fields' cap, ``FootprintCfg.max_dist_m``); None: off."""
 
 
 REPRESENTATIVE_FAULTS: tuple[str, ...] = (
@@ -140,19 +146,35 @@ def imagined_faults(
   stacked, prior = torch.stack(params), torch.tensor(prior)
   if cfg.faults is not None:
     names = fault_names(stacked)
-    unknown = set(cfg.faults) - set(names)
+    unknown = set(cfg.faults) - set(names) - {HEALTHY}
     if unknown:
       raise ValueError(f"Unknown imagined faults {sorted(unknown)}.")
     keep = torch.tensor([n in cfg.faults for n in names])
     stacked, prior = stacked[keep], prior[keep]
+    if HEALTHY in cfg.faults:
+      # No fault: where the healthy robot really goes. Alone it carries all
+      # the weight; beside faults, the average of theirs.
+      nominal = torch.tensor(NOMINAL).repeat(num_joints, 1)[None]
+      share = prior.mean() if len(prior) else torch.tensor(1.0)
+      stacked = torch.cat([stacked, nominal.to(stacked)])
+      prior = torch.cat([prior, share[None]])
   return stacked, prior / prior.sum()
 
 
+HEALTHY = "healthy"
+"""The imagined case with no fault (``RiskCriticCfg.faults``)."""
+
+
 def fault_names(params: torch.Tensor) -> list[str]:
-  """``<joint>:<lock|limp|weak>`` per imagined fault ``[F, J, 2]``."""
+  """``<joint>:<lock|limp|weak>`` per imagined fault ``[F, J, 2]``,
+  ``healthy`` for none."""
   names = []
   for p in params:
-    j = int((p != torch.tensor(NOMINAL)).any(-1).nonzero()[0])
+    hurt = (p != torch.tensor(NOMINAL)).any(-1).nonzero()
+    if len(hurt) == 0:
+      names.append(HEALTHY)
+      continue
+    j = int(hurt[0])
     kind = "lock" if p[j, LOCK] > 0.5 else ("limp" if p[j, TORQUE] == 0 else "weak")
     names.append(f"{JOINT_NAMES[j]}:{kind}")
   return names
@@ -191,15 +213,36 @@ class RiskCritic:
     n, k = cmd.shape[:2]
     if not data.get("risk_fields"):
       return cmd.new_zeros(n, k)
+    clear = self._clear(cmd, data)
     if c.top_m is None or c.top_m >= k or "stock_cost" not in data:
       risk = self._price(cmd, data)
     else:
-      best = data["stock_cost"].topk(c.top_m, -1, largest=False).indices
+      # Clear candidates go last, so the priced ones are those near something.
+      rank = data["stock_cost"].masked_fill(clear, torch.inf)
+      best = rank.topk(c.top_m, -1, largest=False).indices
       picked = cmd.gather(1, best[..., None, None].expand(-1, -1, *cmd.shape[2:]))
       priced = self._price(picked, data)
       risk = priced.amax(-1, keepdim=True).expand(n, k).scatter(1, best, priced)
+    risk = risk.masked_fill(clear, 0.0)
+    self.last["clear"] = clear
     exposed = data.get("exposed")
     return risk if exposed is None else risk * exposed[:, None]
+
+  def _clear(self, cmd: torch.Tensor, data: dict) -> torch.Tensor:
+    """``[n, K]``: whether each candidate's commanded path stays
+    ``clear_m`` from every severity field (all False when off)."""
+    c = self.cfg
+    n, k = cmd.shape[:2]
+    if c.clear_m is None:
+      return torch.zeros(n, k, dtype=torch.bool, device=cmd.device)
+    xy = integrate_plan(cmd, c.control_dt, c.substeps)[..., :2]
+    cap = c.footprint.max_dist_m
+    near = torch.full((n, k), cap, device=cmd.device)
+    for _, dist in data["risk_fields"]:
+      # Off the map counts as open, as the fields' cap.
+      d = cap - _sample(cap - dist, xy, data["resolution"])
+      near = near.minimum(d.amin(-1))
+    return near >= min(c.clear_m, cap) - 1e-6
 
   @torch.no_grad()
   def throws(self, cmd: torch.Tensor, data: dict) -> dict:

@@ -24,6 +24,8 @@ from functools import lru_cache
 import mujoco
 import numpy as np
 
+from failbench.decor import GROUP as DECOR_GROUP
+from failbench.decor import dress
 from failbench.house import LAYOUTS, Item, ground_height, plan_routes
 from failbench.l_course import FLOOR_RGBA
 from failbench.severity_course import CLASS_RGBA
@@ -40,6 +42,9 @@ DECAL_M = 0.002
 WALL_RGBA = (0.55, 0.54, 0.52, 1.0)
 PLATFORM_RGBA = (0.62, 0.60, 0.55, 1.0)
 HFIELD_BASE_M = 0.2
+HIDDEN_ALPHA = 1e-3
+"""A decorated item's box: as good as invisible, but not 0, which MuJoCo's
+rays (the planners' scanners, ``scan_site``) skip as if it weren't there."""
 HEADING_AHEAD_M = 0.4
 """The spawn faces the global path's point this far along it."""
 
@@ -76,6 +81,10 @@ class HouseTerrainCfg(SubTerrainCfg):
   margin: float = 1.0
   """Floor round the flat, inside the tile."""
   hfield_resolution: float = 0.05
+  decor: bool = False
+  """Draw people, glass and furniture as stylised figures
+  (``failbench/decor.py``): look only. Their boxes stay, hidden, and are
+  still all that collides, is scanned and is priced."""
 
   def function(
     self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator
@@ -121,8 +130,49 @@ class HouseTerrainCfg(SubTerrainCfg):
           box("floor", it.x0, it.x1, it.y0, it.y1, -1.0, it.z1 + lift, PLATFORM_RGBA)
         continue
       rgba = WALL_RGBA if it.cls == "wall" else CLASS_RGBA[it.cls]
+      if self.decor and it.cls != "wall":
+        rgba = (*rgba[:3], HIDDEN_ALPHA)  # The figure below is drawn instead.
       box(it.cls, it.x0, it.x1, it.y0, it.y1, it.z0 - EMBED_M, it.z1, rgba)
+      if self.decor and it.cls != "wall":
+        out += self._dress(body, it, m)
     return TerrainOutput(origin=np.array([m, m, 0.0]), geometries=out)
+
+  def _dress(self, body, it: Item, m: float) -> list[TerrainGeometry]:
+    """Item ``it``'s figure, as geoms the generator moves with the tile
+    (by ``pos``: rods are placed by centre and rotation, not ``fromto``)."""
+    kinds = {
+      "box": mujoco.mjtGeom.mjGEOM_BOX,
+      "ellipsoid": mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+      "sphere": mujoco.mjtGeom.mjGEOM_SPHERE,
+      "capsule": mujoco.mjtGeom.mjGEOM_CAPSULE,
+      "cylinder": mujoco.mjtGeom.mjGEOM_CYLINDER,
+    }
+    out: list[TerrainGeometry] = []
+    # Colours vary by where the item stands, the same every build.
+    for p in dress(it, seed=round(1000 * it.x0) * 7919 + round(1000 * it.y0)):
+      geom = body.add_geom(
+        name=f"decor_{it.cls}_{next(_names)}",
+        type=kinds[p.kind],
+        contype=0,
+        conaffinity=0,
+        group=DECOR_GROUP,
+      )
+      a = (p.a[0] + m, p.a[1] + m, p.a[2])
+      if p.kind in ("box", "ellipsoid"):
+        geom.pos, geom.size = a, p.b
+      elif p.kind == "sphere":
+        geom.pos, geom.size = a, (p.r, 0.0, 0.0)
+      else:
+        b = np.array((p.b[0] + m, p.b[1] + m, p.b[2]))
+        axis = b - np.array(a)
+        quat = np.zeros(4)
+        mujoco.mju_quatZ2Vec(quat, axis)
+        geom.pos = (np.array(a) + b) / 2
+        geom.quat = quat
+        geom.size = (p.r, float(np.linalg.norm(axis)) / 2, 0.0)
+      geom.rgba[:] = p.rgba
+      out.append(TerrainGeometry(geom=geom))
+    return out
 
   def _hfield(self, spec, body, lay, rect) -> TerrainGeometry:
     """The ground over ``rect`` (layout frame) as a heightfield whose

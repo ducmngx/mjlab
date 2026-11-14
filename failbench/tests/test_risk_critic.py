@@ -17,6 +17,7 @@ from failbench.mppi.risk_critic import (
   RiskCritic,
   RiskCriticCfg,
   blank_obstacles,
+  fault_names,
   imagined_faults,
 )
 from failbench.severity import SEVERITY
@@ -216,3 +217,39 @@ def test_with_top_m_only_the_best_samples_are_priced_and_the_rest_pay_their_wors
   assert torch.allclose(top[0, best], full[0, best])
   rest = torch.tensor([0, 2, 4])
   assert torch.allclose(top[0, rest], full[0, best].max().expand(3))
+
+
+def test_clear_candidates_cost_nothing_and_leave_the_top_m_to_the_rest():
+  """A candidate whose commanded path stays ``clear_m`` from everything costs
+  nothing, as the full critic finds, without being priced; the top m are
+  taken from the candidates that come near something."""
+  h = _local_heights([(0.5, 3.0, -2.6, -2.3)], torch.zeros(1, 3))
+  cmd = torch.zeros(1, 4, 30, 3)
+  cmd[..., 0] = 0.8  # Forward, 2.3 m beside the box: clear.
+  cmd[0, 2:, :, 1] = -0.5  # Also sideways, towards it.
+  data = _data(h, torch.full_like(h, 25.0), cmd)
+  data["stock_cost"] = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+  full = RiskCritic(RiskCriticCfg(), _Thrown(side=-1.0))(data)
+  cfg = RiskCriticCfg(top_m=1, clear_m=FootprintCfg().max_dist_m)
+  critic = RiskCritic(cfg, _Thrown(side=-1.0))
+  out = critic(data)
+  assert torch.equal(full[0, :2], torch.zeros(2))
+  assert full[0, 2] > 0 and full[0, 3] > 0
+  assert torch.equal(out[0, :2], torch.zeros(2))  # Clear: not charged.
+  assert torch.allclose(out[0, 2], full[0, 2])  # The best of the rest, priced.
+  assert torch.allclose(out[0, 3], full[0, 2])  # Unpriced: the worst priced.
+  assert critic.last["clear"].tolist() == [[True, True, False, False]]
+
+
+def test_the_healthy_robot_can_be_imagined_alone_or_beside_faults():
+  """``healthy`` imagines no fault: alone it carries all the weight; beside
+  faults, the average of theirs."""
+  params, prior = imagined_faults(RiskCriticCfg(faults=("healthy",)), 12)
+  assert torch.equal(params, torch.tensor(NOMINAL).repeat(1, 12, 1))
+  assert prior.tolist() == [1.0]
+  assert fault_names(params) == ["healthy"]
+  both = ("healthy", "FL_hip_joint:limp", "RR_thigh_joint:lock")
+  params, prior = imagined_faults(RiskCriticCfg(faults=both), 12)
+  assert fault_names(params) == ["FL_hip_joint:limp", "RR_thigh_joint:lock", "healthy"]
+  assert torch.isclose(prior[-1], prior[:-1].mean())
+  assert torch.isclose(prior.sum(), torch.tensor(1.0))
