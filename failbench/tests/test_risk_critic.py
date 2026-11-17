@@ -253,3 +253,57 @@ def test_the_healthy_robot_can_be_imagined_alone_or_beside_faults():
   assert fault_names(params) == ["FL_hip_joint:limp", "RR_thigh_joint:lock", "healthy"]
   assert torch.isclose(prior[-1], prior[:-1].mean())
   assert torch.isclose(prior.sum(), torch.tensor(1.0))
+
+
+def _near_and_clear():
+  h = _local_heights([(0.5, 3.0, -2.6, -2.3)], torch.zeros(1, 3))
+  cmd = torch.zeros(1, 4, 30, 3)
+  cmd[..., 0] = 0.8
+  cmd[0, 2:, :, 1] = -0.5
+  data = _data(h, torch.full_like(h, 25.0), cmd)
+  data["stock_cost"] = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+  cfg = RiskCriticCfg(top_m=1, clear_m=FootprintCfg().max_dist_m)
+  return data, RiskCritic(cfg, _Thrown(side=-1.0))
+
+
+def test_a_label_cycle_prices_the_picked_samples_in_full_and_plans_as_configured():
+  """The distillation labels' cycles (``mode = "label"``): the planner gets
+  the configured (top m, clear) cost, and the samples ``label_pick`` chooses
+  from the stock plus that cost are priced in full, as the critic without
+  top m or clear prices them."""
+  data, critic = _near_and_clear()
+  full_critic = RiskCritic(RiskCriticCfg(), _Thrown(side=-1.0))
+  full_critic(data)
+  planned = critic(data)
+  seen = []
+
+  def pick(total):
+    seen.append(total)
+    return torch.tensor([[3, 0]])
+
+  critic.label_pick = pick
+  critic.mode = "label"
+  assert torch.allclose(critic(data), planned)
+  assert torch.allclose(seen[0], data["stock_cost"] + planned)
+  last = critic.last
+  assert last["full"] and last["picked"]
+  want = full_critic.last["per_fault"][:, [3, 0]]
+  assert torch.allclose(last["per_fault"], want)
+  assert torch.equal(last["commands"], data["commands"][:, [3, 0]])
+  assert torch.equal(last["stock_cost"], torch.tensor([[3.0, 0.0]]))
+
+
+def test_a_label_cycle_at_weight_zero_prices_only_the_picked_samples():
+  data, critic = _near_and_clear()
+  critic.cfg = RiskCriticCfg(weight=0.0, top_m=1)
+  critic.label_pick = lambda total: total.argsort(-1)[:, :2]
+  critic.mode = "label"
+  assert torch.equal(critic(data), torch.zeros(1, 4))
+  assert critic.last["per_fault"].shape[1] == 2
+
+
+def test_an_off_cycle_prices_nothing():
+  data, critic = _near_and_clear()
+  critic.mode = "off"
+  assert torch.equal(critic(data), torch.zeros(1, 4))
+  assert not critic.last["full"] and "per_fault" not in critic.last

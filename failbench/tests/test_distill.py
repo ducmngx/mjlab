@@ -2,6 +2,8 @@
 new entities, the student's structure, the critic built on it, the teacher's
 labels and their recording."""
 
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -241,6 +243,24 @@ def test_the_dump_keeps_the_cheapest_candidates_and_their_labels(tmp_path):
     # Each kept label belongs to its own candidate.
     i = int((cost[robot] == torch.tensor(data["stock_cost"][row, 7])).nonzero())
     assert np.allclose(data["per_fault"][row, 7], last["per_fault"][robot, i].numpy())
+
+
+def test_the_dump_stores_samples_the_critic_already_picked_as_they_are(tmp_path):
+  n, s, f = 2, 15, 8
+  last: dict[str, Any] = {
+    "commands": torch.rand(n, s, 30, 3),
+    "stock_cost": torch.rand(n, s),
+    "per_fault": torch.rand(n, s, f),
+    "picked": True,
+  }
+  inputs = {key: torch.rand(n, 4) for key in INPUT_KEYS}
+  h = torch.rand(n, 16, 16)
+  dump = LabelDump(tmp_path / "d", top=5, rand=10, shard_size=100)
+  dump.record(last, torch.rand(n, 1000), inputs, h, h, torch.tensor([False, True]))
+  dump.flush()
+  data = np.load(dump.written[0])
+  assert np.allclose(data["per_fault"][0], last["per_fault"][1].numpy())
+  assert np.allclose(data["stock_cost"][0], last["stock_cost"][1].numpy())
 
 
 # Learning.

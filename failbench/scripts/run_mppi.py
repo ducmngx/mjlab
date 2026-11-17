@@ -281,6 +281,12 @@ class RunMppiConfig:
   ``<this>_<i>.npz``, every ``distill_every`` cycles, robots not yet
   faulted. The critic prices every cycle even at weight 0."""
   distill_every: int = 10
+  distill_cheap: bool = False
+  """With ``distill_dump``: the critic plans as configured (``risk.top_m``,
+  ``risk.clear_m``; not at all at weight 0) and, on the recorded cycles,
+  prices in full only the samples the dump keeps, picked from the stock
+  cost plus the configured one. The labels are the teacher's; the runs are
+  many times cheaper."""
   distill_relabel: float = 0.0
   """Give this share of the objects, per robot, a random severity on the
   planner's map (physics and the safety metrics keep the true class), so
@@ -637,9 +643,13 @@ def run(cfg: RunMppiConfig) -> dict:
   if cfg.distill_dump:
     if not isinstance(planner, Nav2Mppi):
       raise ValueError("The distillation labels are recorded on nav2.")
-    if cfg.risk.top_m is not None:
+    if cfg.risk.top_m is not None and not cfg.distill_cheap:
       raise ValueError("The labels need every sample priced (no top_m).")
     dump = LabelDump(cfg.distill_dump, seed=cfg.seed)
+    if cfg.distill_cheap and risk_critic is not None:
+      risk_critic.label_pick = dump.pick
+  elif cfg.distill_cheap:
+    raise ValueError("--distill-cheap is for --distill-dump.")
   house = HOUSE_TERRAINS.get(cfg.terrain)
   if house is not None:
     # The household layouts: each robot tracks its route's global path,
@@ -777,6 +787,7 @@ def run(cfg: RunMppiConfig) -> dict:
   severity), as the risk critic prices it."""
   start_z = torch.full((n,), float("nan"), device=device)
   plan_time = []
+  plan_full: list[bool] = []  # Whether each cycle priced every sample.
 
   snap_every = round(cfg.save_state_every_s / step_dt) if cfg.save_state_every_s else 0
   snaps: list[dict[str, np.ndarray]] = []
@@ -1104,6 +1115,11 @@ def run(cfg: RunMppiConfig) -> dict:
           route_at = torch.zeros_like(route_real)
           route_t = t
         path, route_at = local_path(route_w, route_real, route_at, pose_w, planner.cfg)
+      if dump is not None and risk_critic is not None and cfg.distill_cheap:
+        if c % cfg.distill_every == 0:
+          risk_critic.mode = "label"
+        else:
+          risk_critic.mode = "off" if cfg.risk.weight == 0 else "cfg"
       out = planner.step(costmap, MAP_RESOLUTION, goal, body_v, context, path)
       if cfg.realtime:
         assert rt_held is not None and rt_cur is not None
@@ -1122,6 +1138,8 @@ def run(cfg: RunMppiConfig) -> dict:
         out["cmd"] = rt_held if not fresh.any() else rt_new[:, 0]
       if dump is not None and c % cfg.distill_every == 0:
         assert risk_critic is not None and critic_inputs is not None
+        if not risk_critic.last.get("full"):
+          raise RuntimeError("A recorded cycle must price every sample.")
         dump.record(
           risk_critic.last,
           -out["weight"],
@@ -1198,6 +1216,7 @@ def run(cfg: RunMppiConfig) -> dict:
     if device.startswith("cuda"):
       torch.cuda.synchronize()
     plan_time.append(time.perf_counter() - t0)
+    plan_full.append(risk_critic is not None and risk_critic.mode == "label")
     if every and (step // r) % every == 0:
       m = (step // r) // every
       maps[:, m] = plan_h.cpu().numpy()
@@ -1379,6 +1398,11 @@ def run(cfg: RunMppiConfig) -> dict:
       "mean_damage": float(hurt_np[sel].mean()),
     }
   summary["plan_ms_mean"] = 1e3 * float(np.mean(plan_time)) if plan_time else None
+  if cfg.distill_cheap and plan_time:
+    full = np.array(plan_full)
+    ms = 1e3 * np.array(plan_time)
+    for key, sel in (("label", full), ("cheap", ~full)):
+      summary[f"plan_ms_{key}"] = float(ms[sel].mean()) if sel.any() else None
   if rt_ms:
     summary["realtime_plan_ms_mean"] = float(np.mean(rt_ms))
     summary["realtime_plan_ms_p95"] = float(np.percentile(rt_ms, 95))

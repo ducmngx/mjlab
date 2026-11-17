@@ -58,7 +58,7 @@ class LabelDump:
 
   def record(
     self,
-    last: dict[str, torch.Tensor],
+    last: dict[str, Any],
     total_cost: torch.Tensor,
     inputs: dict[str, torch.Tensor],
     height: torch.Tensor,
@@ -67,13 +67,16 @@ class LabelDump:
     extra: dict[str, np.ndarray] | None = None,
   ) -> None:
     """One cycle: the critic's ``last`` (``per_fault``, ``commands``,
-    ``stock_cost``), the planner's ``total_cost [n, K]``, the impact
+    ``stock_cost``; all kept as they are if ``picked``), the planner's ``total_cost [n, K]``, the impact
     model's ``inputs``, the planner's ``height`` / ``severity [n, H, W]``,
     for robots ``keep [n]``; ``extra`` per-robot arrays (e.g. the step)."""
     ids = keep.nonzero()[:, 0].cpu()
     if len(ids) == 0:
       return
-    idx = self.pick(total_cost[ids])
+    if last.get("picked"):  # The critic priced only the samples it picked.
+      idx = torch.arange(last["per_fault"].shape[1]).expand(len(ids), -1)
+    else:
+      idx = self.pick(total_cost[ids])
 
     def rows(x: torch.Tensor) -> torch.Tensor:
       return x.cpu()[ids]

@@ -29,7 +29,7 @@ them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Callable, Literal
 
 import torch
 
@@ -203,19 +203,43 @@ class RiskCritic:
   def __init__(self, cfg: RiskCriticCfg, model: DynamicsModel):
     self.cfg = cfg
     self.model = model
-    self.last: dict[str, torch.Tensor] = {}
-    """The last call's per-fault cost ``[n, K, F]``."""
+    self.last: dict[str, Any] = {}
+    """The last call's per-fault cost ``[n, K, F]`` and whether every
+    sample was priced (``full``)."""
+    self.mode: Literal["cfg", "label", "off"] = "cfg"
+    """Per cycle, set by the runner: ``cfg`` as configured; ``label`` as
+    configured, and the samples ``label_pick`` chooses priced in full (the
+    distillation labels' cycles); ``off`` nothing priced."""
+    self.label_pick: Callable[[torch.Tensor], torch.Tensor] | None = None
+    """``total cost [n, K] -> indices [n, S]`` of the samples to label."""
 
   @torch.no_grad()
   def __call__(self, data: dict) -> torch.Tensor:
     c = self.cfg
     cmd = deadband(data["commands"], c.zero_below)
     n, k = cmd.shape[:2]
-    if not data.get("risk_fields"):
+    if self.mode == "off" or not data.get("risk_fields"):
+      self.last = {"full": False}
       return cmd.new_zeros(n, k)
+    if self.mode == "label" and c.weight == 0:
+      risk = cmd.new_zeros(n, k)  # The planner ignores it: price none.
+    else:
+      risk = self._configured(cmd, data)
+    exposed = data.get("exposed")
+    if exposed is not None:
+      risk = risk * exposed[:, None]
+    if self.mode == "label":
+      self._label(cmd, data, risk)
+    return risk
+
+  def _configured(self, cmd: torch.Tensor, data: dict) -> torch.Tensor:
+    """The cost ``[n, K]`` as configured (``top_m``, ``clear_m``)."""
+    c = self.cfg
+    n, k = cmd.shape[:2]
     clear = self._clear(cmd, data)
     if c.top_m is None or c.top_m >= k or "stock_cost" not in data:
       risk = self._price(cmd, data)
+      self.last["full"] = not clear.any()
     else:
       # Clear candidates go last, so the priced ones are those near something.
       rank = data["stock_cost"].masked_fill(clear, torch.inf)
@@ -223,10 +247,22 @@ class RiskCritic:
       picked = cmd.gather(1, best[..., None, None].expand(-1, -1, *cmd.shape[2:]))
       priced = self._price(picked, data)
       risk = priced.amax(-1, keepdim=True).expand(n, k).scatter(1, best, priced)
-    risk = risk.masked_fill(clear, 0.0)
+      self.last["full"] = False
     self.last["clear"] = clear
-    exposed = data.get("exposed")
-    return risk if exposed is None else risk * exposed[:, None]
+    return risk.masked_fill(clear, 0.0)
+
+  def _label(self, cmd: torch.Tensor, data: dict, risk: torch.Tensor) -> None:
+    """Price in full the samples ``label_pick`` chooses from the stock cost
+    plus ``risk``; ``last`` then holds those samples only (``picked``)."""
+    assert self.label_pick is not None, "A label cycle needs label_pick."
+    stock = data["stock_cost"]
+    idx = self.label_pick(stock + risk).to(cmd.device)
+    picked = cmd.gather(1, idx[..., None, None].expand(-1, -1, *cmd.shape[2:]))
+    clear = self.last.get("clear")
+    self._price(picked, data)
+    self.last.update(
+      stock_cost=stock.gather(1, idx), full=True, picked=True, clear=clear
+    )
 
   def _clear(self, cmd: torch.Tensor, data: dict) -> torch.Tensor:
     """``[n, K]``: whether each candidate's commanded path stays
